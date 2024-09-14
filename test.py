@@ -21,8 +21,10 @@ if __name__ == "__main__":
 
         if obs1["turn"] == 0:
             action = bot1.act(obs1, reward1, terminated, trunc, info)
+            bot2.observe(obs2, reward2, terminated, trunc, info)
         else:
             action = bot2.act(obs2, reward2, terminated, trunc, info)
+            bot1.observe(obs1, reward1, terminated, trunc, info)
 
         print("bot", obs1["turn"], "did action", action)
 

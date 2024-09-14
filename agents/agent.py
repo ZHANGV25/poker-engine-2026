@@ -16,3 +16,11 @@ class Agent(ABC):
             action (Tuple[int, int]) : (cumulative amount to bet, index of the card to discard)
         """
         pass
+
+    def observe(
+        self, observation, reward, terminated, truncated, info
+    ) -> None:
+        """
+        Observe the result of your action. However, it's not your turn.
+        """
+        pass
