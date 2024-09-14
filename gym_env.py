@@ -267,7 +267,7 @@ class PokerEnv(gym.Env):
             if self.turn == 1 - self.small_blind_player:
                 # big blind checked
                 # next street
-                self.street += 1
+                self._next_street()
             else:
                 # other player's action on same street
                 pass
