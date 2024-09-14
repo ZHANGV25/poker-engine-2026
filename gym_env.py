@@ -60,7 +60,7 @@ class PokerEnv(gym.Env):
         # Discrete(4) cuz we have 3 cards.
         # Keep in Mind: THIS IS Cumulative betting
         self.action_space = spaces.Tuple(
-            [spaces.Discrete(99, start=2), spaces.Discrete(4, start=-1)]
+            [spaces.Discrete(102, start=-1), spaces.Discrete(4, start=-1)]
         )
 
         # Card space is a Discrete(53), -1 means the card is not shown
@@ -73,6 +73,7 @@ class PokerEnv(gym.Env):
         # Two players, so the observation space is a Tuple of two single_observation_spaces
         observation_space_one_player = spaces.Dict(
             {
+                "street": spaces.Discrete(4),
                 "turn": spaces.Discrete(2),
                 "my_cards": spaces.Tuple([cards_space for _ in range(3)]),
                 "community_cards": spaces.Tuple(
@@ -116,6 +117,7 @@ class PokerEnv(gym.Env):
             num_cards_to_reveal = self.street + 2
 
         return {
+            "street": self.street,
             "turn": self.turn,
             "my_cards": self.player_cards[player_num],
             "community_cards": self.community_cards[:num_cards_to_reveal],
