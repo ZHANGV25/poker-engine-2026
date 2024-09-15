@@ -2,7 +2,7 @@ from gym_env import PokerEnv
 from agents.test_agents import AllInAgent, RandomAgent
 
 
-if __name__ == "__main__":
+def test_agents():
     env = PokerEnv(num_games=5)
 
     (obs0, obs1), info = env.reset()
@@ -34,3 +34,20 @@ if __name__ == "__main__":
         )
         print("Bot0 reward:", reward0, "Bot1 reward:", reward1)
 
+
+def test_agents_with_api_calls():
+    env = PokerEnv(num_games=5)
+
+    (obs0, obs1), info = env.reset()
+    bot0, bot1 = AllInAgent(), RandomAgent()
+
+    reward0 = reward1 = 0
+    trunc = None
+
+    terminated = False
+
+    # TODO: Implement the game loop with API calls
+        
+
+if __name__ == "__main__":
+    test_agents()
