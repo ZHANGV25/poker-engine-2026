@@ -1,3 +1,8 @@
 # PokerBotEngine2025
 
-python 3.12.x
+## How to run the engine
+Make a conda env or virtualenv and install the requirements from requirements.txt
+
+```bash
+pip install -r requirements.txt
+```
