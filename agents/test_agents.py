@@ -6,6 +6,9 @@ action_types = PokerEnv.ActionType
 
 
 class FoldAgent(Agent):
+    def name():
+        return "FoldAgent"
+
     def act(self, observation, reward, terminated, truncated, info):
         # fold instantly by betting -1
         bet, reveal_card = -1, -1
@@ -15,6 +18,9 @@ class FoldAgent(Agent):
 # TODO: Implement the following agents
 class CallingStationAgent(Agent):
     # Always calls/checks
+    def name():
+        return "CallingStationAgent"
+
     def act(self, observation, reward, terminated, truncated, info):
         # observation["street"] == 1 marks the flop, where we discard a card
         if observation["street"] == 1:
@@ -29,6 +35,9 @@ class CallingStationAgent(Agent):
 
 class AllInAgent(Agent):
     # Always goes all in
+    def name():
+        return "AllInAgent"
+
     def act(self, observation, reward, terminated, truncated, info):
         # observation["street"] == 1 marks the flop, where we discard a card
         if observation["street"] == 1:
@@ -43,6 +52,9 @@ class AllInAgent(Agent):
 
 class RandomAgent(Agent):
     # Randomly chooses an action
+    def name():
+        return "RandomAgent"
+
     def act(self, observation, reward, terminated, truncated, info):
         # randomly choose whether to fold, call, or raise
         action = random.choice(
@@ -72,12 +84,15 @@ class RandomAgent(Agent):
 
 class ProbabilityAgent(Agent):
     # Chooses an action based on the probability of winning
+    def name():
+        return "ProbabilityAgent"
+
     def act(self, observation, reward, terminated, truncated, info):
         # treys has an implementation that could be odds
         # it's defined as percentage rank among all hands
         # not sure if it's able to take in extra info to reduce the
         # pool of all hands by the flop discards though
         # so we might have to do it ourselves
-        pass
+        return -1, -1
 
 all_agent_classes = (FoldAgent, CallingStationAgent, AllInAgent, RandomAgent, ProbabilityAgent)

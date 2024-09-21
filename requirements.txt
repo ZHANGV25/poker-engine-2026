@@ -8,6 +8,7 @@ gym-notices==0.0.8
 h11==0.14.0
 idna==3.10
 numpy==2.1.1
+pandas==2.2.3
 pydantic==2.9.1
 pydantic_core==2.23.3
 setuptools==72.1.0

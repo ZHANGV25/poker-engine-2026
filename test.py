@@ -1,5 +1,6 @@
 from gym_env import PokerEnv
 from agents.test_agents import all_agent_classes
+import pandas as pd
 
 
 def test_agents(agent1, agent2):
@@ -33,12 +34,21 @@ def test_agents(agent1, agent2):
             action=action
         )
         print("Bot0 reward:", reward0, "Bot1 reward:", reward1)
+    return obs0['my_bankroll'] - obs1['my_bankroll']
 
 def test_all_base_agents():
-    for agent1 in all_agent_classes:
-        for agent2 in all_agent_classes:
-            print(type(agent1).__name__, "vs", type(agent2).__name__)
-            test_agents(agent1, agent2)
+    agent_names = [x.name() for x in all_agent_classes]
+    bankroll_matrix = []
+    for i1, agent1 in enumerate(all_agent_classes):
+        bankroll_matrix.append([])
+        for i2, agent2 in enumerate(all_agent_classes):
+            print(agent_names[i1], "vs", agent_names[i2])
+            net_bankroll = test_agents(agent1, agent2)
+            bankroll_matrix[-1].append(net_bankroll)
+    
+    bankroll_matrix = pd.DataFrame(bankroll_matrix, columns=agent_names, index=agent_names)
+    print(bankroll_matrix)
+
 
 
 def test_agents_with_api_calls():
