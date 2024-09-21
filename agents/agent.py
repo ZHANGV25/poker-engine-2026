@@ -83,8 +83,8 @@ class Agent(ABC):
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
-        @self.app.post("/send_observation")
-        async def send_observation(request: ObservationRequest) -> None:
+        @self.app.post("/post_observation")
+        async def post_observation(request: ObservationRequest) -> None:
             """
             API endpoint to send the observation to the bot
             """

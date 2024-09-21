@@ -50,9 +50,6 @@ def test_agents_with_api_calls():
                 else:
                     converted_value = value
                 prepared_obs[key] = converted_value
-            print("Observation:")
-            for key, value in prepared_obs.items():
-                print("", key, value, ":", type(value))
             return prepared_obs
 
         payload = {
@@ -66,14 +63,13 @@ def test_agents_with_api_calls():
 
     def _call_agent_ep(method, base_url, ep, payload) -> dict:
         response = requests.request(method, base_url + ep, json=payload)
-        # print(bot0_action_response.json())
         return response.json()
 
     env = PokerEnv(num_games=5)
 
     (obs0, obs1), info = env.reset()
     GET_ACTION_EP = "/get_action"
-    SEND_OBS_EP = "/send_observation"
+    SEND_OBS_EP = "/post_observation"
     BASE_URL_0 = "http://0.0.0.0:8000"
     BASE_URL_1 = "http://0.0.0.0:8001"
 
@@ -91,11 +87,15 @@ def test_agents_with_api_calls():
         bot0_payload = _prepare_payload(obs0, reward0)
         bot1_payload = _prepare_payload(obs1, reward1)
         if obs0["turn"] == 0:
+            # Request Action
             action = _call_agent_ep("GET", BASE_URL_0, GET_ACTION_EP, bot0_payload)
+            # Send Observation
             _call_agent_ep("POST", BASE_URL_1, SEND_OBS_EP, bot1_payload)
         else:
-            action = _call_agent_ep("GET", BASE_URL_0, GET_ACTION_EP, bot1_payload)
-            _call_agent_ep("POST", BASE_URL_1, SEND_OBS_EP, bot0_payload)
+            # Request Action
+            action = _call_agent_ep("GET", BASE_URL_1, GET_ACTION_EP, bot1_payload)
+            # Send Observation
+            _call_agent_ep("POST", BASE_URL_0, SEND_OBS_EP, bot0_payload)
 
         action_value = action["action"]
 
