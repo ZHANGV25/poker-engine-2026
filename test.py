@@ -1,9 +1,17 @@
 from gym_env import PokerEnv
 from agents.test_agents import all_agent_classes
+from agents.test_agents import CallingStationAgent, AllInAgent
 import pandas as pd
 import requests
 import json
 import numpy
+import multiprocessing
+import time
+
+
+def run_bot(bot_class, port):
+    bot = bot_class()
+    bot.run(port=port)
 
 class TestAgentError(ValueError):
     pass
@@ -127,5 +135,20 @@ def test_agents_with_api_calls():
 
 
 if __name__ == "__main__":
-    test_all_base_agents()
+    process0 = multiprocessing.Process(target=run_bot, args=(AllInAgent, 8000))
+    process1 = multiprocessing.Process(target=run_bot, args=(CallingStationAgent, 8001))
+
+    process0.start()
+    process1.start()
+
+    # Wait a bit for the bots to start
+    time.sleep(1)
+
+    print("Starting test")
     test_agents_with_api_calls()
+
+    process0.terminate()
+    process1.terminate()
+
+    test_all_base_agents()
+
