@@ -2,6 +2,7 @@
 Script to run matches between agents.
 """
 
+import logging
 import multiprocessing
 import time
 from typing import Any, Callable, Dict
@@ -9,28 +10,11 @@ from typing import Any, Callable, Dict
 import numpy as np
 import pandas as pd
 import requests
-import logging
-
 from agents.test_agents import AllInAgent, CallingStationAgent, all_agent_classes
 from gym_env import PokerEnv
 
 
-def run_api_bot(bot_class: Callable, port: int, logger: logging.Logger) -> None:
-    """
-    Run an API-based bot on a specified port.
-
-    Args:
-        bot_class (Callable): The bot class to instantiate.
-        port (int): The port number to run the bot on.
-        logger (logging.Logger): The logger object to use for logging.
-    """
-    bot = bot_class(logger)
-    bot.run(port=port)
-
-
-def prepare_payload(
-    obs: Dict[str, Any], reward: float, terminated: bool, truncated: bool, info: Dict[str, Any]
-) -> Dict[str, Any]:
+def prepare_payload(obs: Dict[str, Any], reward: float, terminated: bool, truncated: bool, info: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepare the payload for API calls by converting numpy arrays to lists.
 
@@ -85,11 +69,11 @@ def call_agent_api(method: str, base_url: str, endpoint: str, payload: Dict[str,
             if attempt == max_retries - 1:
                 raise requests.exceptions.RequestException(f"Failed API Request after {max_retries} attempts: {str(e)}")
             delay = base_delay * (2**attempt)
-            print(f"Backing off for {delay} seconds before retry {attempt + 1}")
+            logger.info(f"Backing off for {delay} seconds before retry {attempt + 1}")
             time.sleep(delay)
 
 
-def run_local_match(agent1: Callable, agent2: Callable, num_games: int = 5) -> float:
+def run_local_match(agent1: Callable, agent2: Callable, num_games: int = 5, logger: logging.Logger = None) -> float:
     """
     Run a local match between two agents.
 
@@ -97,16 +81,19 @@ def run_local_match(agent1: Callable, agent2: Callable, num_games: int = 5) -> f
         agent1 (Callable): The first agent class.
         agent2 (Callable): The second agent class.
         num_games (int, optional): The number of games to play. Defaults to 5.
+        logger (logging.Logger, optional): The logger object to use for logging. Defaults to None.
 
     Returns:
         float: The net bankroll of agent1 vs agent2.
     """
-    env = PokerEnv(num_games=num_games)
+    env = PokerEnv(num_games=num_games, logger=logger)
     (obs0, obs1), info = env.reset()
     bot0, bot1 = agent1(), agent2()
 
     reward0 = reward1 = 0
     truncated = None
+
+    logger.info(f"Starting a new match with {num_games} games")
 
     terminated = False
     while not terminated:
@@ -140,7 +127,7 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
     Returns:
         Dict[str, Any]: A dictionary containing the match results.
     """
-    env = PokerEnv(num_games=num_games)
+    env = PokerEnv(num_games=num_games, logger=logger)
     (obs0, obs1), info = env.reset()
 
     get_action_endpoint = "/get_action"
@@ -154,7 +141,7 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
     total_reward0 = 0
     total_reward1 = 0
 
-    logger.info(f"Starting match with {num_games} games")
+    logger.info(f"Starting a new match with {num_games} games")
 
     while not terminated:
         logger.debug(f"Game {game_count + 1}, Turn: {obs0['turn']}")
@@ -189,12 +176,7 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
     logger.info("Match completed")
     logger.info(f"Final results - Bot0 total reward: {total_reward0}, Bot1 total reward: {total_reward1}")
 
-    return {
-        "outcome": {
-            "bot0_reward": total_reward0,
-            "bot1_reward": total_reward1
-        }
-    }
+    return {"outcome": {"bot0_reward": total_reward0, "bot1_reward": total_reward1}}
 
 
 def print_game_state(obs0: Dict[str, Any], obs1: Dict[str, Any]) -> None:
@@ -230,7 +212,7 @@ def log_game_state(logger: logging.Logger, obs0: Dict[str, Any], obs1: Dict[str,
     logger.debug("#####################")
 
 
-def run_all_local_matches() -> None:
+def run_all_local_matches(logger: logging.Logger) -> None:
     """Run matches between all combinations of local agents and print results."""
     agent_names = [x.name() for x in all_agent_classes]
     bankroll_matrix = []
@@ -238,24 +220,26 @@ def run_all_local_matches() -> None:
     for i1, agent1 in enumerate(all_agent_classes):
         bankroll_matrix.append([])
         for i2, agent2 in enumerate(all_agent_classes):
-            print(f"{agent_names[i1]} vs {agent_names[i2]}")
-            net_bankroll = run_local_match(agent1, agent2)
+            logger.info(f"{agent_names[i1]} vs {agent_names[i2]}")
+            net_bankroll = run_local_match(agent1, agent2, logger=logger)
             bankroll_matrix[-1].append(net_bankroll)
 
     bankroll_df = pd.DataFrame(bankroll_matrix, columns=agent_names, index=agent_names)
-    print(bankroll_df)
+    logger.info(f"\n{bankroll_df}")
 
 
 if __name__ == "__main__":
-    # Run API-based match
-    process0 = multiprocessing.Process(target=run_api_bot, args=(AllInAgent, 8000, logging.getLogger()))
-    process1 = multiprocessing.Process(target=run_api_bot, args=(CallingStationAgent, 8001, logging.getLogger()))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    process0 = multiprocessing.Process(target=AllInAgent.run, args=(8000, logger))
+    process1 = multiprocessing.Process(target=CallingStationAgent.run, args=(8001, logger))
 
     process0.start()
     process1.start()
 
-    print("Starting API-based match")
-    run_api_match("http://127.0.0.1:8000", "http://127.0.0.1:8001")
+    logger.info("Starting API-based match")
+    run_api_match("http://127.0.0.1:8000", "http://127.0.0.1:8001", logger)
 
     process0.terminate()
     process1.terminate()

@@ -1,9 +1,10 @@
-import logging
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Any, TypedDict
+from typing import Any, List, Tuple, TypedDict
+
+import logging
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uvicorn
 
 
 # I used a typedDict instead of a pydantic model because it
@@ -105,9 +106,26 @@ class Agent(ABC):
                 self.logger.error(f"Error in post_observation: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
 
-    def run(self, host="0.0.0.0", port=8000):
+    @classmethod
+    def run(cls, port: int, logger: logging.Logger, host: str = "0.0.0.0"):
         """
-        Method to start the FastAPI server from within the agent class.
+        Run an API-based bot on a specified port.
+
+        Args:
+            port (int): The port number to run the bot on.
+            logger (logging.Logger): The logger object to use for logging.
+            host (str): The host to bind the server to. Defaults to "0.0.0.0".
         """
-        self.logger.info(f"Starting agent server on {host}:{port}")
-        uvicorn.run(self.app, host=host, port=port)
+        bot = cls(logger)
+        logger.info(f"Starting agent server on {host}:{port}")
+
+        uvicorn_logger = logging.getLogger("uvicorn")
+        uvicorn_logger.setLevel(logging.WARNING)
+
+        uvicorn_logger.handlers.clear()
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        uvicorn_logger.addHandler(handler)
+
+        uvicorn.run(bot.app, host=host, port=port, log_config=None)

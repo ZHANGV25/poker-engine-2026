@@ -6,21 +6,22 @@ https://gymnasium.farama.org
 https://stable-baselines3.readthedocs.io/en/master/guide/custom_env.html
 
 Keep in mind gym doesn't inherently support multi-agent environments.
-We will have to use the Tuple space to represent the observation space and 
+We will have to use the Tuple space to represent the observation space and
 action space for each agent.
 
 """
 
+import logging
 import os
 from enum import Enum
-import numpy as np
+
 import gym
+import numpy as np
 from gym import spaces
-from treys import Evaluator, Card
+from treys import Card, Evaluator
 
 
 class PokerEnv(gym.Env):
-
     @staticmethod
     def int_to_card(card_int: int):
         """
@@ -47,9 +48,12 @@ class PokerEnv(gym.Env):
 
     NO_DISCARD = -1
 
-    def __init__(self, num_games) -> None:
+    LOG_FREQUENCY = 25
+
+    def __init__(self, num_games, logger=None):
         super().__init__()
         self.num_games = num_games
+        self.logger = logger or logging.getLogger(__name__)
 
         self.evaluator = Evaluator()
 
@@ -61,9 +65,7 @@ class PokerEnv(gym.Env):
         # Card to discard and show is only relevant in the discard game.
         # Discrete(4) cuz we have 3 cards.
         # Keep in Mind: THIS IS Cumulative betting
-        self.action_space = spaces.Tuple(
-            [spaces.Discrete(102, start=-1), spaces.Discrete(4, start=-1)]
-        )
+        self.action_space = spaces.Tuple([spaces.Discrete(102, start=-1), spaces.Discrete(4, start=-1)])
 
         # Card space is a Discrete(53), -1 means the card is not shown
         cards_space = spaces.Discrete(53, start=-1)
@@ -81,9 +83,7 @@ class PokerEnv(gym.Env):
                 "community_cards": spaces.Tuple([cards_space for _ in range(5)]),
                 "my_bet": spaces.Discrete(100, start=0),
                 "opp_bet": spaces.Discrete(100, start=0),
-                "my_bankroll": spaces.Box(
-                    low=-1, high=1, shape=(1,)
-                ),  # Normalized bankroll div by 1e4 or something idk
+                "my_bankroll": spaces.Box(low=-1, high=1, shape=(1,)),  # Normalized bankroll div by 1e4 or something idk
                 "opp_shown_cards": spaces.Tuple([cards_space for _ in range(2)]),
                 "game_num": spaces.Discrete(self.num_games, start=1),
                 "min_raise": spaces.Discrete(100, start=2),
@@ -92,9 +92,7 @@ class PokerEnv(gym.Env):
 
         # Since we have two players, the observation space is a tuple of
         # (observation_space_one_player, observation_space_one_player)
-        self.observation_space = spaces.Tuple(
-            [observation_space_one_player for _ in range(2)]
-        )
+        self.observation_space = spaces.Tuple([observation_space_one_player for _ in range(2)])
 
         self.player_cards = (None, None)
         self.community_cards = []
@@ -175,6 +173,10 @@ class PokerEnv(gym.Env):
 
         self.game_num += 1
 
+        if self.game_num % self.LOG_FREQUENCY == 0:
+            self.logger.info(f"Starting game {self.game_num} of {self.num_games}")
+            self.logger.info(f"Current bankrolls - Player 0: {self.bankrolls[0]}, Player 1: {self.bankrolls[1]}")
+
     def reset(self, *, seed=None, options=None):
         """
         Resets the entire game.
@@ -216,7 +218,7 @@ class PokerEnv(gym.Env):
         # raise
         raised_by = new_bet - other_player_old_bet
         if raised_by < self.min_raise:
-            print("Raise must be at least", self.min_raise, "but was", raised_by)
+            self.logger.error("Raise must be at least", self.min_raise, "but was", raised_by)
             return self.ActionType.INVALID
 
         # Discard has to be done in the flop and not any other streets
@@ -224,11 +226,11 @@ class PokerEnv(gym.Env):
             # on the flop, must be valid discard
             # TODO: What if a player decides to fold? Do they still have to show their cards?
             if card_to_discard < 0 and self.ACTION_TYPE != self.ActionType.FOLD:
-                print("Did not discard a card during the flop")
+                self.logger.error("Did not discard a card during the flop")
                 return self.ActionType.INVALID
         else:
             if card_to_discard != self.NO_DISCARD:
-                print("Discarded a card when it wasn't the flop")
+                self.logger.error("Discarded a card when it wasn't the flop")
                 return self.ActionType.INVALID
 
         return self.ActionType.RAISE
@@ -243,17 +245,9 @@ class PokerEnv(gym.Env):
 
     def _get_winner(self):
         board_cards = list(map(self.int_to_card, self.community_cards))
-        player_1_cards = list(
-            map(self.int_to_card, [c for c in self.player_cards[0] if c != -1])
-        )
-        player_2_cards = list(
-            map(self.int_to_card, [c for c in self.player_cards[1] if c != -1])
-        )
-        assert (
-            len(player_1_cards) == 2
-            and len(player_2_cards) == 2
-            and len(board_cards) == 5
-        )
+        player_1_cards = list(map(self.int_to_card, [c for c in self.player_cards[0] if c != -1]))
+        player_2_cards = list(map(self.int_to_card, [c for c in self.player_cards[1] if c != -1]))
+        assert len(player_1_cards) == 2 and len(player_2_cards) == 2 and len(board_cards) == 5
         player_1_hand_score = self.evaluator.evaluate(
             player_1_cards,
             board_cards,
@@ -277,19 +271,14 @@ class PokerEnv(gym.Env):
         """
         bet_amount, card_to_discard = action
         action_type = self._get_action_type(action)
-        print("Action type:", action_type)
+        self.logger.debug("Action type:", action_type)
         new_game = False
         new_street = False
         winner = None
 
         # Discard phase
-        if (
-            self.street == 1
-            and self.shown_cards[self.turn][self.DISCARD_CARD_POS] == -1
-        ):
-            self.shown_cards[self.turn][self.DISCARD_CARD_POS] = self.player_cards[
-                self.turn
-            ][card_to_discard]
+        if self.street == 1 and self.shown_cards[self.turn][self.DISCARD_CARD_POS] == -1:
+            self.shown_cards[self.turn][self.DISCARD_CARD_POS] = self.player_cards[self.turn][card_to_discard]
             self.player_cards[self.turn][card_to_discard] = -1
 
         # We consider invalid actions as folding
@@ -305,7 +294,7 @@ class PokerEnv(gym.Env):
             new_street = True
         elif action_type == self.ActionType.CHECK:
             if self.turn == 1 - self.small_blind_player:
-                new_street = True # big blind checks mean next street
+                new_street = True  # big blind checks mean next street
         elif action_type == self.ActionType.RAISE:
             self.bets[self.turn] = bet_amount
             self.min_raise = max(self.min_raise, bet_amount - self.bets[1 - self.turn])
@@ -318,19 +307,22 @@ class PokerEnv(gym.Env):
                 winner = self._get_winner()
                 self._update_bankrolls(winner)
                 new_game = True
-                
+
         if not new_game and not new_street:
             self.turn = 1 - self.turn
 
         obs, reward, terminated, truncated, info = self._get_obs(winner)
         if terminated:
-            print("Game is terminated. Final bankrolls:", self.bankrolls)
+            self.logger.info(f"Game is terminated. Final bankrolls: {self.bankrolls}")
+
+        if new_game and self.game_num % self.LOG_FREQUENCY == 0:
+            self.logger.info(f"Game {self.game_num} ended. Winner: Player {winner if winner != -1 else 'Tie'}")
+            self.logger.info(f"Updated bankrolls - Player 0: {self.bankrolls[0]}, Player 1: {self.bankrolls[1]}")
 
         if new_game:
             self._start_new_game()
 
         return obs, reward, terminated, truncated, info
-        
 
 
 if __name__ == "__main__":
