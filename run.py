@@ -5,7 +5,7 @@ Script to run matches between agents.
 import logging
 import multiprocessing
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -115,7 +115,10 @@ def run_local_match(agent1: Agent, agent2: Agent, num_games: int = 5, logger: lo
     return obs0["my_bankroll"] - obs1["my_bankroll"]
 
 
-def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, player0_resources=None, player1_resources=None, num_games: int = 1000) -> Dict[str, Any]:
+TIME_LIMIT_SECONDS = 420  # 7 minutes
+
+
+def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_games: int = 1000) -> Dict[str, Any]:
     """
     Run a match between two API-based agents.
 
@@ -123,8 +126,6 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, play
         base_url_0 (str): The base URL for the first agent's API.
         base_url_1 (str): The base URL for the second agent's API.
         logger (logging.Logger): The logger object to use for logging.
-        player0_resources: Optional resource tracker for player 0
-        player1_resources: Optional resource tracker for player 1
         num_games (int): The number of games to play. Defaults to 1000.
 
     Returns:
@@ -146,6 +147,37 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, play
     total_reward0 = 0
     total_reward1 = 0
 
+    # Track time used by each player
+    time_used_0 = 0.0
+    time_used_1 = 0.0
+
+    def handle_player_action(current_player: int, current_payload: Dict) -> Dict:
+        current_url = base_url_0 if current_player == 0 else base_url_1
+
+        action_start = time.time()
+        action = call_agent_api("GET", current_url, get_action_endpoint, current_payload, logger)
+        action_duration = time.time() - action_start
+
+        # Update time tracking
+        if current_player == 0:
+            nonlocal time_used_0
+            time_used_0 += action_duration
+            if time_used_0 > TIME_LIMIT_SECONDS:
+                raise TimeoutError("Player 0 exceeded time limit")
+        else:
+            nonlocal time_used_1
+            time_used_1 += action_duration
+            if time_used_1 > TIME_LIMIT_SECONDS:
+                raise TimeoutError("Player 1 exceeded time limit")
+
+        return action
+
+    def get_match_result(status: str, winner: Optional[int] = None, rewards: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
+        result = {"status": status, "winner": winner}
+        if rewards:
+            result.update({"bot0_reward": rewards[0], "bot1_reward": rewards[1]})
+        return result
+
     try:
         logger.info(f"Starting a new match with {num_games} games")
 
@@ -157,32 +189,19 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, play
             bot1_payload = prepare_payload(obs1, reward1, terminated, truncated, info)
 
             try:
-                if obs0["turn"] == 0:
-                    if player0_resources:
-                        player0_resources.start_action()
-                    action = call_agent_api("GET", base_url_0, get_action_endpoint, bot0_payload, logger)
-                    if player0_resources:
-                        player0_resources.end_action()
-                        if player0_resources.has_exceeded_time_limit():
-                            logger.info("Player 0 exceeded time limit")
-                            return {"status": "timeout", "winner": 1}
+                current_player = obs0["turn"]
+                observer_url = base_url_1 if current_player == 0 else base_url_0
+                current_payload = bot0_payload if current_player == 0 else bot1_payload
+                observer_payload = bot1_payload if current_player == 0 else bot0_payload
 
-                    call_agent_api("POST", base_url_1, send_obs_endpoint, bot1_payload, logger)
-                else:
-                    if player1_resources:
-                        player1_resources.start_action()
-                    action = call_agent_api("GET", base_url_1, get_action_endpoint, bot1_payload, logger)
-                    if player1_resources:
-                        player1_resources.end_action()
-                        if player1_resources.has_exceeded_time_limit():
-                            logger.info("Player 1 exceeded time limit")
-                            return {"status": "timeout", "winner": 0}
+                action = handle_player_action(current_player, current_payload)
 
-                    call_agent_api("POST", base_url_0, send_obs_endpoint, bot0_payload, logger)
+                # Send observation to the other player
+                call_agent_api("POST", observer_url, send_obs_endpoint, observer_payload, logger)
 
             except Exception as e:
                 logger.error(f"Error during bot communication: {str(e)}")
-                return {"status": "error", "winner": 1 - obs0["turn"]}
+                return get_match_result("error")
 
             action_value = action["action"]
             logger.debug(f"Bot {obs0['turn']} did action {action_value}")
@@ -203,11 +222,13 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, play
         logger.info("Match completed")
         logger.info(f"Final results - Bot0 total reward: {total_reward0}, Bot1 total reward: {total_reward1}")
 
-        return {"status": "completed", "winner": None, "bot0_reward": total_reward0, "bot1_reward": total_reward1}
+        return get_match_result("completed", rewards=(total_reward0, total_reward1))
 
+    except TimeoutError:
+        return get_match_result("timeout", winner=1 - current_player)
     except Exception as e:
-        logger.error(f"Match failed with error: {str(e)}")
-        return {"status": "error", "winner": None}
+        logger.error(f"Match failed: {str(e)}")
+        return get_match_result("error")
 
 
 def print_game_state(obs0: Dict[str, Any], obs1: Dict[str, Any]) -> None:
