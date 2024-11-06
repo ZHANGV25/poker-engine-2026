@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import time
 from typing import Any, Dict, Optional, Tuple
+import json
 
 import numpy as np
 import pandas as pd
@@ -215,6 +216,8 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
             if info is not None and info.get("game_ended", False):
                 game_count += 1
                 logger.info(f"Game {game_count} ended. Bot0 total reward: {total_reward0}, Bot1 total reward: {total_reward1}")
+                bankroll_log = format_bankroll_log(game_count, env.bankrolls)
+                logger.info(bankroll_log)
 
                 if game_count == num_games:
                     terminated = True
@@ -278,6 +281,17 @@ def run_all_local_matches(logger: logging.Logger) -> None:
 
     bankroll_df = pd.DataFrame(bankroll_matrix, columns=agent_names, index=agent_names)
     logger.info(f"\n{bankroll_df}")
+
+
+def format_bankroll_log(game_number: int, bankrolls: list) -> str:
+    """Format bankroll data as a JSON string for logging"""
+    bankroll_data = {
+        "type": "bankroll_update",
+        "game_number": game_number,
+        "bot0_bankroll": int(bankrolls[0]),
+        "bot1_bankroll": int(bankrolls[1])
+    }
+    return json.dumps(bankroll_data)
 
 
 if __name__ == "__main__":
