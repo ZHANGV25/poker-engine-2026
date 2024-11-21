@@ -14,5 +14,5 @@ jobs:
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.ENGINE_PAT }}
-          repository: cmu-dsc/poker-backend-2025
+          repository: cmu-dsc/poker-infra
           event-type: rebuild-engine
