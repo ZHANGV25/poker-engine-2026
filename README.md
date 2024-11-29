@@ -25,5 +25,5 @@
 ## Running Tests
 
 ```bash
-pytest --cov=gym_env --cov-report=term-missing --cov-report=html
+pytest --cov=gym_env --cov-report=term-missing --cov-report=html --cov-branch
 ```
