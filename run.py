@@ -238,12 +238,29 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
 
         logger.info("Match completed")
         logger.info(f"Final results - Bot0 total reward: {env.bankrolls[0]}, Bot1 total reward: {env.bankrolls[1]}")
-        return {
-            "status": "completed",
-            "winner": None,
-            "bot0_reward": env.bankrolls[0],
-            "bot1_reward": env.bankrolls[1],
-        }
+        if env.bankrolls[0] > env.bankrolls[1]:
+            result = {
+                "status": "completed",
+                "result": "win",  # player1 wins
+                "bot0_reward": env.bankrolls[0],
+                "bot1_reward": env.bankrolls[1]
+            }
+        elif env.bankrolls[1] > env.bankrolls[0]:
+            result = {
+                "status": "completed",
+                "result": "loss",  # player2 wins
+                "bot0_reward": env.bankrolls[0],
+                "bot1_reward": env.bankrolls[1]
+            }
+        else:
+            result = {
+                "status": "completed",
+                "result": "tie",
+                "bot0_reward": env.bankrolls[0],
+                "bot1_reward": env.bankrolls[1]
+            }
+
+        return result
 
     except TimeoutError:
         return get_match_result("timeout", winner=1 - current_player)
