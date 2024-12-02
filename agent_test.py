@@ -40,12 +40,12 @@ class InvalidActionError(Exception):
         return f"Invalid action '{self.action}' attempted in observation '{self.observation}'."
 
 
-def run_game(player_bot_num: int, test_agent_class: Agent):
+def run_game(player_bot_num: int, test_agent_class: Agent, num_hands: int):
     """
     Run the agents against each other and check for errors
     """
     logger = getLogger(__name__)
-    env = PokerEnv(logger=logger)
+    env = PokerEnv(logger=logger, num_hands=num_hands)
     my_agent = MyAgent(logger=logger)
     test_agent = test_agent_class(logger=logger)
 
@@ -90,7 +90,7 @@ def main():
         for game_num in range(NUM_HANDS):
             try:
                 player_bot_num = game_num % 2
-                reward = run_game(player_bot_num, test_agent_class)
+                reward = run_game(player_bot_num, test_agent_class, NUM_HANDS)
                 player_bankroll += reward[player_bot_num]
                 test_bot_bankroll += reward[1 - player_bot_num]
                 print("passed game number", game_num)

@@ -10,20 +10,21 @@ from pydantic import BaseModel
 # was giving me issues.
 class Observation(TypedDict):
     street: int
-    turn: int
+    acting_agent: int
     my_cards: List[int]
     community_cards: List[int]
     my_bet: int
     opp_bet: int
-    my_bankroll: int
-    opp_shown_cards: List[int]
-    game_num: int
+    opp_discarded_card: int
+    opp_drawn_card: int
     min_raise: int
+    max_raise: int
+    valid_actions: List[int]
 
 
 class ActionRequest(BaseModel):
     observation: Observation
-    reward: int
+    reward: float
     terminated: bool
     truncated: bool
     info: Any
@@ -31,18 +32,18 @@ class ActionRequest(BaseModel):
 
 class ObservationRequest(BaseModel):
     observation: Observation
-    reward: int
+    reward: float
     terminated: bool
     truncated: bool
     info: Any
 
 
 class ActionResponse(BaseModel):
-    action: Tuple[int, int]
+    action: Tuple[int, int, int]
 
 
 class Agent(ABC):
-    def __init__(self, logger: logging.Logger=None):
+    def __init__(self, logger: logging.Logger = None):
         self.app = FastAPI()
         self.logger = logger or logging.getLogger(__name__)
         self.add_routes()

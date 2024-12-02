@@ -110,12 +110,8 @@ class State:
 
 def check_observation(expected_obs: dict, got_obs: dict):
     for field, value in expected_obs.items():
-        assert field in got_obs, print(
-            f"Field {field} was expected, but wasn't present in obs: {got_obs}"
-        )
-        assert got_obs[field] == value, print(
-            f"Field {field} failed: expected {value}, got {got_obs[field]}"
-        )
+        assert field in got_obs, print(f"Field {field} was expected, but wasn't present in obs: {got_obs}")
+        assert got_obs[field] == value, print(f"Field {field} failed: expected {value}, got {got_obs[field]}")
 
 
 class Action:
@@ -142,12 +138,8 @@ class GameState:
         self.p1obs = p1obs
 
 
-def _test_engine(
-    rigged_deck: list[int],
-    updates: list[tuple[Action, tuple[dict, dict]]],
-    expected_final_rewards: tuple[int, int],
-):
-    engine = PokerEnv()  # small blind player always starts out as 0
+def _test_engine(rigged_deck: list[int], updates: list[tuple[Action, tuple[dict, dict]]], expected_final_rewards: tuple[int, int], num_hands: int = 1):
+    engine = PokerEnv(num_hands=num_hands)  # small blind player always starts out as 0
     assert isinstance(rigged_deck, list)
     (player0_obs, player1_obs), _info = engine.reset(
         options={"cards": rigged_deck}  # rig the deck
@@ -171,9 +163,7 @@ def _test_engine(
         expected_community_cards.append(reversed_deck.pop())
 
     p0_valid_actions = [1] * 5
-    p0_valid_actions[engine.ActionType.CHECK.value] = (
-        0  # p0 can't check as it's small blind
-    )
+    p0_valid_actions[engine.ActionType.CHECK.value] = 0  # p0 can't check as it's small blind
 
     # pop redraw cards next (as needed)
     player0_expected_obs = {
@@ -209,24 +199,18 @@ def _test_engine(
     check_observation(player1_expected_obs, player1_obs)
 
     for i, (action, expected_state) in enumerate(updates):
-        obs, reward, terminated, _, _ = engine.step(
-            (action.action, action.raise_ammount, action.card_to_discard)
-        )
+        obs, reward, terminated, _, _ = engine.step((action.action, action.raise_ammount, action.card_to_discard))
         p0_got_obs, p1_got_obs = obs
         p0_got_reward, p1_got_reward = reward
 
-        assert terminated == (i == (len(updates) - 1)), print(
-            f"terminated: {terminated}; len(updates): {len(updates)}; i: {i}"
-        )
+        assert terminated == (i == (len(updates) - 1)), print(f"terminated: {terminated}; len(updates): {len(updates)}; i: {i}")
 
         expected_p0_obs, expected_p1_obs = expected_state
         check_observation(expected_p0_obs, p0_got_obs)
         check_observation(expected_p1_obs, p1_got_obs)
 
         if terminated:
-            assert reward == expected_final_rewards, print(
-                f"Got final reward: {reward}, expected: {expected_final_rewards}"
-            )
+            assert reward == expected_final_rewards, print(f"Got final reward: {reward}, expected: {expected_final_rewards}")
         else:
             assert p0_got_reward == 0 and p1_got_reward == 0
 
@@ -266,9 +250,7 @@ def test_allways_check():
             ],
         )
     )
-    _test_engine(
-        rigged_deck=rigged_deck, updates=updates, expected_final_rewards=(2, -2)
-    )
+    _test_engine(rigged_deck=rigged_deck, updates=updates, expected_final_rewards=(2, -2))
 
 
 def test_allways_raise_small():
@@ -279,9 +261,7 @@ def test_allways_raise_small():
     big_blind_call = Action(PokerEnv.ActionType.CALL.value, min_bet, -1)
     # preflop: p0raise->p1call 4 => flop p0raise->p1call 8=> river p0raise p1call 12=> turn p0raise p1call
     actions = ([small_blind_raise] + [big_blind_call]) * 4
-    states = [({"min_raise": 4}, {"min_raise": 4})] + [
-        ({"min_raise": 2}, {"min_raise": 2})
-    ] * 7
+    states = [({"min_raise": 4}, {"min_raise": 4})] + [({"min_raise": 2}, {"min_raise": 2})] * 7
     assert len(states) == len(actions)
     updates = list(zip(actions, states))
     rigged_deck = list(
@@ -339,9 +319,7 @@ def test_example_tie():
             ],
         )
     )
-    _test_engine(
-        rigged_deck=rigged_deck, updates=updates, expected_final_rewards=(0, 0)
-    )
+    _test_engine(rigged_deck=rigged_deck, updates=updates, expected_final_rewards=(0, 0))
 
 
 def test_example_game_1():
@@ -360,7 +338,6 @@ def test_example_game_1():
         Action(PokerEnv.ActionType.RAISE.value, 10, -1),
         Action(PokerEnv.ActionType.CALL.value, 0, -1),
     ]
-
 
     obs = [
         (
@@ -712,7 +689,6 @@ def test_example_game_1():
         expected_final_rewards=expected_final_rewards,
     )
     return
-
 
 
 def test_example_game_2():
@@ -1299,7 +1275,7 @@ def test_example_game_5():
     """
     A game with max bet
     """
-    rigged_deck = [24,10,14,5,-1,-1,-1,-1,-1,-1]
+    rigged_deck = [24, 10, 14, 5, -1, -1, -1, -1, -1, -1]
     expected_final_rewards = (-2, 2)
     actions = [
         Action(PokerEnv.ActionType.CALL.value, 0, -1),
@@ -1440,11 +1416,11 @@ def test_discard_invalid_card():
             ],
         )
     )
-    
+
     small_blind_call = Action(PokerEnv.ActionType.CALL.value, 0, -1)
     invalid_discard = Action(PokerEnv.ActionType.DISCARD.value, 0, -1)
     either_player_check = Action(PokerEnv.ActionType.CHECK.value, 0, -1)
-    
+
     # Initial state after small blind calls
     p0_obs = {
         "my_cards": [np.int64(rigged_deck[0]), np.int64(rigged_deck[1])],
@@ -1456,7 +1432,7 @@ def test_discard_invalid_card():
         "my_discarded_card": -1,
         "my_drawn_card": -1,
     }
-    
+
     # Complete sequence of actions to end the game:
     # 1. Small blind calls
     # 2. Invalid discard attempt
@@ -1472,12 +1448,30 @@ def test_discard_invalid_card():
         (either_player_check, ({}, {})),
         (either_player_check, ({}, {})),  # showdown
     ]
-    
+
     _test_engine(
         rigged_deck=rigged_deck,
         updates=updates,
-        expected_final_rewards=(2, -2)  # p0 wins with three of a kind
+        expected_final_rewards=(2, -2),  # p0 wins with three of a kind
     )
+
+
+def test_small_blind_alternation():
+    """
+    Test that the small blind alternates between players correctly.
+    """
+    env = PokerEnv(num_hands=4)
+
+    small_blind_positions = []
+
+    for _ in range(4):
+        small_blind_positions.append(env.small_blind_player)
+        
+        obs, _ = env.reset()
+
+    expected_pattern = [0, 1, 0, 1]
+    assert small_blind_positions == expected_pattern, f"Small blind positions {small_blind_positions} don't match expected pattern {expected_pattern}"
+    print("Small blind alternation test passed!")
 
 
 def main():
@@ -1491,6 +1485,8 @@ def main():
     test_example_game_3()
     test_example_game_4()
     test_example_game_5()
+    test_small_blind_alternation()
+
 
 if __name__ == "__main__":
     main()

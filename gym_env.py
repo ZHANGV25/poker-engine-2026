@@ -51,9 +51,12 @@ class PokerEnv(gym.Env):
         DISCARD = 4
         INVALID = 5
 
-    def __init__(self, logger=None, small_blind_amount=1):
+    def __init__(self, logger=None, small_blind_amount=1, num_hands=1):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
+        self.num_hands = num_hands
+        self.current_hand = 0
+        self.bankrolls = [0, 0]
 
         self.small_blind_amount = small_blind_amount
         self.big_blind_amount = small_blind_amount * 2
@@ -65,9 +68,13 @@ class PokerEnv(gym.Env):
 
         # Action space is a Tuple (action_type, raise_amount, card_to_discard)
         # where action is a Discrete(4), raise_amount is a Discrete(100), and card_to_discard is a Discrete(3) (-1 means no card is discarded)
-        self.action_space = spaces.Tuple([
-            spaces.Discrete(len(self.ActionType) - 1), # user can pass any besides INVALID
-            spaces.Discrete(self.MAX_PLAYER_BET, start=1), spaces.Discrete(3, start=-1)])
+        self.action_space = spaces.Tuple(
+            [
+                spaces.Discrete(len(self.ActionType) - 1),  # user can pass any besides INVALID
+                spaces.Discrete(self.MAX_PLAYER_BET, start=1),
+                spaces.Discrete(3, start=-1),
+            ]
+        )
 
         # Card space is a Discrete(28), -1 means the card is not shown
         cards_space = spaces.Discrete((len(self.SUITS) * len(self.RANKS)) + 1, start=-1)
@@ -95,9 +102,7 @@ class PokerEnv(gym.Env):
 
         # Since we have two players, the observation space is a tuple of
         # (observation_space_one_player, observation_space_one_player)
-        self.observation_space = spaces.Tuple(
-            [observation_space_one_player for _ in range(2)]
-        )
+        self.observation_space = spaces.Tuple([observation_space_one_player for _ in range(2)])
 
         # New episode
         self.reset(seed=int.from_bytes(os.urandom(32)))
@@ -116,7 +121,7 @@ class PokerEnv(gym.Env):
         # You can discard only in the street (0,1)
         if self.street > 1:
             valid_actions[self.ActionType.DISCARD.value] = 0
-        
+
         if (max(self.bets)) == self.MAX_PLAYER_BET:
             valid_actions[self.ActionType.RAISE.value] = 0
 
@@ -135,9 +140,7 @@ class PokerEnv(gym.Env):
             "street": self.street,
             "acting_agent": self.acting_agent,
             "my_cards": self.player_cards[player_num],
-            "community_cards": self.community_cards[:num_cards_to_reveal] + [
-                -1 for _ in range(5 - num_cards_to_reveal)
-            ],
+            "community_cards": self.community_cards[:num_cards_to_reveal] + [-1 for _ in range(5 - num_cards_to_reveal)],
             "my_bet": self.bets[player_num],
             "opp_bet": self.bets[1 - player_num],
             "opp_discarded_card": self.discarded_cards[1 - player_num],
@@ -168,12 +171,7 @@ class PokerEnv(gym.Env):
             reward = (0, 0)
         terminated = winner is not None
         truncated = False
-        info = {
-            "player_0_cards": info0["player_cards"],
-            "player_1_cards": info1["player_cards"],
-            "community_cards": info0["community_cards"],
-            "invalid_action": invalid_action
-        }
+        info = {"player_0_cards": info0["player_cards"], "player_1_cards": info1["player_cards"], "community_cards": info0["community_cards"], "invalid_action": invalid_action}
         return (obs0, obs1), reward, terminated, truncated, info
 
     def _draw_card(self):
@@ -189,6 +187,29 @@ class PokerEnv(gym.Env):
         options is a dict with the following keys:
         - cards: a list of 27 cards to be used in the game
         """
+        super().reset(seed=seed)
+
+        # Increment hand counter
+        self.current_hand += 1
+
+        if self.current_hand % 25 == 0:
+            self.logger.info(f"Starting hand {self.current_hand} of {self.num_hands}. Bankrolls: Bot0={self.bankrolls[0]}, Bot1={self.bankrolls[1]}")
+
+        # Alternate the small blind player
+        # Start with player 0 as small blind, then alternate each hand
+        self.small_blind_player = (self.current_hand + 1) % 2
+        self.acting_agent = self.small_blind_player
+
+        # Reset hand-specific variables but keep bankrolls
+        self.street = 0
+        self.bets = [0, 0]
+
+        # Set initial bets based on small blind position
+        if self.small_blind_player == 0:
+            self.bets = [self.small_blind_amount, self.big_blind_amount]
+        else:
+            self.bets = [self.big_blind_amount, self.small_blind_amount]
+
         super().reset(seed=seed)
         if options is not None:
             self.cards = options["cards"]
@@ -217,6 +238,11 @@ class PokerEnv(gym.Env):
             "player_1_cards": info1["player_cards"],
             "community_cards": info0["community_cards"],
         }
+
+        # Add bankroll info to observations
+        obs0["my_bankroll"] = self.bankrolls[0]
+        obs1["my_bankroll"] = self.bankrolls[1]
+
         return (obs0, obs1), info
 
     def _next_street(self):
@@ -234,17 +260,9 @@ class PokerEnv(gym.Env):
         Returns the winner of the game.
         """
         board_cards = list(map(self.int_to_card, self.community_cards))
-        player_0_cards = list(
-            map(self.int_to_card, [c for c in self.player_cards[0] if c != -1])
-        )
-        player_1_cards = list(
-            map(self.int_to_card, [c for c in self.player_cards[1] if c != -1])
-        )
-        assert (
-            len(player_0_cards) == 2
-            and len(player_1_cards) == 2
-            and len(board_cards) == 5
-        )
+        player_0_cards = list(map(self.int_to_card, [c for c in self.player_cards[0] if c != -1]))
+        player_1_cards = list(map(self.int_to_card, [c for c in self.player_cards[1] if c != -1]))
+        assert len(player_0_cards) == 2 and len(player_1_cards) == 2 and len(board_cards) == 5
         player_0_hand_rank = self.evaluator.evaluate(
             player_0_cards,
             board_cards,
@@ -269,7 +287,7 @@ class PokerEnv(gym.Env):
     def step(self, action: tuple[int, int, int]):
         """
         Takes a step in the game, given the action taken by the active player.
-        
+
         `action`: (action_type, raise_amount, card_to_discard)
             - `action_type`: `int`, index of the action type
             - `raise_amount`: `int`, how much to raise, or 0 for a check or call
@@ -304,11 +322,12 @@ class PokerEnv(gym.Env):
             if self.acting_agent == PokerEnv.BIG_BLIND_PLAYER:
                 new_street = True  # big blind checks mean next street
         elif action_type == self.ActionType.RAISE.value:
-            assert (self.bets[1-self.acting_agent] >= self.bets[self.acting_agent]), self.logger.log(
-                "Expected the opponent to have bet at least as much as current player, given current player is raising")
-            self.bets[self.acting_agent] = self.bets[1-self.acting_agent] + raise_amount
-            raise_so_far = (self.bets[1-self.acting_agent] - self.last_street_bet)
-            
+            assert self.bets[1 - self.acting_agent] >= self.bets[self.acting_agent], self.logger.log(
+                "Expected the opponent to have bet at least as much as current player, given current player is raising"
+            )
+            self.bets[self.acting_agent] = self.bets[1 - self.acting_agent] + raise_amount
+            raise_so_far = self.bets[1 - self.acting_agent] - self.last_street_bet
+
             max_raise = self.MAX_PLAYER_BET - max(self.bets)
             min_raise_no_limit = raise_so_far + raise_amount
             self.min_raise = min(min_raise_no_limit, max_raise)
@@ -316,9 +335,7 @@ class PokerEnv(gym.Env):
             # Must be DISCARD at this point
             assert action_type == self.ActionType.DISCARD.value, f"Unexpected action type: {action_type}"
             if card_to_discard != -1:
-                self.discarded_cards[self.acting_agent] = self.player_cards[
-                    self.acting_agent
-                ][card_to_discard]
+                self.discarded_cards[self.acting_agent] = self.player_cards[self.acting_agent][card_to_discard]
                 drawn_card = self._draw_card()
                 self.drawn_cards[self.acting_agent] = drawn_card
                 self.player_cards[self.acting_agent][card_to_discard] = drawn_card
@@ -333,9 +350,36 @@ class PokerEnv(gym.Env):
 
         obs, reward, terminated, truncated, info = self._get_obs(winner, action_type == self.ActionType.INVALID.value)
         if terminated:
-            self.logger.info(f"Game is terminated. Final rewards: {reward}")
             self.logger.debug(
-                f"Game is terminated. P0 cards: {list(map(self.int_card_to_str, self.player_cards[0]))}; P1 cards: {list(map(self.int_card_to_str, self.player_cards[1]))}; board cards: {list(map(self.int_card_to_str, self.community_cards))}")
+                f"Game is terminated. P0 cards: {list(map(self.int_card_to_str, self.player_cards[0]))}; P1 cards: {list(map(self.int_card_to_str, self.player_cards[1]))}; board cards: {list(map(self.int_card_to_str, self.community_cards))}"
+            )
+        # Check if this is the last hand
+        terminated = terminated or (self.current_hand == self.num_hands and winner is not None)
+
+        if winner is not None:
+            # Calculate rewards based on the bets
+            if winner == 0:
+                reward = (min(self.bets), -min(self.bets))
+            elif winner == 1:
+                reward = (-min(self.bets), min(self.bets))
+            else:
+                reward = (0, 0)
+
+            # Update bankrolls based on the actual bets
+            if winner == 0:
+                self.bankrolls[0] += self.bets[1]  # Winner gets opponent's bet
+                self.bankrolls[1] -= self.bets[1]  # Loser loses their bet
+            elif winner == 1:
+                self.bankrolls[0] -= self.bets[0]  # Loser loses their bet
+                self.bankrolls[1] += self.bets[0]  # Winner gets opponent's bet
+            # In case of a tie, bets are returned
+
+            # Only terminate if this is the last hand
+            terminated = self.current_hand >= self.num_hands
+
+            if not terminated:
+                # Reset for next hand if not terminated
+                obs, info = self.reset()
+                return obs, reward, terminated, truncated, info
+
         return obs, reward, terminated, truncated, info
-
-
