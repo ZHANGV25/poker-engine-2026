@@ -2,6 +2,7 @@
 Script to run matches between agents.
 """
 
+import csv
 import json
 import logging
 import multiprocessing
@@ -11,9 +12,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
-
 from agents.agent import Agent
-from agents.test_agents import AllInAgent, RandomAgent, all_agent_classes
+from agents.prob_agent import ProbabilityAgent
+from agents.test_agents import RandomAgent, all_agent_classes
 from gym_env import PokerEnv
 
 
@@ -133,7 +134,7 @@ def run_local_match(agent1: Agent, agent2: Agent, num_games: int = 1000, logger:
 TIME_LIMIT_SECONDS = 420  # 7 minutes
 
 
-def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_games: int = 1000) -> Dict[str, Any]:
+def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_games: int = 1000, csv_path: str = "./match.csv") -> Dict[str, Any]:
     """
     Run a match between two API-based agents.
 
@@ -142,6 +143,7 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
         base_url_1 (str): The base URL for the second agent's API.
         logger (logging.Logger): The logger object to use for logging.
         num_games (int): The number of games to play. Defaults to 1000.
+        csv_path (str): The file path to write the match CSV to. Defaults to "./match.csv".
 
     Returns:
         Dict[str, Any]: A dictionary containing the match results:
@@ -165,6 +167,27 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
     # Track time used by each player
     time_used_0 = 0.0
     time_used_1 = 0.0
+
+    csv_headers = [
+        "hand_number",
+        "street",
+        "team_0_bankroll",
+        "team_1_bankroll",
+        "active_team",
+        "action_type",
+        "action_amount",
+        "team_0_cards",
+        "team_1_cards",
+        "board_cards",
+        "team_0_discarded",
+        "team_1_discarded",
+        "team_0_bet",
+        "team_1_bet",
+    ]
+
+    csv_file = open(csv_path, "w", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
+    writer.writeheader()
 
     def handle_player_action(current_player: int, current_payload: Dict) -> Dict:
         current_url = base_url_0 if current_player == 0 else base_url_1
@@ -203,6 +226,23 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
             bot0_payload = prepare_payload(obs0, reward0, terminated, truncated, info)
             bot1_payload = prepare_payload(obs1, reward1, terminated, truncated, info)
 
+            current_state = {
+                "hand_number": env.current_hand,
+                "street": obs0["street"],
+                "team_0_bankroll": env.bankrolls[0],
+                "team_1_bankroll": env.bankrolls[1],
+                "active_team": obs0["acting_agent"],
+                "team_0_cards": [env.int_card_to_str(c) for c in env.player_cards[0] if c != -1],
+                "team_1_cards": [env.int_card_to_str(c) for c in env.player_cards[1] if c != -1],
+                "board_cards": [env.int_card_to_str(c) for c in env.community_cards[: obs0["street"] + 2] if c != -1],
+                "team_0_discarded": env.int_card_to_str(env.discarded_cards[0]) if env.discarded_cards[0] != -1 else "",
+                "team_1_discarded": env.int_card_to_str(env.discarded_cards[1]) if env.discarded_cards[1] != -1 else "",
+                "team_0_bet": obs0["my_bet"] if obs0["acting_agent"] == 0 else obs0["opp_bet"],
+                "team_1_bet": obs1["my_bet"] if obs1["acting_agent"] == 1 else obs1["opp_bet"],
+                "action_type": "",  # Will be filled after action is taken
+                "action_amount": 0,  # Will be filled after action is taken
+            }
+
             try:
                 current_player = obs0["acting_agent"]
                 observer_url = base_url_1 if current_player == 0 else base_url_0
@@ -214,27 +254,32 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
                 # Send observation to the other player
                 call_agent_api("POST", observer_url, send_obs_endpoint, observer_payload, logger)
 
+                # Update action information in state and write to CSV
+                current_state["action_type"] = PokerEnv.ActionType(action["action"][0]).name
+                current_state["action_amount"] = action["action"][1]
+                writer.writerow(current_state)
+
+                action_value = action["action"]
+                logger.debug(f"Bot {obs0['acting_agent']} did action {action_value}")
+
+                (obs0, obs1), (reward0, reward1), terminated, truncated, info = env.step(action=action_value)
+                logger.debug(f"Bot0 reward: {reward0}, Bot1 reward: {reward1}")
+
+                total_reward0 += reward0
+                total_reward1 += reward1
+
+                if info is not None and info.get("game_ended", False):
+                    game_count += 1
+                    logger.info(f"Game {game_count} ended. Bot0 total reward: {total_reward0}, Bot1 total reward: {total_reward1}")
+                    bankroll_log = format_bankroll_log(game_count, env.bankrolls)
+                    logger.info(bankroll_log)
+
+                    if game_count == num_games:
+                        terminated = True
+
             except Exception as e:
                 logger.error(f"Error during bot communication: {str(e)}")
                 return get_match_result("error")
-
-            action_value = action["action"]
-            logger.debug(f"Bot {obs0['acting_agent']} did action {action_value}")
-
-            (obs0, obs1), (reward0, reward1), terminated, truncated, info = env.step(action=action_value)
-            logger.debug(f"Bot0 reward: {reward0}, Bot1 reward: {reward1}")
-
-            total_reward0 += reward0
-            total_reward1 += reward1
-
-            if info is not None and info.get("game_ended", False):
-                game_count += 1
-                logger.info(f"Game {game_count} ended. Bot0 total reward: {total_reward0}, Bot1 total reward: {total_reward1}")
-                bankroll_log = format_bankroll_log(game_count, env.bankrolls)
-                logger.info(bankroll_log)
-
-                if game_count == num_games:
-                    terminated = True
 
         logger.info("Match completed")
         logger.info(f"Final results - Bot0 total reward: {env.bankrolls[0]}, Bot1 total reward: {env.bankrolls[1]}")
@@ -243,22 +288,17 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
                 "status": "completed",
                 "result": "win",  # player1 wins
                 "bot0_reward": env.bankrolls[0],
-                "bot1_reward": env.bankrolls[1]
+                "bot1_reward": env.bankrolls[1],
             }
         elif env.bankrolls[1] > env.bankrolls[0]:
             result = {
                 "status": "completed",
                 "result": "loss",  # player2 wins
                 "bot0_reward": env.bankrolls[0],
-                "bot1_reward": env.bankrolls[1]
+                "bot1_reward": env.bankrolls[1],
             }
         else:
-            result = {
-                "status": "completed",
-                "result": "tie",
-                "bot0_reward": env.bankrolls[0],
-                "bot1_reward": env.bankrolls[1]
-            }
+            result = {"status": "completed", "result": "tie", "bot0_reward": env.bankrolls[0], "bot1_reward": env.bankrolls[1]}
 
         return result
 
@@ -267,6 +307,8 @@ def run_api_match(base_url_0: str, base_url_1: str, logger: logging.Logger, num_
     except Exception as e:
         logger.error(f"Match failed: {str(e)}")
         return get_match_result("error")
+    finally:
+        csv_file.close()  # Ensure the CSV file is properly closed
 
 
 def print_game_state(obs0: Dict[str, Any], obs1: Dict[str, Any]) -> None:
@@ -302,22 +344,6 @@ def log_game_state(logger: logging.Logger, obs0: Dict[str, Any], obs1: Dict[str,
     logger.debug("#####################")
 
 
-def run_all_local_matches(logger: logging.Logger) -> None:
-    """Run matches between all combinations of local agents and print results."""
-    agent_names = [x.name() for x in all_agent_classes]
-    bankroll_matrix = []
-
-    for i1, agent1 in enumerate(all_agent_classes):
-        bankroll_matrix.append([])
-        for i2, agent2 in enumerate(all_agent_classes):
-            logger.info(f"{agent_names[i1]} vs {agent_names[i2]}")
-            net_bankroll = run_local_match(agent1, agent2, logger=logger)
-            bankroll_matrix[-1].append(net_bankroll)
-
-    bankroll_df = pd.DataFrame(bankroll_matrix, columns=agent_names, index=agent_names)
-    logger.info(f"\n{bankroll_df}")
-
-
 def format_bankroll_log(game_number: int, bankrolls: list) -> str:
     """Format bankroll data as a JSON string for logging"""
     bankroll_data = {"type": "bankroll_update", "game_number": game_number, "bot0_bankroll": int(bankrolls[0]), "bot1_bankroll": int(bankrolls[1])}
@@ -328,14 +354,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
 
-    process0 = multiprocessing.Process(target=AllInAgent.run, args=(8000, logger))
+    process0 = multiprocessing.Process(target=ProbabilityAgent.run, args=(8000, logger))
     process1 = multiprocessing.Process(target=RandomAgent.run, args=(8001, logger))
 
     process0.start()
     process1.start()
 
     logger.info("Starting API-based match")
-    result = run_api_match("http://127.0.0.1:8000", "http://127.0.0.1:8001", logger)
+    # When running run.py by itself, just write match.csv locally:
+    result = run_api_match("http://127.0.0.1:8000", "http://127.0.0.1:8001", logger, csv_path="./match.csv")
     logger.info(f"Match result: {result}")
 
     # Clean up processes

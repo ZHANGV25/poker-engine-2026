@@ -13,11 +13,24 @@ class ProbabilityAgent(Agent):
     def __init__(self, logger=None):
         super().__init__(logger)
         self.evaluator = Evaluator()         
+        self.hand_count = 0
 
     def __name__(self):
         return "ProbabilityAgent"
 
     def act(self, observation, reward, terminated, truncated, info):
+        # Log new hand starts
+        if observation['street'] == 0:  # New hand
+            self.hand_count += 1
+            self.logger.info(f"Hand {self.hand_count}: Starting with bankroll {observation.get('my_bankroll', 0)}")
+            self.logger.info(f"Initial cards: {[int_to_card(c) for c in observation['my_cards']]}")
+
+        # Log significant community card developments
+        if observation['street'] > 0 and observation['community_cards']:
+            visible_cards = [c for c in observation['community_cards'] if c != -1]
+            if visible_cards:
+                self.logger.info(f"Community cards: {[int_to_card(c) for c in visible_cards]}")
+
         my_cards = observation["my_cards"]
         community_cards = observation["community_cards"]
         opp_discarded_card = observation["opp_discarded_card"]
@@ -64,6 +77,12 @@ class ProbabilityAgent(Agent):
         raise_amount = 0
         card_to_discard = -1
 
+        # Log decision making process for significant bets
+        if equity > 0.8:
+            self.logger.info(f"Strong hand detected (equity: {equity:.2f}) - considering raise")
+        elif observation['opp_bet'] > 100:  # Log big opponent bets
+            self.logger.info(f"Large opponent bet: {observation['opp_bet']} with equity {equity:.2f}")
+
         if equity > 0.8 and observation["valid_actions"][action_types.RAISE.value]:
             raise_amount = min(int(pot_size*0.75), observation["max_raise"])
             raise_amount = max(raise_amount, observation["min_raise"])
@@ -78,9 +97,19 @@ class ProbabilityAgent(Agent):
         else:
             action_type = action_types.FOLD.value
 
+        # Log significant actions
+        if action_type == action_types.RAISE.value and raise_amount > 100:
+            self.logger.info(f"Making large raise: {raise_amount} with equity {equity:.2f}")
+        elif action_type == action_types.FOLD.value and observation['opp_bet'] > 50:
+            self.logger.info(f"Folding to bet of {observation['opp_bet']} with equity {equity:.2f}")
+
         self.logger.debug(f"Action: {action_type}, Raise Amount: {raise_amount}, Card to Discard: {card_to_discard}")
 
         return action_type, raise_amount, card_to_discard
+
+    def observe(self, observation, reward, terminated, truncated, info):
+        if terminated:
+            self.logger.info(f"Hand {self.hand_count} completed with reward: {reward}")
 
 
 
