@@ -7,12 +7,12 @@ action_types = PokerEnv.ActionType
 
 
 class MyAgent(Agent):
+    def __name__(self):
+        return "MyAgent"
+
     def __init__(self, logger=None):
         super().__init__(logger)
         # Initialize any instance variables here
-
-    def __name__(self):
-        return "MyAgent"
 
     def act(self, observation, reward, terminated, truncated, info):
         # Example of using the logger

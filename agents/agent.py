@@ -45,8 +45,14 @@ class ActionResponse(BaseModel):
 class Agent(ABC):
     def __init__(self, logger: logging.Logger = None):
         self.app = FastAPI()
-        self.logger = logger or logging.getLogger(__name__)
+        # Use the provided logger directly, or create a new one
+        self.logger = logger or logging.getLogger(self.__name__())
         self.add_routes()
+
+    @abstractmethod
+    def __name__(self):
+        """Return the name of the agent. Must be implemented by subclasses."""
+        pass
 
     @abstractmethod
     def act(self, observation, reward, terminated, truncated, info) -> tuple[int, int]:
@@ -116,16 +122,18 @@ class Agent(ABC):
             logger (logging.Logger): The logger object to use for logging.
             host (str): The host to bind the server to. Defaults to "0.0.0.0".
         """
-        bot = cls(logger)
-        logger.info(f"Starting agent server on {host}:{port}")
+        # Create a logger for this agent instance
+        agent_logger = logging.getLogger(cls.__name__)
+        agent_logger.setLevel(logging.INFO)
 
-        uvicorn_logger = logging.getLogger("uvicorn")
-        uvicorn_logger.setLevel(logging.WARNING)
+        # Add a handler with formatting if none exists
+        if not agent_logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
+            agent_logger.addHandler(handler)
 
-        uvicorn_logger.handlers.clear()
+        bot = cls(agent_logger)
+        agent_logger.info(f"Starting agent server on {host}:{port}")
 
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        uvicorn_logger.addHandler(handler)
-
-        uvicorn.run(bot.app, host=host, port=port, log_config=None)
+        uvicorn.run(bot.app, host=host, port=port, log_level="info", access_log=False)
