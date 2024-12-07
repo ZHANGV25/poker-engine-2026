@@ -10,11 +10,11 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import requests
+
 from agents.agent import Agent
+from agents.player import PlayerAgent
 from agents.prob_agent import ProbabilityAgent
-from agents.test_agents import RandomAgent, all_agent_classes
 from gym_env import PokerEnv
 
 
@@ -355,7 +355,7 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     process0 = multiprocessing.Process(target=ProbabilityAgent.run, args=(8000, logger))
-    process1 = multiprocessing.Process(target=RandomAgent.run, args=(8001, logger))
+    process1 = multiprocessing.Process(target=PlayerAgent.run, args=(8001, logger))
 
     process0.start()
     process1.start()

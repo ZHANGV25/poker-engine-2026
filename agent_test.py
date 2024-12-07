@@ -4,7 +4,7 @@ Basic Test Suite for MyAgent which checks that it never does an invalid action
 
 import time
 from logging import getLogger
-from agents.my_agent import MyAgent
+from agents.player import MyAgent
 from agents.agent import Agent
 from agents.prob_agent import ProbabilityAgent
 from agents.test_agents import FoldAgent, CallingStationAgent, AllInAgent, RandomAgent

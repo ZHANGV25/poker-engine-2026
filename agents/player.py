@@ -1,4 +1,3 @@
-import random
 from agents.agent import Agent
 from gym_env import PokerEnv
 from agents.prob_agent import ProbabilityAgent
@@ -6,9 +5,9 @@ from agents.prob_agent import ProbabilityAgent
 action_types = PokerEnv.ActionType
 
 
-class MyAgent(Agent):
+class PlayerAgent(Agent):
     def __name__(self):
-        return "MyAgent"
+        return "PlayerAgent"
 
     def __init__(self, logger=None):
         super().__init__(logger)
@@ -16,7 +15,7 @@ class MyAgent(Agent):
 
     def act(self, observation, reward, terminated, truncated, info):
         # Example of using the logger
-        self.logger.info(f"Street: {observation['street']}, Bankroll: {observation.get('my_bankroll', 0)}")
+        self.logger.info(f"Street: {observation['street']}")
 
         # For now, we'll use the ProbabilityAgent's logic
         prob_agent = ProbabilityAgent(self.logger)
