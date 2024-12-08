@@ -296,8 +296,8 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
 
-    process0 = multiprocessing.Process(target=ProbabilityAgent.run, args=(8000, logger))
-    process1 = multiprocessing.Process(target=PlayerAgent.run, args=(8001, logger))
+    process0 = multiprocessing.Process(target=ProbabilityAgent.run, args=(False, 8000))
+    process1 = multiprocessing.Process(target=PlayerAgent.run, args=(True, 8001))
 
     process0.start()
     process1.start()

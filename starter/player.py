@@ -9,8 +9,8 @@ class PlayerAgent(Agent):
     def __name__(self):
         return "PlayerAgent"
 
-    def __init__(self, logger=None):
-        super().__init__(logger)
+    def __init__(self, stream: bool = True):
+        super().__init__(stream)
         # Initialize any instance variables here
 
     def act(self, observation, reward, terminated, truncated, info):
@@ -18,7 +18,7 @@ class PlayerAgent(Agent):
         self.logger.info(f"Street: {observation['street']}")
 
         # For now, we'll use the ProbabilityAgent's logic
-        prob_agent = ProbabilityAgent(self.logger)
+        prob_agent = ProbabilityAgent()
         return prob_agent.act(observation, reward, terminated, truncated, info)
         # valid_actions = observation["valid_actions"]
         # action_type = random.choice(valid_actions)

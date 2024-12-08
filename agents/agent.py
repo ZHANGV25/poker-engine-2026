@@ -1,8 +1,11 @@
 import logging
-import uvicorn
-from fastapi import FastAPI, HTTPException
+import os
+import sys
 from abc import ABC, abstractmethod
 from typing import Any, List, Tuple, TypedDict
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
@@ -43,11 +46,31 @@ class ActionResponse(BaseModel):
 
 
 class Agent(ABC):
-    def __init__(self, logger: logging.Logger = None):
+    def __init__(self, stream: bool = False):
         self.app = FastAPI()
-        # Use the provided logger directly, or create a new one
-        self.logger = logger or logging.getLogger(self.__name__())
+        self.logger = self._setup_logger(stream)
         self.add_routes()
+
+    def _setup_logger(self, stream: bool = False) -> logging.Logger:
+        """Set up a logger for this agent instance"""
+        logger = logging.getLogger(self.__name__())
+        logger.setLevel(logging.INFO)
+
+        match_id = os.getenv("MATCH_ID", "unknown")
+        player_id = os.getenv("PLAYER_ID", "unknown")
+        log_path = f"/tmp/match_{match_id}_{player_id}.log"
+
+        handler = logging.FileHandler(log_path)
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+        if stream:
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+
+        return logger
 
     @abstractmethod
     def __name__(self):
@@ -113,27 +136,8 @@ class Agent(ABC):
                 raise HTTPException(status_code=500, detail=str(e))
 
     @classmethod
-    def run(cls, port: int, logger: logging.Logger, host: str = "0.0.0.0"):
-        """
-        Run an API-based bot on a specified port.
-
-        Args:
-            port (int): The port number to run the bot on.
-            logger (logging.Logger): The logger object to use for logging.
-            host (str): The host to bind the server to. Defaults to "0.0.0.0".
-        """
-        # Create a logger for this agent instance
-        agent_logger = logging.getLogger(cls.__name__)
-        agent_logger.setLevel(logging.INFO)
-
-        # Add a handler with formatting if none exists
-        if not agent_logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-            handler.setFormatter(formatter)
-            agent_logger.addHandler(handler)
-
-        bot = cls(agent_logger)
-        agent_logger.info(f"Starting agent server on {host}:{port}")
-
+    def run(cls, stream: bool = False, port: int = 8000, host: str = "0.0.0.0"):
+        """Run an API-based bot on a specified port."""
+        bot = cls(stream)
+        bot.logger.info(f"Starting agent server on {host}:{port}")
         uvicorn.run(bot.app, host=host, port=port, log_level="info", access_log=False)

@@ -12,8 +12,8 @@ class ProbabilityAgent(Agent):
     def __name__(self):
         return "ProbabilityAgent"
 
-    def __init__(self, logger=None):
-        super().__init__(logger)
+    def __init__(self, stream: bool = False):
+        super().__init__(stream)
         self.evaluator = Evaluator()
 
     def act(self, observation, reward, terminated, truncated, info):
