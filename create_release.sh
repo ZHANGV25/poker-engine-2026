@@ -12,6 +12,7 @@ zip -r "$zip_name" \
     run.py \
     requirements.txt \
     agents/ \
+    starter/ \
     -x "**/.DS_Store" \
     "**/__pycache__/*" \
     "**/*.pyc" \

@@ -13,7 +13,7 @@ import numpy as np
 import requests
 
 from agents.agent import Agent
-from agents.player import PlayerAgent
+from starter.player import PlayerAgent
 from agents.prob_agent import ProbabilityAgent
 from gym_env import PokerEnv
 
