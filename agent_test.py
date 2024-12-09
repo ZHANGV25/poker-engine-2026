@@ -1,10 +1,10 @@
 """
-Basic Test Suite for MyAgent which checks that it never does an invalid action
+Basic Test Suite for PlayerAgent which checks that it never does an invalid action
 """
 
 import time
 from logging import getLogger
-from starter.player import MyAgent
+from starter.player import PlayerAgent
 from agents.agent import Agent
 from agents.prob_agent import ProbabilityAgent
 from agents.test_agents import FoldAgent, CallingStationAgent, AllInAgent, RandomAgent
@@ -46,7 +46,7 @@ def run_game(player_bot_num: int, test_agent_class: Agent, num_hands: int):
     """
     logger = getLogger(__name__)
     env = PokerEnv(logger=logger, num_hands=num_hands)
-    my_agent = MyAgent(logger=logger)
+    my_agent = PlayerAgent(logger=logger)
     test_agent = test_agent_class(logger=logger)
 
     bots: list[Agent] = [None, None]
@@ -74,7 +74,7 @@ def run_game(player_bot_num: int, test_agent_class: Agent, num_hands: int):
 
 def main():
     """
-    Runs NUM_GAMES games between MyAgent and ProbabilityAgent, alternating who
+    Runs NUM_GAMES games between PlayerAgent and ProbabilityAgent, alternating who
     is small blind
     """
     

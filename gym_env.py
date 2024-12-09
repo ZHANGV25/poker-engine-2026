@@ -52,18 +52,17 @@ class PokerEnv(gym.Env):
         INVALID = 5
 
     def __init__(self, logger=None, small_blind_amount=1, num_hands=1):
+        """
+        Represents a single hand of poker.
+        """
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
-        self.num_hands = num_hands
-        self.current_hand = 0
-        self.bankrolls = [0, 0]
 
         self.small_blind_amount = small_blind_amount
         self.big_blind_amount = small_blind_amount * 2
         self.min_raise = self.big_blind_amount
         self.acting_agent = PokerEnv.SMALL_BLIND_PLAYER
         self.last_street_bet = None
-        # Card evaluator from treys
         self.evaluator = Evaluator()
 
         # Action space is a Tuple (action_type, raise_amount, card_to_discard)
@@ -135,7 +134,7 @@ class PokerEnv(gym.Env):
             num_cards_to_reveal = 0
         else:
             num_cards_to_reveal = self.street + 2
-            
+
         obs = {
             "street": self.street,
             "acting_agent": self.acting_agent,
@@ -154,7 +153,7 @@ class PokerEnv(gym.Env):
         # All in situation
         if obs["min_raise"] > obs["max_raise"]:
             obs["min_raise"] = obs["max_raise"]
-        
+
         info = {
             "player_cards": [self.int_card_to_str(card) for card in obs["my_cards"] if card != -1],
             "community_cards": [self.int_card_to_str(card) for card in obs["community_cards"] if card != -1],
@@ -192,60 +191,40 @@ class PokerEnv(gym.Env):
         - cards: a list of 27 cards to be used in the game
         """
         super().reset(seed=seed)
-
-        # Increment hand counter
-        self.current_hand += 1
-
-        if self.current_hand % 25 == 0:
-            self.logger.info(f"Starting hand {self.current_hand} of {self.num_hands}. Bankrolls: Bot0={self.bankrolls[0]}, Bot1={self.bankrolls[1]}")
-
-        # Alternate the small blind player
-        # Start with player 0 as small blind, then alternate each hand
-        self.small_blind_player = (self.current_hand + 1) % 2
-        self.acting_agent = self.small_blind_player
-
-        # Reset hand-specific variables but keep bankrolls
         self.street = 0
         self.bets = [0, 0]
+        self.discarded_cards = [-1, -1]
+        self.drawn_cards = [-1, -1]
 
-        # Set initial bets based on small blind position
-        if self.small_blind_player == 0:
-            self.bets = [self.small_blind_amount, self.big_blind_amount]
-        else:
-            self.bets = [self.big_blind_amount, self.small_blind_amount]
+        # Set default values first
+        self.cards = np.arange(27)
+        np.random.shuffle(self.cards)
+        self.small_blind_player = 0  # Default to player 0
 
-        super().reset(seed=seed)
+        # Override with any provided options, using defaults as fallbacks
         if options is not None:
-            self.cards = options["cards"]
-        else:
-            self.cards = np.arange(27)
-            np.random.shuffle(self.cards)
+            self.cards = options.get("cards", self.cards)
+            self.small_blind_player = options.get("small_blind_player", self.small_blind_player)
 
+        # Deal to players and community
         self.player_cards = [[self._draw_card() for _ in range(2)] for _ in range(2)]
         self.community_cards = [self._draw_card() for _ in range(5)]
 
-        self.discarded_cards = [-1 for _ in range(2)]
-        self.drawn_cards = [-1 for _ in range(2)]
-        # p0 is the small blind player, p1 is the big-blind player
-        self.bets = [self.small_blind_amount, self.big_blind_amount]
-        self.acting_agent = 0
-        self.street = 0
+        # Assign blinds
+        self.acting_agent = self.small_blind_player
+        self.bets = [0, 0]
+        self.bets[self.small_blind_player] = self.small_blind_amount
+        self.bets[1 - self.small_blind_player] = self.big_blind_amount
         self.min_raise = self.big_blind_amount
         self.last_street_bet = 0
 
-        # gen observation, extract info
         obs0, info0 = self._get_single_player_obs(0)
         obs1, info1 = self._get_single_player_obs(1)
-
         info = {
             "player_0_cards": info0["player_cards"],
             "player_1_cards": info1["player_cards"],
             "community_cards": info0["community_cards"],
         }
-
-        # Add bankroll info to observations
-        obs0["my_bankroll"] = self.bankrolls[0]
-        obs1["my_bankroll"] = self.bankrolls[1]
 
         return (obs0, obs1), info
 
@@ -301,6 +280,7 @@ class PokerEnv(gym.Env):
         valid_actions = self._get_valid_actions(self.acting_agent)
         self.logger.debug(f"Action type: {action_type}, Valid actions: {valid_actions}, Street: {self.street}, Bets: {self.bets}")
 
+        # Handle invalid actions
         if not valid_actions[action_type]:
             self.logger.error(f"Invalid action: {action_type}")
             action_type = self.ActionType.INVALID.value
@@ -320,15 +300,15 @@ class PokerEnv(gym.Env):
             self.bets[self.acting_agent] = self.bets[1 - self.acting_agent]
             if not (self.street == 0 and self.acting_agent == self.SMALL_BLIND_PLAYER):
                 # on the first street, the little blind can "call" the big blind's bet of 2
-                assert self.bets[self.acting_agent] > self.big_blind_amount
+                assert self.bets[self.acting_agent] >= self.big_blind_amount
                 new_street = True
         elif action_type == self.ActionType.CHECK.value:
             if self.acting_agent == PokerEnv.BIG_BLIND_PLAYER:
                 new_street = True  # big blind checks mean next street
         elif action_type == self.ActionType.RAISE.value:
-            assert self.bets[1 - self.acting_agent] >= self.bets[self.acting_agent], self.logger.log(
-                "Expected the opponent to have bet at least as much as current player, given current player is raising"
-            )
+            assert (
+                self.bets[1 - self.acting_agent] >= self.bets[self.acting_agent]
+            ), "Expected the opponent to have bet at least as much as current player given current player is raising"
             self.bets[self.acting_agent] = self.bets[1 - self.acting_agent] + raise_amount
             raise_so_far = self.bets[1 - self.acting_agent] - self.last_street_bet
 
@@ -357,33 +337,15 @@ class PokerEnv(gym.Env):
             self.logger.debug(
                 f"Game is terminated. P0 cards: {list(map(self.int_card_to_str, self.player_cards[0]))}; P1 cards: {list(map(self.int_card_to_str, self.player_cards[1]))}; board cards: {list(map(self.int_card_to_str, self.community_cards))}"
             )
-        # Check if this is the last hand
-        terminated = terminated or (self.current_hand == self.num_hands and winner is not None)
 
-        if winner is not None:
-            # Calculate rewards based on the bets
             if winner == 0:
                 reward = (min(self.bets), -min(self.bets))
             elif winner == 1:
                 reward = (-min(self.bets), min(self.bets))
             else:
+                # tie
                 reward = (0, 0)
 
-            # Update bankrolls based on the actual bets
-            if winner == 0:
-                self.bankrolls[0] += self.bets[1]  # Winner gets opponent's bet
-                self.bankrolls[1] -= self.bets[1]  # Loser loses their bet
-            elif winner == 1:
-                self.bankrolls[0] -= self.bets[0]  # Loser loses their bet
-                self.bankrolls[1] += self.bets[0]  # Winner gets opponent's bet
-            # In case of a tie, bets are returned
-
-            # Only terminate if this is the last hand
-            terminated = self.current_hand >= self.num_hands
-
-            if not terminated:
-                # Reset for next hand if not terminated
-                obs, info = self.reset()
-                return obs, reward, terminated, truncated, info
+            return obs, reward, terminated, truncated, info
 
         return obs, reward, terminated, truncated, info

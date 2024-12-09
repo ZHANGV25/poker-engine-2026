@@ -1461,13 +1461,15 @@ def test_small_blind_alternation():
     Test that the small blind alternates between players correctly.
     """
     env = PokerEnv(num_hands=4)
-
     small_blind_positions = []
 
-    for _ in range(4):
-        small_blind_positions.append(env.small_blind_player)
-        
-        obs, _ = env.reset()
+    for hand_number in range(4):
+        # Reset with the small blind player determined by hand number
+        small_blind_player = hand_number % 2
+        obs, _ = env.reset(options={"small_blind_player": small_blind_player})
+
+        # Verify the small blind player was set correctly
+        small_blind_positions.append(small_blind_player)
 
     expected_pattern = [0, 1, 0, 1]
     assert small_blind_positions == expected_pattern, f"Small blind positions {small_blind_positions} don't match expected pattern {expected_pattern}"

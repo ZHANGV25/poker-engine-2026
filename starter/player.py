@@ -15,8 +15,9 @@ class PlayerAgent(Agent):
 
     def act(self, observation, reward, terminated, truncated, info):
         # Example of using the logger
-        self.logger.info(f"Street: {observation['street']}")
-
+        if observation["street"] == 0 and info["hand_number"] % 50 == 0:
+            self.logger.info(f"Hand number: {info['hand_number']}")
+        
         # For now, we'll use the ProbabilityAgent's logic
         prob_agent = ProbabilityAgent()
         return prob_agent.act(observation, reward, terminated, truncated, info)
