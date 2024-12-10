@@ -29,15 +29,12 @@ def verify_submission() -> Optional[str]:
     Returns:
         Optional[str]: Error message if verification fails, None if successful
     """
-    # Check if starter directory exists
     if not os.path.isdir("starter"):
         return "Starter directory not found"
 
-    # Check for required files
     if not os.path.isfile("starter/player.py"):
         return "Required file 'player.py' not found in starter directory"
 
-    # Try importing PlayerAgent
     try:
         spec = importlib.util.spec_from_file_location("player", "starter/player.py")
         if spec is None or spec.loader is None:
@@ -46,7 +43,6 @@ def verify_submission() -> Optional[str]:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        # Check if PlayerAgent exists and inherits from Agent
         if not hasattr(module, "PlayerAgent"):
             return "player.py does not contain PlayerAgent class"
 
@@ -99,16 +95,11 @@ def run_test_match(test_agent_class: Agent, logger):
         process0.start()
         process1.start()
 
-        # Give servers time to start
-        time.sleep(1)
-
-        # Run the match
         result = run_api_match("http://127.0.0.1:8000", "http://127.0.0.1:8001", logger, num_hands=NUM_HANDS, csv_path=f"./match_{test_agent_class.__name__}.csv")
 
         return result
 
     finally:
-        # Clean up processes
         process0.terminate()
         process1.terminate()
         process0.join()
@@ -123,12 +114,25 @@ def main():
     3. The agent can be initialized and run as an API server
     4. The agent can play full games without crashing
     5. The agent responds within time limits
+    
+    Returns:
+        dict: Test results containing:
+            - verification_error: str or None
+            - games_completed: int
+            - runtime_errors: int
+            - timeout_errors: int
+            - passed: bool
     """
-    # First verify the submission
-    error = verify_submission()
-    if error:
-        print(f"Submission verification failed: {error}")
-        sys.exit(1)
+    verification_error = verify_submission()
+    if verification_error:
+        print(f"Submission verification failed: {verification_error}")
+        return {
+            "verification_error": verification_error,
+            "games_completed": 0,
+            "runtime_errors": 0,
+            "timeout_errors": 0,
+            "passed": False
+        }
 
     logger = getLogger(__name__)
     test_results = {"games_completed": 0, "runtime_errors": 0, "timeout_errors": 0}
@@ -170,17 +174,23 @@ def main():
         else:
             print(f"✓ Time check passed: {time_per_hand:.2f}s per hand")
 
-    # Print final summary
     print("\nTest Suite Summary")
     print("-" * 50)
     print(f"Games completed successfully: {test_results['games_completed']}")
     print(f"Runtime errors encountered: {test_results['runtime_errors']}")
     print(f"Time limit violations: {test_results['timeout_errors']}")
 
-    # Return non-zero exit code if any errors occurred
-    if sum(test_results.values()) - test_results["games_completed"] > 0:
-        sys.exit(1)
+    test_results["verification_error"] = None
+    test_results["passed"] = (
+        test_results["games_completed"] > 0 and
+        test_results["runtime_errors"] == 0 and
+        test_results["timeout_errors"] == 0
+    )
+    
+    return test_results
 
 
 if __name__ == "__main__":
-    main()
+    results = main()
+    if not results["passed"]:
+        sys.exit(1)
