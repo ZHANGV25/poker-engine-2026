@@ -1,15 +1,17 @@
 import logging
+import time
 from unittest.mock import Mock, patch
 
 import pytest
 import requests
 
 from match import (
+    TIME_LIMIT_SECONDS,
     AgentFailure,
     AgentFailureTracker,
     call_agent_api,
-    run_api_match,
     get_match_result,
+    run_api_match,
 )
 
 
@@ -23,6 +25,19 @@ def reset_failure_tracker():
     """Reset the failure tracker before each test"""
     failure_tracker = AgentFailureTracker()
     return failure_tracker
+
+
+@pytest.fixture(autouse=True)
+def reduce_delays():
+    """Temporarily reduce delays and timeouts for testing"""
+    original_time_limit = TIME_LIMIT_SECONDS
+    original_sleep = time.sleep
+
+    # Patch time.sleep to be instant
+    with patch("time.sleep", return_value=None):
+        # Reduce the time limit for faster timeout tests
+        with patch("match.TIME_LIMIT_SECONDS", 0.1):
+            yield
 
 
 def test_call_agent_api_success(mock_logger):
@@ -116,16 +131,17 @@ def test_call_agent_api_retry_success(mock_logger):
     mock_response.json.return_value = {"action": [0, 0]}
 
     with patch("requests.request") as mock_request:
-        # Fail twice, then succeed
-        mock_request.side_effect = [
-            requests.exceptions.ConnectionError,
-            requests.exceptions.ConnectionError,
-            mock_response,
-        ]
+        with patch("time.sleep", return_value=None):  # Make retries instant
+            # Fail twice, then succeed
+            mock_request.side_effect = [
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ConnectionError,
+                mock_response,
+            ]
 
-        result = call_agent_api("GET", "http://test", "/endpoint", {}, mock_logger, 0)
-        assert result == {"action": [0, 0]}
-        assert mock_logger.error.call_count == 0
+            result = call_agent_api("GET", "http://test", "/endpoint", {}, mock_logger, 0)
+            assert result == {"action": [0, 0]}
+            assert mock_logger.error.call_count == 0
 
 
 def test_match_result_format():
