@@ -81,7 +81,7 @@ def test_call_agent_api_single_player_failing(mock_logger, reset_failure_tracker
 @pytest.mark.asyncio
 async def test_run_api_match_timeout(mock_logger):
     """Test match handling when a player exceeds time limit"""
-    with patch("run.call_agent_api") as mock_call:
+    with patch("match.call_agent_api") as mock_call:
         mock_call.side_effect = TimeoutError("Player 0 exceeded time limit")
 
         result = run_api_match("http://test1", "http://test2", mock_logger)
@@ -92,7 +92,7 @@ async def test_run_api_match_timeout(mock_logger):
 @pytest.mark.asyncio
 async def test_run_api_match_both_failing(mock_logger):
     """Test match handling when both players fail"""
-    with patch("run.call_agent_api") as mock_call:
+    with patch("match.call_agent_api") as mock_call:
         mock_call.side_effect = AgentFailure("Both players have failed multiple times")
         result = run_api_match("http://test1", "http://test2", mock_logger)
         assert result["status"] == "error"
@@ -102,7 +102,7 @@ async def test_run_api_match_both_failing(mock_logger):
 @pytest.mark.asyncio
 async def test_run_api_match_single_failure(mock_logger):
     """Test match handling when one player fails"""
-    with patch("run.call_agent_api") as mock_call:
+    with patch("match.call_agent_api") as mock_call:
         mock_call.side_effect = AgentFailure("Player 1 has failed 3 times")
 
         result = run_api_match("http://test1", "http://test2", mock_logger)
