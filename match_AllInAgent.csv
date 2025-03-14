@@ -1,0 +1,9 @@
+hand_number,street,active_team,team_0_bankroll,team_1_bankroll,action_type,action_amount,team_0_cards,team_1_cards,board_cards,team_0_discarded,team_1_discarded,team_0_bet,team_1_bet
+1,0,1,-8,8,RAISE,98,"['2h', '8d']","['As', '4s']","['3h', '3s']",,,1,1
+1,0,0,-8,8,FOLD,0,"['2h', '8d']","['As', '4s']","['3h', '3s']",,,2,2
+2,0,0,-10,10,RAISE,0,"['9h', '5d']","['2d', '8s']","['7s', '7d']",,,1,1
+3,0,1,-11,11,RAISE,98,"['9d', '8s']","['3s', '3h']","['4h', '7d']",,,1,1
+3,0,0,-11,11,FOLD,0,"['9d', '8s']","['3s', '3h']","['4h', '7d']",,,2,2
+4,0,0,-13,13,RAISE,0,"['6h', '4d']","['3d', '5d']","['6d', '2s']",,,1,1
+5,0,1,-14,14,RAISE,98,"['3s', '3h']","['As', 'Ah']","['8h', '2s']",,,1,1
+5,0,0,-14,14,RAISE,0,"['3s', '3h']","['As', 'Ah']","['8h', '2s']",,,2,2

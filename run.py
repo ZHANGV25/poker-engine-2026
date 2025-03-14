@@ -3,7 +3,7 @@ import multiprocessing
 
 from agents.test_agents import AllInAgent
 from match import run_api_match
-from starter.player import PlayerAgent
+from submission.player import PlayerAgent
 
 
 def main():

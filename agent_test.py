@@ -24,19 +24,19 @@ def verify_submission() -> Optional[str]:
     Verify that the submission contains required files and can be imported
 
     Args:
-        starter_dir: Path to the starter directory
+        submission_dir: Path to the submission directory
 
     Returns:
         Optional[str]: Error message if verification fails, None if successful
     """
-    if not os.path.isdir("starter"):
-        return "Starter directory not found"
+    if not os.path.isdir("submission"):
+        return "Submission directory not found"
 
-    if not os.path.isfile("starter/player.py"):
-        return "Required file 'player.py' not found in starter directory"
+    if not os.path.isfile("submission/player.py"):
+        return "Required file 'player.py' not found in submission directory"
 
     try:
-        spec = importlib.util.spec_from_file_location("player", "starter/player.py")
+        spec = importlib.util.spec_from_file_location("player", "submission/player.py")
         if spec is None or spec.loader is None:
             return "Could not load player.py"
 
@@ -63,7 +63,7 @@ def get_player_agent() -> Optional[Type[Agent]]:
         Optional[Type[Agent]]: PlayerAgent class if successful, None if import fails
     """
     try:
-        from starter.player import PlayerAgent
+        from submission.player import PlayerAgent
 
         return PlayerAgent
     except ImportError:
