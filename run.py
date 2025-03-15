@@ -1,28 +1,50 @@
 import logging
 import multiprocessing
+import json
+import importlib
 
-from agents.test_agents import AllInAgent
 from match import run_api_match
-from submission.player import PlayerAgent
 
+def load_agent_class(file_path):
+    """
+    Dynamically imports and returns an agent class from a string path.
+    Example: 'agents.test_agents.AllInAgent' -> AllInAgent class
+    """
+    module_path, class_name = file_path.rsplit('.', 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)
 
 def main():
+    # Load configuration
+    with open('agent_config.json', 'r') as f:
+        config = json.load(f)
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
 
-    process0 = multiprocessing.Process(target=AllInAgent.run, args=(False, 8000))
-    process1 = multiprocessing.Process(target=PlayerAgent.run, args=(True, 8001))
+    # Load agent classes dynamically
+    bot0_class = load_agent_class(config['bot0']['file_path'])
+    bot1_class = load_agent_class(config['bot1']['file_path'])
+
+    # Create processes using the configuration
+    process0 = multiprocessing.Process(
+        target=bot0_class.run,
+        args=(False, config['bot0']['port'])
+    )
+    process1 = multiprocessing.Process(
+        target=bot1_class.run,
+        args=(False, config['bot1']['port'])
+    )
 
     process0.start()
     process1.start()
 
     logger.info("Starting API-based match")
-    # When running run.py by itself, just write match.csv locally:
     result = run_api_match(
-        "http://127.0.0.1:8000",
-        "http://127.0.0.1:8001",
+        f"http://localhost:{config['bot0']['port']}",
+        f"http://localhost:{config['bot1']['port']}",
         logger,
-        csv_path="./match.csv",
+        csv_path=config['match_settings']['csv_output_path'],
     )
     logger.info(f"Match result: {result}")
 

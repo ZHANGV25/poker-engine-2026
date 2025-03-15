@@ -127,7 +127,7 @@ def call_agent_api(
     try:
         for attempt in range(max_retries):
             try:
-                response = requests.request(method, base_url + endpoint, json=payload)
+                response = requests.request(method, base_url + endpoint, json=payload, timeout=5.0)
                 response.raise_for_status()
                 failure_tracker.record_success(player_id)
                 return response.json()

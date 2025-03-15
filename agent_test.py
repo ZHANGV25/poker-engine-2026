@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import sys
 import time
+import logging
 from logging import getLogger
 from typing import Optional, Type
 
@@ -123,6 +124,9 @@ def main():
             - timeout_errors: int
             - passed: bool
     """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = getLogger(__name__)
+
     verification_error = verify_submission()
     if verification_error:
         print(f"Submission verification failed: {verification_error}")
@@ -134,7 +138,6 @@ def main():
             "passed": False
         }
 
-    logger = getLogger(__name__)
     test_results = {"games_completed": 0, "runtime_errors": 0, "timeout_errors": 0}
 
     test_agents = [ProbabilityAgent, AllInAgent, FoldAgent, CallingStationAgent, RandomAgent]

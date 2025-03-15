@@ -1,0 +1,13 @@
+{
+    "bot0": {
+        "file_path": "agents.test_agents.AllInAgent",
+        "port": 8000
+    },
+    "bot1": {
+        "file_path": "submission.player.PlayerAgent",
+        "port": 8001
+    },
+    "match_settings": {
+        "csv_output_path": "./match.csv"
+    }
+} 
