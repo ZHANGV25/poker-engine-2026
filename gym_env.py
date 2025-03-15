@@ -282,11 +282,13 @@ class PokerEnv(gym.Env):
 
         # Handle invalid actions
         if not valid_actions[action_type]:
-            self.logger.error(f"Invalid action: {action_type}")
+            action_name = self.ActionType(action_type).name
+            valid_action_names = [self.ActionType(i).name for i, is_valid in enumerate(valid_actions) if is_valid]
+            self.logger.error(f"Player {self.acting_agent} attempted invalid action: {action_name}. Valid actions are: {valid_action_names}")
             action_type = self.ActionType.INVALID.value
 
         if action_type == self.ActionType.RAISE.value and not (self.min_raise <= raise_amount <= (self.MAX_PLAYER_BET - max(self.bets))):
-            self.logger.error(f"Raise must be between [{self.min_raise}, {self.MAX_PLAYER_BET - max(self.bets)}] but was {raise_amount}")
+            self.logger.error(f"Player {self.acting_agent} attempted invalid raise amount: {raise_amount}. Must be between {self.min_raise} and {self.MAX_PLAYER_BET - max(self.bets)}")
             action_type = self.ActionType.INVALID.value
 
         winner = None
