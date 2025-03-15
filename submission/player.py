@@ -21,25 +21,33 @@ class PlayerAgent(Agent):
         if observation["street"] == 0 and info["hand_number"] % 50 == 0:
             self.logger.info(f"Hand number: {info['hand_number']}")
 
-        # Always check the valid actions
+        # First, get the list of valid actions we can take
         valid_actions = observation["valid_actions"]
-        action_type = random.choice(valid_actions)
-        return action_type, 0, -1
-        if action_types.RAISE in valid_actions:
-            action_type = action_types.RAISE
-            
-            # Always raise within the min and max raise
-            raise_amount = random.randint(observation["min_raise"], observation["max_raise"])
-        else:
-            action_type = random.choice(valid_actions)
-            raise_amount = 0
-
-        # If you discard, you will get to play another action immediately after (next act call)
-        if action_type == action_types.DISCARD:
+        
+        # Get indices of valid actions (where value is 1)
+        valid_action_indices = [i for i, is_valid in enumerate(valid_actions) if is_valid]
+        
+        # Randomly choose one of the valid action indices
+        action_type = random.choice(valid_action_indices)
+        
+        # Set up our response values
+        raise_amount = 0
+        card_to_discard = -1  # -1 means no discard
+        
+        # If we chose to raise, pick a random amount between min and max
+        if action_type == action_types.RAISE.value:
+            if observation["min_raise"] == observation["max_raise"]:
+                raise_amount = observation["min_raise"]
+            else:
+                raise_amount = random.randint(
+                    observation["min_raise"],
+                    observation["max_raise"]
+                )
+        
+        # If we chose to discard, randomly pick one of our two cards (0 or 1)
+        if action_type == action_types.DISCARD.value:
             card_to_discard = random.randint(0, 1)
-        else:
-            card_to_discard = -1
-
+        
         return action_type, raise_amount, card_to_discard
 
     def observe(self, observation, reward, terminated, truncated, info):
