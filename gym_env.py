@@ -287,18 +287,9 @@ class PokerEnv(gym.Env):
             self.logger.error(f"Player {self.acting_agent} attempted invalid action: {action_name}. Valid actions are: {valid_action_names}")
             action_type = self.ActionType.INVALID.value
 
-        # if action_type == self.ActionType.RAISE.value and not (self.min_raise <= raise_amount <= (self.MAX_PLAYER_BET - max(self.bets))):
-        #     self.logger.error(f"Player {self.acting_agent} attempted invalid raise amount: {raise_amount}. Must be between {self.min_raise} and {self.MAX_PLAYER_BET - max(self.bets)}")
-        #     action_type = self.ActionType.INVALID.value
-        if action_type == self.ActionType.RAISE.value:
-            max_raise_possible = self.MAX_PLAYER_BET - max(self.bets)
-            # If available raise is less than the normal minimum, treat it as an all-in raise.
-            if max_raise_possible < self.min_raise:
-                self.logger.info(f"Player {self.acting_agent} is all-in with available raise of {max_raise_possible}.")
-                raise_amount = max_raise_possible
-            elif not (self.min_raise <= raise_amount <= max_raise_possible):
-                self.logger.error(f"Player {self.acting_agent} attempted invalid raise amount: {raise_amount}. Must be between {self.min_raise} and {max_raise_possible}")
-                action_type = self.ActionType.INVALID.value
+        if action_type == self.ActionType.RAISE.value and not (self.min_raise <= raise_amount <= (self.MAX_PLAYER_BET - max(self.bets))):
+            self.logger.error(f"Player {self.acting_agent} attempted invalid raise amount: {raise_amount}. Must be between {self.min_raise} and {self.MAX_PLAYER_BET - max(self.bets)}")
+            action_type = self.ActionType.INVALID.value
 
         winner = None
 
