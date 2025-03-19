@@ -165,3 +165,7 @@ cython_debug/
 *.zip
 *.csv
 *.txt
+
+# Poker engine logs
+logs/
+agent_logs/

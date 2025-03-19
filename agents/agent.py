@@ -54,19 +54,25 @@ class Agent(ABC):
 
     def _setup_logger(self, stream: bool = False) -> logging.Logger:
         """Set up a logger for this agent instance"""
-        logger = logging.getLogger(self.__name__())
+        logger = logging.getLogger(self.__class__.__name__)
         logger.setLevel(logging.INFO)
-
+        
+        # Clear any existing handlers to avoid duplicate logging
+        logger.handlers.clear()
+        
+        # Create formatter
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        
+        # Set up file logging in a local agent_logs directory
         match_id = os.getenv("MATCH_ID", "unknown")
         player_id = os.getenv("PLAYER_ID", "unknown")
-        temp_dir = os.path.join(tempfile.gettempdir(), "poker-engine-logs")
-        os.makedirs(temp_dir, exist_ok=True)
-        log_path = os.path.join(temp_dir, f"match_{match_id}_{player_id}.log")
-
-        handler = logging.FileHandler(log_path)
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent_logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        log_path = os.path.join(logs_dir, f"match_{match_id}_{player_id}.log")
+        
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
         if stream:
             console_handler = logging.StreamHandler(sys.stdout)
