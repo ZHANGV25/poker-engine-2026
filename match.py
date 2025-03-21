@@ -185,7 +185,7 @@ def run_api_match(
         writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
         writer.writeheader()
 
-        for hand_number in range(1, num_hands + 1):
+        for hand_number in range(num_hands):
             env = PokerEnv(logger=logger)  # env for a single hand
             (obs0, obs1), info = env.reset()
             try:
