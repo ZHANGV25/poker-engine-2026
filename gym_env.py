@@ -206,6 +206,8 @@ class PokerEnv(gym.Env):
             self.cards = options.get("cards", self.cards)
             self.small_blind_player = options.get("small_blind_player", self.small_blind_player)
 
+        self.big_blind_player = 1 - self.small_blind_player
+            
         # Deal to players and community
         self.player_cards = [[self._draw_card() for _ in range(2)] for _ in range(2)]
         self.community_cards = [self._draw_card() for _ in range(5)]
@@ -214,7 +216,7 @@ class PokerEnv(gym.Env):
         self.acting_agent = self.small_blind_player
         self.bets = [0, 0]
         self.bets[self.small_blind_player] = self.small_blind_amount
-        self.bets[1 - self.small_blind_player] = self.big_blind_amount
+        self.bets[self.big_blind_player] = self.big_blind_amount
         self.min_raise = self.big_blind_amount
         self.last_street_bet = 0
 
@@ -236,7 +238,7 @@ class PokerEnv(gym.Env):
         self.min_raise = self.big_blind_amount
         assert self.bets[0] == self.bets[1], self.logger.log(f"Bet amounts are not equal: {self.bets}")
         self.last_street_bet = self.bets[0]
-        self.acting_agent = 0
+        self.acting_agent = self.small_blind_player
 
     def _get_winner(self):
         """
@@ -300,12 +302,12 @@ class PokerEnv(gym.Env):
             winner = 1 - self.acting_agent
         elif action_type == self.ActionType.CALL.value:
             self.bets[self.acting_agent] = self.bets[1 - self.acting_agent]
-            if not (self.street == 0 and self.acting_agent == self.SMALL_BLIND_PLAYER):
+            if not (self.street == 0 and self.acting_agent == self.small_blind_player):
                 # on the first street, the little blind can "call" the big blind's bet of 2
                 assert self.bets[self.acting_agent] >= self.big_blind_amount
                 new_street = True
         elif action_type == self.ActionType.CHECK.value:
-            if self.acting_agent == PokerEnv.BIG_BLIND_PLAYER:
+            if self.acting_agent == self.big_blind_player:
                 new_street = True  # big blind checks mean next street
         elif action_type == self.ActionType.RAISE.value:
             assert (
