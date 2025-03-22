@@ -246,7 +246,7 @@ def test_allways_check():
                 "2h",
                 "3h",
                 "4h",
-                # p0 wins
+                # p0 wins (higher 3 of a kind)
             ],
         )
     )
@@ -1476,6 +1476,44 @@ def test_small_blind_alternation():
     print("Small blind alternation test passed!")
 
 
+def test_ace_high_after_nine():
+    # small blind player goes first; they need to pay 1 to check
+    small_blind_call = Action(PokerEnv.ActionType.CALL.value, 0, -1)
+
+    either_player_check = Action(PokerEnv.ActionType.CHECK.value, 0, -1)
+
+    # pr-flop: bb checks (1); flop: 2 checks; turn: 2 checks; river: 2 checks
+    NUM_CHECK_ROUNDS = sum([1, 2, 2, 2])
+    actions = [small_blind_call] + ([either_player_check] * NUM_CHECK_ROUNDS)
+    states = [({}, {})] * (NUM_CHECK_ROUNDS + 1)
+    assert len(actions) == len(states)
+    updates = list(zip(actions, states))
+    # draws p0's 2 cards, then p1's 2 cards, then 5 community cards, starting at 0th index of rigged_deck
+    rigged_deck = list(
+        map(
+            card_str_to_int,
+            [
+                # p0's cards
+                "Ad",
+                "Ad",
+                # p1's cards
+                "9h",
+                "9d",
+                # community cards
+                "6h",
+                "7s",
+                "8h",
+                "9s",
+                "4h",
+                # p1 has three of a kind: 9, 9, 9,
+                # p0 has a straight, with ACE HIGH: 6, 7, 8, 9, A
+                # p0 wins
+            ],
+        )
+    )
+    _test_engine(rigged_deck=rigged_deck, updates=updates, expected_final_rewards=(2, -2))
+
+
 def main():
     test_utils()
     print("test utils passed")
@@ -1488,6 +1526,7 @@ def main():
     test_example_game_4()
     test_example_game_5()
     test_small_blind_alternation()
+    test_ace_high_after_nine()
 
 
 if __name__ == "__main__":
