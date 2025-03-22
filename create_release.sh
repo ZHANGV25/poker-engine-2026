@@ -17,6 +17,7 @@ cp agents/agent.py "$temp_dir/agents/"
 cp agents/test_agents.py "$temp_dir/agents/"
 cp -r submission/* "$temp_dir/submission/"
 cp -r docs/* "$temp_dir/docs/"
+cp agent_config.json "$temp_dir/"
 
 # Create zip file while excluding unwanted files
 zip -r "$zip_name" "$temp_dir" \

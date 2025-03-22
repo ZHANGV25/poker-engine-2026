@@ -12,7 +12,6 @@ from logging import getLogger
 from typing import Optional, Type
 
 from agents.agent import Agent
-from agents.prob_agent import ProbabilityAgent
 from agents.test_agents import AllInAgent, CallingStationAgent, FoldAgent, RandomAgent
 from match import run_api_match
 
@@ -140,7 +139,7 @@ def main():
 
     test_results = {"games_completed": 0, "runtime_errors": 0, "timeout_errors": 0}
 
-    test_agents = [ProbabilityAgent, AllInAgent, FoldAgent, CallingStationAgent, RandomAgent]
+    test_agents = [AllInAgent, FoldAgent, CallingStationAgent, RandomAgent]
 
     for test_agent_class in test_agents:
         print(f"\nTesting user bot against {test_agent_class.__name__}")
