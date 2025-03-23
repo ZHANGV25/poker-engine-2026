@@ -83,7 +83,7 @@ class PokerEnv(gym.Env):
         DISCARD = 4
         INVALID = 5
 
-    def __init__(self, logger=None, small_blind_amount=1, num_hands=1, rl_mode=False):
+    def __init__(self, logger=None, small_blind_amount=1, num_hands=1):
         """
         Represents a single hand of poker.
         """
@@ -96,7 +96,6 @@ class PokerEnv(gym.Env):
         self.acting_agent = PokerEnv.SMALL_BLIND_PLAYER
         self.last_street_bet = None
         self.evaluator = WrappedEval()
-        self.rl_mode=rl_mode
 
         # Action space is a Tuple (action_type, raise_amount, card_to_discard)
         # where action is a Discrete(4), raise_amount is a Discrete(100), and card_to_discard is a Discrete(3) (-1 means no card is discarded)
@@ -216,7 +215,7 @@ class PokerEnv(gym.Env):
                 "community_cards": info0["community_cards"],
                 "invalid_action": invalid_action,
             }
-            if is_showdown or self.rl_mode
+            if is_showdown
             else {}
         )
 
@@ -267,16 +266,7 @@ class PokerEnv(gym.Env):
 
         obs0, info0 = self._get_single_player_obs(0)
         obs1, info1 = self._get_single_player_obs(1)
-        info = (
-            {
-                "player_0_cards": info0["player_cards"],
-                "player_1_cards": info1["player_cards"],
-                "community_cards": info0["community_cards"],
-            }
-            if self.rl_mode
-            else {}
-        )
-
+        info = {}
         return (obs0, obs1), info
 
     def _next_street(self):

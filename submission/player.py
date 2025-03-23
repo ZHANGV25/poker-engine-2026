@@ -1,8 +1,6 @@
 from agents.agent import Agent
-from agents.test_agents import AllInAgent
 from gym_env import PokerEnv
 import random
-
 
 action_types = PokerEnv.ActionType
 
@@ -17,11 +15,8 @@ class PlayerAgent(Agent):
         self.hand_number = 0
         self.last_action = None
         self.won_hands = 0
-        self.all_in= AllInAgent()
 
     def act(self, observation, reward, terminated, truncated, info):
-        return self.all_in.act(observation, reward, terminated, truncated, info)
-        
         # Example of using the logger
         if observation["street"] == 0 and info["hand_number"] % 50 == 0:
             self.logger.info(f"Hand number: {info['hand_number']}")
@@ -57,12 +52,13 @@ class PlayerAgent(Agent):
 
     def observe(self, observation, reward, terminated, truncated, info):
         # Log interesting events when observing opponent's actions
+        pass
         if terminated:
-            self.logger.info(f"Game ended with reward: {reward}, info {info}")
+            self.logger.info(f"Game ended with reward: {reward}")
             self.hand_number += 1
             if reward > 0:
                 self.won_hands += 1
             self.last_action = None
         else:
             # log observation keys
-            self.logger.info(f"Observation keys: {observation}; Info:{info}")
+            self.logger.info(f"Observation keys: {observation}")
