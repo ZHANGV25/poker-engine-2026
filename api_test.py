@@ -111,7 +111,7 @@ async def test_run_api_match_both_failing(mock_logger):
         mock_call.side_effect = AgentFailure("Both players have failed multiple times")
         result = run_api_match("http://test1", "http://test2", mock_logger)
         assert result["status"] == "error"
-        assert result["error"] == "Both players have failed multiple times"
+        assert "Both players have failed multiple times" in result["error"]
 
 
 @pytest.mark.asyncio

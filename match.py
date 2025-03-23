@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import time
+import traceback
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -196,6 +197,9 @@ def run_api_match(
         writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
         writer.writeheader()
 
+        def format_error(e):
+            return f"ERROR Raised: \"{str(e)}\". Stacktrace:\n{traceback.format_exc()}"
+
         for hand_number in range(num_hands):
             env = PokerEnv(logger=logger)  # env for a single hand
             (obs0, obs1), info = env.reset()
@@ -213,13 +217,15 @@ def run_api_match(
                 return get_match_result("timeout", winner=winner)
             except AgentFailure as af:
                 if "Player 0 has failed" in str(af):
+                    # player 0 timeout
                     return get_match_result("timeout", winner=1)
                 elif "Player 1 has failed" in str(af):
+                    # player 1 timeout
                     return get_match_result("timeout", winner=0)
-                return get_match_result("error", error=str(af))
+                return get_match_result("error", error=format_error(af))
             except Exception as e:
                 logger.error(f"Unexpected error during hand {hand_number}: {e}")
-                return get_match_result("error", error=str(e))
+                return get_match_result("error", error=format_error(e))
 
         logger.info("All hands completed")
         logger.info(f"Final results - {team_0_name} bankroll: {bankrolls[0]}, {team_1_name} bankroll: {bankrolls[1]}")
@@ -301,6 +307,7 @@ def play_hand(
         (obs0, obs1), (reward0, reward1), terminated, truncated, info = env.step(action=action["action"])
         info["hand_number"] = hand_number  # Maintain hand number after each step
 
+    # game has terminated; prepare and send final observation
     bot0_payload = prepare_payload(obs0, reward0, terminated, truncated, info)
     bot1_payload = prepare_payload(obs1, reward1, terminated, truncated, info)
     call_agent_api("POST", base_url_0, SEND_OBS_ENDPOINT, bot0_payload, logger, 0)

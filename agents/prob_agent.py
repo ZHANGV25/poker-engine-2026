@@ -89,3 +89,5 @@ class ProbabilityAgent(Agent):
     def observe(self, observation, reward, terminated, truncated, info):
         if terminated and abs(reward) > 20:  # Only log significant hand results
             self.logger.info(f"Significant hand completed with reward: {reward}")
+        if "player_0_cards" in info:
+            self.logger.info(f"Showdown cards: {info['player_0_cards']} {info['player_1_cards']} {info['community_cards']}")
