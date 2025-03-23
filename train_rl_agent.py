@@ -176,7 +176,7 @@ class RLAgent:
 def train_agent(num_episodes=500, save_every=50, weight_path="rl_agent_weights.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    env = PokerEnv(rl_mode=True)
+    env = PokerEnv()
     # Feature vector is 13-dimensional.
     agent = RLAgent(input_dim=13)
     agent.policy_net.to(device)
