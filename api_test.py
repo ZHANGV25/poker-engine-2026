@@ -4,7 +4,6 @@ from unittest.mock import Mock, patch
 
 import pytest
 import requests
-
 from match import (
     TIME_LIMIT_SECONDS,
     AgentFailure,
@@ -154,7 +153,9 @@ def test_match_result_format():
                 "status": "completed",
                 "result": "win",  # Player 0 won
                 "bot0_reward": 100,
+                "bot0_time_used": 0,
                 "bot1_reward": 50,
+                "bot1_time_used": 0,
             },
         },
         {
@@ -164,7 +165,9 @@ def test_match_result_format():
                 "status": "completed",
                 "result": "loss",  # Player 1 won
                 "bot0_reward": 50,
+                "bot0_time_used": 0,
                 "bot1_reward": 100,
+                "bot1_time_used": 0,
             },
         },
         {
@@ -174,7 +177,9 @@ def test_match_result_format():
                 "status": "completed",
                 "result": "tie",
                 "bot0_reward": 100,
+                "bot0_time_used": 0,
                 "bot1_reward": 100,
+                "bot1_time_used": 0,
             },
         },
         {
@@ -183,6 +188,8 @@ def test_match_result_format():
             "expected": {
                 "status": "timeout",
                 "result": "win",  # Player 0 won due to timeout
+                "bot0_time_used": 0,
+                "bot1_time_used": 0,
             },
         },
         {
@@ -192,6 +199,8 @@ def test_match_result_format():
                 "status": "error",
                 "result": "invalid",
                 "error": "Test error",
+                "bot0_time_used": 0,
+                "bot1_time_used": 0,
             },
         },
     ]
