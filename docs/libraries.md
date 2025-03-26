@@ -52,17 +52,11 @@ The following libraries are pre-installed in the tournament environment and are 
 - System calls or subprocess execution
 - Libraries not listed above
 
-### Memory Usage
-
-- Your bot must stay within the 4GB RAM limit
-- Large model files count towards this limit
-- Consider using smaller, optimized models
-
 ### Storage
 
 - Your submission can include additional files (e.g., trained models)
-- Total submission size must be under 10MB (to be changed to 500MB)
-- Files must be read during bot initialization, not during gameplay
+- Total submission size must be under 1 GB
+- Files should be read during bot initialization, not during gameplay (or else you might timeout)
 
 ## Best Practices
 
