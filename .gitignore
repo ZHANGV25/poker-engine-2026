@@ -164,8 +164,14 @@ cython_debug/
 .DS_Store
 *.zip
 *.csv
-*.txt
+# *.txt
 
 # Poker engine logs
 logs/
 agent_logs/
+
+
+# uv stuff
+.python-version*
+pyproject.toml*
+uv.lock*
