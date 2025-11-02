@@ -503,11 +503,123 @@ class PokerEnv(gym.Env):
                 self.logger.info(f"Card selection complete. Advancing to street 1 (betting)")
 
         # ===================================================================
-        # STREET 1+: BETTING ROUND (TODO: Implement in next phase)
+        # STREET 1: BETTING ROUND
+        # ===================================================================
+        elif self.street == 1:
+            # Action format: (action_type, raise_amount, -1)
+            action_type, raise_amount = param1, param2
+
+            acting_player = self.acting_agent
+            valid_actions = self._get_valid_actions(acting_player)
+
+            # Validate action type
+            if action_type not in range(len(self.ActionType) - 1):
+                self.logger.error(f"Player {acting_player} invalid action type: {action_type}")
+                invalid_action = True
+                self.folded_players.add(acting_player)
+
+            elif not valid_actions[action_type]:
+                action_name = self.ActionType(action_type).name
+                valid_action_names = [self.ActionType(i).name for i, is_valid in enumerate(valid_actions) if is_valid]
+                self.logger.error(
+                    f"Player {acting_player} attempted invalid action: {action_name}. "
+                    f"Valid actions: {valid_action_names}"
+                )
+                invalid_action = True
+                self.folded_players.add(acting_player)
+
+            # Handle each action type
+            elif action_type == self.ActionType.FOLD.value:
+                self.logger.debug(f"Player {acting_player} folded")
+                self.folded_players.add(acting_player)
+
+                # Check if only one player remains
+                active_players = [i for i in range(self.num_players) if i not in self.folded_players]
+                if len(active_players) == 1:
+                    # Winner by default
+                    winner = active_players[0]
+                    terminated = True
+                    self.logger.info(f"Player {winner} wins by elimination")
+
+            elif action_type == self.ActionType.CHECK.value:
+                self.logger.debug(f"Player {acting_player} checked")
+                # Check is valid (validated by _get_valid_actions)
+
+            elif action_type == self.ActionType.CALL.value:
+                max_bet = max(self.bets)
+                call_amount = max_bet - self.bets[acting_player]
+                self.bets[acting_player] = max_bet
+                self.stacks[acting_player] -= call_amount
+                self.logger.debug(f"Player {acting_player} called {call_amount} (total bet: {max_bet})")
+
+            elif action_type == self.ActionType.RAISE.value:
+                from poker_types import BET_CAP
+
+                # Validate raise amount
+                max_bet = max(self.bets)
+                call_amount = max_bet - self.bets[acting_player]
+                new_bet = max_bet + raise_amount
+
+                # Check bet cap
+                if new_bet > BET_CAP:
+                    self.logger.error(
+                        f"Player {acting_player} attempted to raise to ${new_bet}, "
+                        f"exceeds BET_CAP ${BET_CAP}"
+                    )
+                    invalid_action = True
+                    self.folded_players.add(acting_player)
+
+                # Check min raise
+                elif raise_amount < self.min_raise:
+                    self.logger.error(
+                        f"Player {acting_player} attempted to raise ${raise_amount}, "
+                        f"min_raise is ${self.min_raise}"
+                    )
+                    invalid_action = True
+                    self.folded_players.add(acting_player)
+
+                else:
+                    # Valid raise
+                    total_contribution = call_amount + raise_amount
+                    self.bets[acting_player] = new_bet
+                    self.stacks[acting_player] -= total_contribution
+                    self.min_raise = raise_amount  # Update min raise for next raiser
+                    self.logger.debug(
+                        f"Player {acting_player} raised ${raise_amount} "
+                        f"(total bet: ${new_bet})"
+                    )
+
+            # Advance to next active player
+            if not terminated:
+                original_actor = self.acting_agent
+                self.acting_agent = (self.acting_agent + 1) % NUM_SEATS
+
+                # Skip folded and empty players
+                while (self.acting_agent >= self.num_players or
+                       self.acting_agent in self.folded_players):
+                    self.acting_agent = (self.acting_agent + 1) % NUM_SEATS
+
+                    # Safety check: prevent infinite loop
+                    if self.acting_agent == original_actor:
+                        self.logger.error("Infinite loop in action order!")
+                        break
+
+                # Check if betting round is complete
+                # Round is complete when all active players have equal bets
+                active_players = [i for i in range(self.num_players) if i not in self.folded_players]
+                if active_players:
+                    active_bets = [self.bets[i] for i in active_players]
+                    if len(set(active_bets)) == 1:  # All bets are equal
+                        # Betting round complete, advance to showdown
+                        self.street = 2
+                        self.logger.info(f"Betting round complete. Advancing to street 2 (showdown)")
+
+        # ===================================================================
+        # STREET 2+: SHOWDOWN (TODO: Implement in next phase)
         # ===================================================================
         else:
-            # TODO: Implement betting logic
-            self.logger.error(f"Betting not yet implemented (street {self.street})")
+            # TODO: Implement showdown logic
+            self.logger.error(f"Showdown not yet implemented (street {self.street})")
             terminated = True
 
         # Build observations and rewards
@@ -519,8 +631,24 @@ class PokerEnv(gym.Env):
             else:
                 observations.append(None)
 
-        # Rewards are 0 until hand completes
-        rewards = tuple([0.0] * NUM_SEATS)
+        # Calculate rewards
+        if terminated and winner is not None:
+            # Winner takes the entire pot
+            pot_total = sum(self.bets)
+            rewards_list = [0.0] * NUM_SEATS
+
+            for seat in range(NUM_SEATS):
+                if seat == winner:
+                    # Winner gets pot minus their contribution
+                    rewards_list[seat] = pot_total - self.bets[seat]
+                else:
+                    # Losers lose their contribution (already deducted from stack)
+                    rewards_list[seat] = -self.bets[seat]
+
+            rewards = tuple(rewards_list)
+        else:
+            # Rewards are 0 until hand completes
+            rewards = tuple([0.0] * NUM_SEATS)
 
         # Info
         info = {

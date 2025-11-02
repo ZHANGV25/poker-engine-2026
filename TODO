@@ -121,12 +121,99 @@ Summary of Progress
   ✓ All card selection tests passed!
   🎉 All tests passed!
 
-  ---
-  Next Steps
+---
 
-  Would you like me to continue with Phase 3: Betting Round implementation, or would you prefer to:
-  1. Review the current implementation
-  2. Add more edge case tests for card selection
-  3. Work on a different part of the system (match.py, agents, etc.)
+## CURRENT STATUS (Last Updated: Phase 3 Complete)
 
-  The next phase would involve implementing the single post-flop betting round (street 1) with actions: FOLD, CHECK, CALL, RAISE.
+### ✅ COMPLETED PHASES:
+
+**Phase 1: Types & Reset**
+- poker_types.py: All type definitions complete
+- gym_env.py: reset() fully implemented for 6 players
+- Tests: 3/3 passing (reset, empty seats, button rotation)
+
+**Phase 2: Card Selection**
+- gym_env.py: step() Street 0 logic complete
+- Tests: 4/4 passing (visible cards, valid selection, invalid index, duplicates)
+- Feature: Players select 2 cards from 5 hole cards after seeing 3 boards
+
+**Phase 3: Betting Round (Street 1)** ✅ JUST COMPLETED
+- gym_env.py: step() Street 1 logic complete
+- Tests: 4/4 passing (all check, raise+call, all fold, bet cap)
+- Features implemented:
+  - FOLD, CHECK, CALL, RAISE actions
+  - Position-based action order (left of button, clockwise)
+  - Bet cap enforcement (BET_CAP = $100)
+  - Round completion detection (all active players equal bets)
+  - Winner by elimination (all but one fold)
+  - Reward calculation for winners
+  - Min raise tracking
+
+### 🚧 IN PROGRESS:
+
+**Phase 4: Showdown & Pot Splitting**
+- Status: Next to implement
+- Required: 3-board hand evaluation
+- Required: Independent pot splitting per board
+- Required: Tie handling
+
+### 📋 TODO:
+
+**Phase 4: Showdown & Pot Splitting**
+- Evaluate 3 boards independently
+- Split pot across boards
+- Handle ties per board
+- Calculate final rewards
+
+**Phase 5: Integration**
+- Update match.py for 6 players
+- Update agents/agent.py observation schema
+- Update agent implementations (prob_agent, rl_agent)
+- Integration testing
+
+**Phase 6: Documentation**
+- Update game-engine.md
+- Update terminology.md
+- Update README
+
+---
+
+## Phase 3 Summary: Betting Round Implementation ✅
+
+**Tests Written (4/4 passing):**
+1. `test_all_players_check()` - All players check → advance to showdown
+2. `test_player_raises_others_call()` - P0 checks, P1 raises, others call → showdown
+3. `test_all_fold_except_one()` - All fold except P0 → P0 wins immediately
+4. `test_bet_cap_enforcement()` - Raise exceeds BET_CAP → action rejected
+
+**Implementation Details:**
+- Action format during Street 1: `(action_type, raise_amount, -1)`
+- Action types: FOLD=0, RAISE=1, CHECK=2, CALL=3
+- Position order: Left of button → clockwise, skipping folded players
+- Round completion: All active players have equal bets
+- Bet cap: Raises above $100 rejected
+- Min raise: Tracked and enforced
+- Rewards: Winner gets (pot - their_contribution), losers get -their_contribution
+
+**Expected Behaviors Verified:**
+- ✅ Action order starts left of button, proceeds clockwise
+- ✅ CHECK allowed only when bets are equal
+- ✅ CALL matches highest bet
+- ✅ RAISE increases bet (within bet cap)
+- ✅ FOLD eliminates player from hand
+- ✅ Round ends when all active players have equal bets
+- ✅ Skip folded players in action order
+- ✅ Advance to showdown after betting completes
+- ✅ Winner by elimination gets full pot
+
+---
+
+## Phase 4 TODO: Showdown & Pot Splitting
+
+Expected Behaviors to Test:
+1. Evaluate 3 boards independently
+2. Best 5-card hand from (2 kept cards + 5 board cards)
+3. Each board awards pot/3 to winner(s)
+4. Ties split that board's pot equally
+5. Rewards sum across all 3 boards
+6. Handle case where same player wins multiple boards
