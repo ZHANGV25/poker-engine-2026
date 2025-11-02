@@ -57,8 +57,8 @@ class PokerEnv(gym.Env):
     BIG_BLIND_PLAYER = 1
     MAX_PLAYER_BET = 100
 
-    RANKS = "23456789A"
-    SUITS = "dhs"  # diamonds hearts spade
+    RANKS = "23456789TJQKA"
+    SUITS = "shdc"  # spades hearts diamonds clubs
 
     @staticmethod
     def int_to_card(card_int: int):
@@ -80,7 +80,7 @@ class PokerEnv(gym.Env):
         RAISE = 1
         CHECK = 2
         CALL = 3
-        DISCARD = 4
+        KEEP = 4
         INVALID = 5
 
     def __init__(self, logger=None, small_blind_amount=1, num_hands=1, num_players=6):
@@ -385,34 +385,78 @@ class PokerEnv(gym.Env):
         self.last_street_bet = self.bets[0]
         self.acting_agent = self.small_blind_player
 
-    def _get_winner(self):
+    def _evaluate_board(self, board_idx: int, active_players: list[int]):
         """
-        Returns the winner of the game.
+        Evaluate a single board and return the winner(s).
+
+        Args:
+            board_idx: Index of the board to evaluate (0, 1, or 2)
+            active_players: List of seat indices that are still in the hand
+
+        Returns:
+            Dict with:
+                - board_index: int
+                - winning_seats: list of seat indices that won this board
+                - evaluator_rank: int (treys rank, lower is better)
+                - hand_description: list of card strings forming the winning hand
         """
-        board_cards = list(map(self.int_to_card, self.community_cards))
-        player_0_cards = list(map(self.int_to_card, [c for c in self.player_cards[0] if c != -1]))
-        player_1_cards = list(map(self.int_to_card, [c for c in self.player_cards[1] if c != -1]))
-        assert len(player_0_cards) == 2 and len(player_1_cards) == 2 and len(board_cards) == 5
-        player_0_hand_rank = self.evaluator.evaluate(
-            player_0_cards,
-            board_cards,
-        )
-        player_1_hand_rank = self.evaluator.evaluate(
-            player_1_cards,
-            board_cards,
+        from poker_types import BOARD_CARDS_PER_BOARD
+
+        # Get board cards
+        board_start = board_idx * BOARD_CARDS_PER_BOARD
+        board_end = board_start + BOARD_CARDS_PER_BOARD
+        board_cards_int = self.community_cards[board_start:board_end]
+        board_cards = list(map(self.int_to_card, board_cards_int))
+
+        self.logger.debug(
+            f"Evaluating board {board_idx}, cards: {[self.int_card_to_str(c) for c in board_cards_int]}"
         )
 
-        self.logger.debug(f"(get winner) Player 0 cards: {list(map(Card.int_to_str, player_0_cards))}; Player 1 cards: {list(map(Card.int_to_str, player_1_cards))}")
-        self.logger.debug(f"Determined winner based on hand scores; p0 score: {player_0_hand_rank}; p1 score: {player_1_hand_rank}")
+        # Evaluate each active player's hand
+        player_ranks = {}
 
-        # showdown
-        if player_0_hand_rank == player_1_hand_rank:
-            winner = -1  # tie
-        elif player_1_hand_rank < player_0_hand_rank:
-            winner = 1
-        else:
-            winner = 0
-        return winner
+        for seat in active_players:
+            # Get player's kept cards
+            if not self.kept_cards[seat]:
+                self.logger.warning(f"Player {seat} has no kept cards, skipping")
+                continue
+
+            player_hand_int = self.kept_cards[seat]
+            player_hand = list(map(self.int_to_card, player_hand_int))
+
+            # Evaluate 7-card hand (2 kept + 5 board)
+            rank = self.evaluator.evaluate(player_hand, board_cards)
+            player_ranks[seat] = rank
+
+            self.logger.debug(
+                f"Player {seat} cards: {[self.int_card_to_str(c) for c in player_hand_int]}, "
+                f"rank: {rank}"
+            )
+
+        # Find winner(s) - lowest rank wins (treys uses lower = better)
+        if not player_ranks:
+            self.logger.error("No players to evaluate!")
+            return {
+                'board_index': board_idx,
+                'winning_seats': [],
+                'evaluator_rank': 0,
+                'hand_description': []
+            }
+
+        best_rank = min(player_ranks.values())
+        winners = [seat for seat, rank in player_ranks.items() if rank == best_rank]
+
+        # Get hand description (use first winner's cards)
+        first_winner = winners[0]
+        winner_cards_int = self.kept_cards[first_winner] + board_cards_int
+        hand_description = [self.int_card_to_str(c) for c in winner_cards_int]
+
+        return {
+            'board_index': board_idx,
+            'winning_seats': winners,
+            'evaluator_rank': best_rank,
+            'hand_description': hand_description
+        }
 
     def step(self, action: tuple[int, int, int]):
         """
@@ -440,6 +484,11 @@ class PokerEnv(gym.Env):
         invalid_action = False
         winner = None
         terminated = False
+        rewards = None  # Will be set by showdown or winner-by-elimination
+        info = {
+            'invalid_action': False,
+            'eliminated_seats': list(self.folded_players),
+        }
 
         # ===================================================================
         # STREET 0: CARD SELECTION PHASE
@@ -610,16 +659,104 @@ class PokerEnv(gym.Env):
                 if active_players:
                     active_bets = [self.bets[i] for i in active_players]
                     if len(set(active_bets)) == 1:  # All bets are equal
-                        # Betting round complete, advance to showdown
+                        # Betting round complete, run showdown immediately
                         self.street = 2
-                        self.logger.info(f"Betting round complete. Advancing to street 2 (showdown)")
+                        self.logger.info(f"Betting round complete. Running showdown")
+
+                        # Run showdown logic immediately
+                        from poker_types import NUM_BOARDS
+
+                        board_results = []
+                        pot_total = sum(self.bets)
+                        pot_per_board = pot_total / NUM_BOARDS
+
+                        self.logger.info(f"Showdown: {len(active_players)} active players, pot=${pot_total}")
+
+                        for board_idx in range(NUM_BOARDS):
+                            board_result = self._evaluate_board(board_idx, active_players)
+                            board_result['pot_awarded'] = pot_per_board / len(board_result['winning_seats'])
+                            board_results.append(board_result)
+
+                            self.logger.info(
+                                f"Board {board_idx}: Winners {board_result['winning_seats']}, "
+                                f"each gets ${board_result['pot_awarded']:.2f}"
+                            )
+
+                        # Calculate final rewards
+                        showdown_rewards = [0.0] * NUM_SEATS
+
+                        for seat in range(NUM_SEATS):
+                            # Sum winnings from all boards
+                            winnings = sum(
+                                result['pot_awarded'] if seat in result['winning_seats'] else 0
+                                for result in board_results
+                            )
+                            # Reward = winnings - contribution
+                            showdown_rewards[seat] = winnings - self.bets[seat]
+
+                        # Store info and terminate
+                        info['board_results'] = board_results
+                        winner = max(range(NUM_SEATS), key=lambda s: showdown_rewards[s])
+                        terminated = True
+
+                        # Override rewards with showdown calculation
+                        rewards = tuple(showdown_rewards)
 
         # ===================================================================
-        # STREET 2+: SHOWDOWN (TODO: Implement in next phase)
+        # STREET 2: SHOWDOWN
+        # ===================================================================
+        elif self.street == 2:
+            # Evaluate 3 boards independently and calculate rewards
+            from poker_types import NUM_BOARDS, BOARD_CARDS_PER_BOARD
+
+            active_players = [i for i in range(self.num_players) if i not in self.folded_players]
+
+            if not active_players:
+                self.logger.error("No active players for showdown!")
+                terminated = True
+            else:
+                # Evaluate each board
+                board_results = []
+                pot_total = sum(self.bets)
+                pot_per_board = pot_total / NUM_BOARDS
+
+                self.logger.info(f"Showdown: {len(active_players)} active players, pot=${pot_total}")
+
+                for board_idx in range(NUM_BOARDS):
+                    board_result = self._evaluate_board(board_idx, active_players)
+                    board_result['pot_awarded'] = pot_per_board / len(board_result['winning_seats'])
+                    board_results.append(board_result)
+
+                    self.logger.info(
+                        f"Board {board_idx}: Winners {board_result['winning_seats']}, "
+                        f"each gets ${board_result['pot_awarded']:.2f}"
+                    )
+
+                # Calculate final rewards
+                showdown_rewards = [0.0] * NUM_SEATS
+
+                for seat in range(NUM_SEATS):
+                    # Sum winnings from all boards
+                    winnings = sum(
+                        result['pot_awarded'] if seat in result['winning_seats'] else 0
+                        for result in board_results
+                    )
+                    # Reward = winnings - contribution
+                    showdown_rewards[seat] = winnings - self.bets[seat]
+
+                # Store info and terminate
+                info['board_results'] = board_results
+                winner = max(range(NUM_SEATS), key=lambda s: showdown_rewards[s])
+                terminated = True
+
+                # Override rewards with showdown calculation
+                rewards = tuple(showdown_rewards)
+
+        # ===================================================================
+        # INVALID STREET
         # ===================================================================
         else:
-            # TODO: Implement showdown logic
-            self.logger.error(f"Showdown not yet implemented (street {self.street})")
+            self.logger.error(f"Invalid street: {self.street}")
             terminated = True
 
         # Build observations and rewards
@@ -631,30 +768,29 @@ class PokerEnv(gym.Env):
             else:
                 observations.append(None)
 
-        # Calculate rewards
-        if terminated and winner is not None:
-            # Winner takes the entire pot
-            pot_total = sum(self.bets)
-            rewards_list = [0.0] * NUM_SEATS
+        # Calculate rewards (if not already set by showdown)
+        if rewards is None:
+            if terminated and winner is not None:
+                # Winner by elimination (not showdown) takes the entire pot
+                pot_total = sum(self.bets)
+                rewards_list = [0.0] * NUM_SEATS
 
-            for seat in range(NUM_SEATS):
-                if seat == winner:
-                    # Winner gets pot minus their contribution
-                    rewards_list[seat] = pot_total - self.bets[seat]
-                else:
-                    # Losers lose their contribution (already deducted from stack)
-                    rewards_list[seat] = -self.bets[seat]
+                for seat in range(NUM_SEATS):
+                    if seat == winner:
+                        # Winner gets pot minus their contribution
+                        rewards_list[seat] = pot_total - self.bets[seat]
+                    else:
+                        # Losers lose their contribution (already deducted from stack)
+                        rewards_list[seat] = -self.bets[seat]
 
-            rewards = tuple(rewards_list)
-        else:
-            # Rewards are 0 until hand completes
-            rewards = tuple([0.0] * NUM_SEATS)
+                rewards = tuple(rewards_list)
+            else:
+                # Rewards are 0 until hand completes
+                rewards = tuple([0.0] * NUM_SEATS)
 
-        # Info
-        info = {
-            'invalid_action': invalid_action,
-            'eliminated_seats': list(self.folded_players),
-        }
+        # Update info
+        info['invalid_action'] = invalid_action
+        info['eliminated_seats'] = list(self.folded_players)
 
         truncated = False
 

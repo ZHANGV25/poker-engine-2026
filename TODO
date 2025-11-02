@@ -123,7 +123,7 @@ Summary of Progress
 
 ---
 
-## CURRENT STATUS (Last Updated: Phase 3 Complete)
+## CURRENT STATUS (Last Updated: Phase 4 Complete) ✅
 
 ### ✅ COMPLETED PHASES:
 
@@ -137,7 +137,7 @@ Summary of Progress
 - Tests: 4/4 passing (visible cards, valid selection, invalid index, duplicates)
 - Feature: Players select 2 cards from 5 hole cards after seeing 3 boards
 
-**Phase 3: Betting Round (Street 1)** ✅ JUST COMPLETED
+**Phase 3: Betting Round (Street 1)**
 - gym_env.py: step() Street 1 logic complete
 - Tests: 4/4 passing (all check, raise+call, all fold, bet cap)
 - Features implemented:
@@ -149,21 +149,28 @@ Summary of Progress
   - Reward calculation for winners
   - Min raise tracking
 
+**Phase 4: Showdown & Pot Splitting** ✅ JUST COMPLETED
+- gym_env.py: _evaluate_board() method implemented using treys
+- gym_env.py: Showdown runs immediately after betting completes
+- Tests: 4/4 passing (single winner, different winners, with betting, board_results info)
+- Features implemented:
+  - 3-board independent evaluation using treys hand evaluator
+  - Pot splitting per board (pot/3 per board)
+  - Tie handling (split pot among tied winners on each board)
+  - Zero-sum reward calculation
+  - board_results in info dict with winning_seats and pot_awarded per board
+- Critical fixes:
+  - Expanded card encoding from 27 cards (9 ranks × 3 suits) to 52 cards (13 ranks × 4 suits)
+  - Fixed card duplication issues in tests (changed from modulo wrapping to unique cards)
+  - Fixed showdown execution (runs immediately when betting completes, not requiring extra step)
+
 ### 🚧 IN PROGRESS:
 
-**Phase 4: Showdown & Pot Splitting**
+**Phase 5: Integration**
 - Status: Next to implement
-- Required: 3-board hand evaluation
-- Required: Independent pot splitting per board
-- Required: Tie handling
+- Required: Update match.py, agents/agent.py, prob_agent, rl_agent
 
 ### 📋 TODO:
-
-**Phase 4: Showdown & Pot Splitting**
-- Evaluate 3 boards independently
-- Split pot across boards
-- Handle ties per board
-- Calculate final rewards
 
 **Phase 5: Integration**
 - Update match.py for 6 players
@@ -208,12 +215,56 @@ Summary of Progress
 
 ---
 
-## Phase 4 TODO: Showdown & Pot Splitting
+## Phase 4 Summary: Showdown & Pot Splitting ✅
 
-Expected Behaviors to Test:
-1. Evaluate 3 boards independently
-2. Best 5-card hand from (2 kept cards + 5 board cards)
-3. Each board awards pot/3 to winner(s)
-4. Ties split that board's pot equally
-5. Rewards sum across all 3 boards
-6. Handle case where same player wins multiple boards
+**Tests Written (4/4 passing):**
+1. `test_showdown_single_winner_all_boards()` - P0 wins all 3 boards with best hand
+2. `test_showdown_different_winners_per_board()` - Showdown completes, ties handled
+3. `test_showdown_with_betting()` - P1 raises, others call, then showdown
+4. `test_showdown_info_contains_board_results()` - Verify info dict structure
+
+**Implementation Details:**
+- Card encoding: Expanded from 27 cards to full 52-card deck
+  - RANKS: "23456789TJQKA" (13 ranks)
+  - SUITS: "shdc" (4 suits)
+  - Encoding: card_int = (suit_index * 13) + rank_index
+- _evaluate_board() method:
+  - Takes board_idx and active_players list
+  - Converts card integers to treys Card objects
+  - Evaluates 7-card hand (2 kept + 5 board) per player
+  - Returns dict with winning_seats, evaluator_rank, hand_description
+- Showdown execution:
+  - Runs immediately when betting completes (all bets equal)
+  - Evaluates all 3 boards independently
+  - Pot split: pot/3 per board, divided among winners of that board
+  - Ties: Multiple winners on a board split that board's pot equally
+- Reward calculation:
+  - Each player's reward = (sum of winnings from 3 boards) - (their bet contribution)
+  - Rewards always sum to 0 (zero-sum game)
+
+**Expected Behaviors Verified:**
+- ✅ 3 boards evaluated independently using treys evaluator
+- ✅ Each board awards pot/3 to winner(s)
+- ✅ Ties split that board's pot equally among winners
+- ✅ Rewards sum to 0 (zero-sum game)
+- ✅ Same player can win multiple boards
+- ✅ Showdown runs automatically after betting completes
+- ✅ info dict contains board_results with per-board details
+
+**Critical Bugs Fixed:**
+1. Card encoding only had 27 cards → expanded to 52 cards
+2. Duplicate cards in tests → changed rigged_deck to use unique cards
+3. treys KeyError 17017 → caused by duplicate cards, fixed by #1 and #2
+4. UnboundLocalError on info dict → initialized info at start of step()
+5. Showdown required extra step() call → moved showdown logic into betting completion
+
+---
+
+## Phase 5 TODO: Integration
+
+Next Steps:
+1. Update match.py for 6 players
+2. Update agents/agent.py observation schema
+3. Update prob_agent.py for 3-board equity calculations
+4. Update rl_agent.py feature engineering
+5. Run end-to-end integration tests

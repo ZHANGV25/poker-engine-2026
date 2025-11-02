@@ -1,4 +1,4 @@
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing import Literal, NotRequired, TypeAlias, TypedDict, NamedTuple, Tuple
 from dataclasses import dataclass
 
 NUM_SEATS = 6
@@ -60,3 +60,10 @@ class StepInfo(TypedDict, total=False):
     next_street: int                     # upcoming street if we just advanced
     eliminated_seats: list[SeatIndex]    # seats folded out
     board_results: list[ShowdownBoardResult]
+
+class Action(NamedTuple):
+    action_type: int
+    raise_amount: int
+    kept_cards: Tuple[CardIndex, CardIndex]
+    
+    
