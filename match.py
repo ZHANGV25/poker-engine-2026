@@ -9,10 +9,10 @@ import time
 import traceback
 from typing import Any, Dict, Optional, Tuple, List, TypedDict
 from collections import defaultdict
+from deprecated import deprecated
 
 import numpy as np
 import requests
-
 
 from gym_env import PokerEnv
 
@@ -53,6 +53,7 @@ class AgentFailureTracker:
 
     def record_success(self, player_id: int):
         self.failed_attempts[player_id] = 0
+
 
 class AgentAPIClient:
     """Handles API communication with agents"""
@@ -172,6 +173,8 @@ class PokerMatch:
         self.num_hands = num_hands
         self.csv_path = csv_path
         
+        self.env = PokerEnv()
+        
         # Initialize trackers
         self.bankrolls = [0.0] * self.num_players
         self.time_used = [0.0] * self.num_players
@@ -179,6 +182,16 @@ class PokerMatch:
         
         # Initialize helpers
         self.api_client = AgentAPIClient(logger, self.failure_tracker)
+    
+    def _play_hand(self, hand_number: int):
+        
+        small_blind_player = hand_number % self.num_players
+
+        # Initialize hand
+        observations, info = self.env.reset(options={"small_blind_player": small_blind_player})
+        info["hand_number"] = hand_number
+        rewards = [0.0] * self.num_players
+        terminated = truncated = False
         
     
     
@@ -193,6 +206,52 @@ def get_street_name(street_num: int) -> str:
     """Convert numeric street value to human-readable name"""
     street_names = {0: "Pre-Flop", 1: "Flop", 2: "Turn", 3: "River"}
     return street_names.get(street_num, f"Unknown-{street_num}")
+
+@deprecated
+def prepare_payload(
+    obs: Dict[str, Any],
+    reward: float,
+    terminated: bool,
+    truncated: bool,
+    info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Prepare the payload for API calls by converting numpy arrays and values to Python native types.
+
+    Args:
+        obs (Dict[str, Any]): The observation dictionary.
+        reward (float): The reward value.
+        terminated (bool): Whether the episode has terminated.
+        truncated (bool): Whether the episode has been truncated.
+        info (Dict[str, Any]): Additional information.
+
+    Returns:
+        Dict[str, Any]: The prepared payload.
+    """
+
+    def _convert_numpy(v):
+        if isinstance(v, np.integer):
+            return int(v)
+        elif isinstance(v, np.floating):
+            return float(v)
+        elif isinstance(v, np.ndarray):
+            return v.tolist()
+        elif isinstance(v, dict):
+            return {k: _convert_numpy(val) for k, val in v.items()}
+        elif isinstance(v, list):
+            return [_convert_numpy(item) for item in v]
+        return v
+
+    def _prepare_observation(observation: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: _convert_numpy(v) for k, v in observation.items()}
+
+    return {
+        "observation": _prepare_observation(obs),
+        "reward": float(reward),
+        "terminated": terminated,
+        "truncated": truncated,
+        "info": _convert_numpy(info),
+    }
 
 
 def call_agent_api(
@@ -252,6 +311,7 @@ def call_agent_api(
 bankrolls = [0] * NUM_PLAYERS  # Track total bankrolls across all hands
 
 # TODO: fix csv writer once, 6 player support is finished
+@deprecated
 def run_api_match(
     base_url_0: str,
     base_url_1: str,
@@ -333,6 +393,7 @@ time_used_1 = 0.0
 time_used = [0.0] * NUM_PLAYERS
 
 # TODO handle if there exists less than 6 players at the table
+@deprecated
 def play_hand(
     env: PokerEnv, 
     base_urls: List[str], # for 6 players
