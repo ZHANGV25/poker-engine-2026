@@ -15,6 +15,8 @@ import numpy as np
 import requests
 
 from gym_env import PokerEnv
+from utils.log import log_method, log_game_state, log_action
+from utils.errors import handle_game_errors, log_and_suppress_errors
 
 NUM_PLAYERS = 6
 TIME_LIMIT_SECONDS = 1500
@@ -35,7 +37,16 @@ class MatchResult(TypedDict):
 class AgentFailure(Exception):
     """Custom exception for tracking agent failures"""
 
-    pass
+    def __init__(self, message: str, failed_player: Optional[int] = None):
+        super().__init__(message)
+        self.failed_player = failed_player
+
+class TimeoutError(Exception):
+    """Custom exception for player timeout"""
+
+    def __init__(self, message: str, failed_player: Optional[int] = None):
+        super().__init__(message)
+        self.failed_player = failed_player
 
 class AgentFailureTracker:
     def __init__(self):
@@ -45,13 +56,13 @@ class AgentFailureTracker:
         self.failed_attempts[player_id] += 1
 
         # Check for all players failing
-        all_failed = all(attempts > MAX_AGENT_FAILURES for attempts in self.failed_attempts.values())
+        all_failed = all(attempts >= MAX_AGENT_FAILURES for attempts in self.failed_attempts.values())
         if all_failed:
-            raise AgentFailure("Both players have failed multiple times")
+            raise AgentFailure("All players have failed multiple times", failed_player=None)
 
         # Check for single player persistent failure
         if self.failed_attempts[player_id] >= MAX_AGENT_FAILURES:
-            raise AgentFailure(f"Player {player_id} has failed {self.MAX_FAILURES} times")
+            raise AgentFailure(f"Player {player_id} has failed {MAX_AGENT_FAILURES} times", failed_player=player_id)
 
     def record_success(self, player_id: int):
         self.failed_attempts[player_id] = 0
@@ -159,11 +170,10 @@ class PayloadPreparer:
 
 class PokerMatch:
     """Manages a complete poker match between multiple agents"""
-    # TODO set up logging for errors and game state changes
     # TODO implement the csv writer path
     #   - define new headers for csv file
     # TODO Handle when agenet disconnects and should continue gamne
-    
+
     def __init__(
         self,
         base_urls: List[str],
@@ -171,33 +181,58 @@ class PokerMatch:
         team_names: Optional[List[str]] = None,
         csv_path: str = "./match.csv"
     ):
-        
+
         self.base_urls = base_urls
         self.num_players = NUM_PLAYERS # NOTE might change later
         self.logger = logger
         self.team_names = team_names or [f"Player {i}" for i in range(self.num_players)]
         self.csv_path = csv_path
-        
+
         self.env = PokerEnv()
-        
+
         # Initialize trackers
         self.bankrolls = [0.0] * self.num_players
         self.time_used = [0.0] * self.num_players
-        self.failure_tracker = AgentFailureTracker(self.num_players)
-        
+        self.failure_tracker = AgentFailureTracker()
+
         # Initialize helpers
         self.api_client = AgentAPIClient(logger, self.failure_tracker)
+        self.payload_preparer = PayloadPreparer()
+
+        # Initialize game state attributes for logging decorators
+        self.hand_number = 0
+        self.street = 0
+        self.acting_agent = 0
+        self.bets = [0] * self.num_players
+        self.num_hands = 0
     
+    @handle_game_errors(determine_winner=True, log_traceback=True)
+    @log_method(level=logging.INFO, log_duration=True)
     def run(self, num_hands = 1000) -> MatchResult:
-        
-        for hand_number in num_hands:
+        self.num_hands = num_hands
+        self.logger.info(f"Starting match: {num_hands} hands, {self.num_players} players")
+
+        for hand_number in range(num_hands):
+            self.hand_number = hand_number
             self._play_hand(hand_number)
-        
+
+            # Log bankroll update every 50 hands
+            if hand_number % 50 == 0 and hand_number > 0:
+                bankroll_str = ", ".join([f"Player {i}: ${self.bankrolls[i]:.2f}" for i in range(self.num_players)])
+                self.logger.info(f"Hand {hand_number} - Bankrolls: {bankroll_str}")
+
+        # Log final results
+        self.logger.info(f"Match completed - {num_hands} hands played")
+        final_bankroll = ", ".join([f"Player {i}: ${self.bankrolls[i]:.2f}" for i in range(self.num_players)])
+        self.logger.info(f"Final bankrolls: {final_bankroll}")
+
         return self._create_result('completed')
             
+    @log_method(level=logging.DEBUG, log_duration=True)
+    @log_game_state(level=logging.DEBUG, fields=['hand_number', 'bankrolls'], on_exit=True)
     def _play_hand(self, hand_number: int):
         """Play a single hand of poker"""
-        
+
         small_blind_player = hand_number % self.num_players
 
         # Initialize hand
@@ -205,21 +240,27 @@ class PokerMatch:
         info["hand_number"] = hand_number
         rewards = [0.0] * self.num_players
         terminated = truncated = False
-        
+
         # Add time info to observations
         self._update_time_info(observations)
-        
+
         # Main game loop
         while not terminated:
+            # Update state tracking for decorators
+            self.street = observations[0].get('street', 0)
+            self.acting_agent = observations[0].get('acting_agent', 0)
+            if 'bets' in observations[0]:
+                self.bets = observations[0]['bets']
+
             action = self._get_action_from_active_player(observations, rewards, terminated, truncated, info)
             self._broadcast_to_inactive_players(observations, rewards, terminated, truncated, info)
-            
+
             # Step environment
-            # NOTE in the case that a player dies how should `PokerEnv` handle it? -dylan 
+            # NOTE in the case that a player dies how should `PokerEnv` handle it? -dylan
             observations, rewards, terminated, truncated, info = self.env.step(action=action["action"])
             info["hand_number"] = hand_number
             self._update_time_info(observations)
-        
+
         # Send final observations
         self._send_final_observations(observations, rewards, terminated, truncated, info)
 
@@ -227,6 +268,7 @@ class PokerMatch:
         for i, reward in enumerate(rewards):
             self.bankrolls[i] += reward
             
+    @log_action(level=logging.DEBUG, include_timing=True, include_game_context=True)
     def _get_action_from_active_player(
         self,
         observations: List[Dict[str, Any]],
@@ -239,20 +281,22 @@ class PokerMatch:
         acting_player = observations[0]["acting_agent"]
         obs = observations[acting_player]
         url = self.base_urls[acting_player]
-        
+
         payload = self.payload_preparer.prepare(obs, rewards[acting_player], terminated, truncated, info)
-        
+
         start_time = time.time()
         action = self.api_client.call("GET", url, GET_ACTION_ENDPOINT, payload, acting_player)
         elapsed = time.time() - start_time
-        
+
         self.time_used[acting_player] += elapsed
-        
+
         if self.time_used[acting_player] > TIME_LIMIT_SECONDS:
-            raise TimeoutError(f"Player {acting_player} exceeded time limit")
-        
+            raise TimeoutError(f"Player {acting_player} exceeded time limit", failed_player=acting_player)
+
         return action
         
+    @log_and_suppress_errors(level=logging.WARNING)
+    @log_method(level=logging.DEBUG, log_duration=True)
     def _broadcast_to_inactive_players(
         self,
         observations: List[Dict[str, Any]],
@@ -263,7 +307,7 @@ class PokerMatch:
     ) -> None:
         """Send observations to all inactive players"""
         acting_player = observations[0]["acting_agent"]
-        
+
         for player_id in range(self.num_players):
             if player_id != acting_player:
                 obs = observations[player_id]
@@ -271,6 +315,8 @@ class PokerMatch:
                 payload = self.payload_preparer.prepare(obs, rewards[player_id], terminated, truncated, info)
                 self.api_client.call("POST", url, SEND_OBS_ENDPOINT, payload, player_id)
 
+    @log_and_suppress_errors(level=logging.WARNING)
+    @log_method(level=logging.DEBUG, log_duration=True)
     def _send_final_observations(
         self,
         observations: List[Dict[str, Any]],
@@ -580,7 +626,7 @@ def play_hand(
                 action_duration = time.time() - action_start
                 time_used[player] += action_duration
                 if time_used[player] > TIME_LIMIT_SECONDS:
-                    raise TimeoutError(f"Player {player} exceeded time limit")
+                    raise TimeoutError(f"Player {player} exceeded time limit", failed_player=player)
                               
             # broadcast to other players
             else:
