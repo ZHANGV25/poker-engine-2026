@@ -265,7 +265,7 @@ class PokerEnv(gym.Env):
             assert len(my_hand_cards) == 2, f"Player {player_num} should have 2 cards after fixing, has {len(my_hand_cards)}"
             my_hand_obs = tuple(self.card_to_obs_encoding(c) for c in my_hand_cards)
         else:
-            my_hand_obs = (0, 0)  # Not yet fixed, show as hidden
+            my_hand_obs = (-1, -1)  # Not yet fixed, show as hidden
 
         # Build observation dict
         obs = {
