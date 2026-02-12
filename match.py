@@ -148,6 +148,8 @@ def call_agent_api(
 
                 delay = base_delay * (2**attempt)
                 logger.info(f"Backing off for {delay} seconds before retry {attempt + 1}")
+                if 'response' in locals() and response is not None:
+                    logger.info(f"Validation Error Details: {response.text}")
                 time.sleep(delay)
 
     except Exception as e:
@@ -181,6 +183,8 @@ def run_api_match(
         "team_1_bankroll",
         "action_type",
         "action_amount",
+        "action_keep_1",
+        "action_keep_2",
         "team_0_cards",
         "team_1_cards",
         "board_cards",
@@ -281,7 +285,13 @@ def play_hand(
         action_start = time.time()
         action = call_agent_api("GET", current_url, GET_ACTION_ENDPOINT, current_payload, logger, current_player)
         action_duration = time.time() - action_start
-        action_type = PokerEnv.ActionType(action["action"][0])
+
+        raw_action = action["action"] # Expecting [Type, Amount, Idx1, Idx2]
+        act_type_int = raw_action[0]
+        act_amount = raw_action[1]
+        act_keep1 = raw_action[2]
+        act_keep2 = raw_action[3]
+        action_type = PokerEnv.ActionType(act_type_int)
 
         # Update time tracking
         if current_player == 0:
@@ -300,6 +310,10 @@ def play_hand(
         # Notify other player
         call_agent_api("POST", observer_url, SEND_OBS_ENDPOINT, observer_payload, logger, 1 - current_player)
 
+        def fmt_cards(cards_list):
+            return [env.int_card_to_str(c) for c in cards_list if c != -1]
+
+        num_board_cards = 0 if obs0["street"] == 0 else obs0["street"] + 2
         # Log action
         current_state = {
             "hand_number": hand_number,
@@ -307,15 +321,17 @@ def play_hand(
             "active_team": obs0["acting_agent"],
             "team_0_bankroll": bankrolls[0],
             "team_1_bankroll": bankrolls[1],
-            "team_0_cards": [env.int_card_to_str(c) for c in env.player_cards[0] if c != -1],
-            "team_1_cards": [env.int_card_to_str(c) for c in env.player_cards[1] if c != -1],
-            "board_cards": [env.int_card_to_str(c) for c in env.community_cards[: obs0["street"] + 2] if c != -1],
-            "team_0_discarded": env.int_card_to_str(env.discarded_cards[0]) if env.discarded_cards[0] != -1 else "",
-            "team_1_discarded": env.int_card_to_str(env.discarded_cards[1]) if env.discarded_cards[1] != -1 else "",
+            "team_0_cards": fmt_cards(env.player_cards[0]),
+            "team_1_cards": fmt_cards(env.player_cards[1]),
+            "board_cards": fmt_cards(env.community_cards[: num_board_cards]),
+            "team_0_discarded": fmt_cards(env.discarded_cards[0]),
+            "team_1_discarded": fmt_cards(env.discarded_cards[1]),
             "team_0_bet": obs0["my_bet"] if obs0["acting_agent"] == 0 else obs0["opp_bet"],
             "team_1_bet": obs1["my_bet"] if obs1["acting_agent"] == 1 else obs1["opp_bet"],
             "action_type": action_type.name,
-            "action_amount": action["action"][1],
+            "action_amount": act_amount,
+            "action_keep_1": act_keep1,
+            "action_keep_2": act_keep2
         }
         writer.writerow(current_state)
 

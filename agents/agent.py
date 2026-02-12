@@ -10,19 +10,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import traceback
 
-# I used a typedDict instead of a pydantic model because it
-# was giving me issues.
 class Observation(TypedDict):
     street: int
     acting_agent: int
     my_cards: List[int]
     community_cards: List[int]
     my_bet: int
-    my_discarded_card: int
-    my_drawn_card: int
+    my_discarded_cards: List[int]
     opp_bet: int
-    opp_discarded_card: int
-    opp_drawn_card: int
+    opp_discarded_cards: List[int]
     min_raise: int
     max_raise: int
     valid_actions: List[int]
@@ -48,7 +44,7 @@ class ObservationRequest(BaseModel):
 
 
 class ActionResponse(BaseModel):
-    action: Tuple[int, int, int]
+    action: Tuple[int, int, int, int]
 
 
 class Agent(ABC):
