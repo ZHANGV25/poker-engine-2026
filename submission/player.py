@@ -1,6 +1,6 @@
 from agents.agent import Agent
 from gym_env import PokerEnv
-import random
+
 
 class PlayerAgent(Agent):
     def __init__(self, stream: bool = True):
@@ -9,36 +9,23 @@ class PlayerAgent(Agent):
 
     def act(self, observation, reward, terminated, truncated, info):
         """
-        Simple starter: Discards randomly on the flop, otherwise plays randomly.
+        Starter: Folds whenever possible. On the flop discard round (mandatory), keeps first two cards.
+
+        Args (Gym-style step callback):
+          observation: Dict with game state for this player (street, my_cards, community_cards,
+                       my_bet, opp_bet, valid_actions, my_discarded_cards, opp_discarded_cards, etc.).
+          reward: Chip reward from the previous step (e.g. +2 if you won the pot).
+          terminated: True if the hand has ended (fold or showdown).
+          truncated: True if the episode was cut off (e.g. time limit); usually False per hand.
+          info: Extra dict (e.g. hand_number, and at showdown player_0_cards, player_1_cards, community_cards).
         """
-        # Example of using the logger
-        if observation["street"] == 0 and info["hand_number"] % 50 == 0:
-            self.logger.info(f"Hand number: {info['hand_number']} ASDFSDAFDSAF")
+        # Example usage of logger
+        self.logger.info(f"Hand {info.get('hand_number', '?')} street {observation['street']}")
 
         valid_actions = observation["valid_actions"]
-        
-        # Initialize default response (must be 4 values)
-        action_type = 0
-        raise_amount = 0
-        keep_1, keep_2 = 0, 0
 
-        # 1. Handle Discard Phase (Mandatory for the new variant)
         if valid_actions[self.action_types.DISCARD.value]:
-            # Variant: We are dealt 5 cards, we must pick 2 to keep.
-            indices = random.sample(range(5), 2)
-            return self.action_types.DISCARD.value, 0, indices[0], indices[1]
+            return self.action_types.DISCARD.value, 0, 0, 1
 
-        # 2. Handle Betting Phase
-        valid_indices = [i for i, is_valid in enumerate(valid_actions) if is_valid]
-        action_type = random.choice(valid_indices)
+        return self.action_types.FOLD.value, 0, 0, 0
 
-        if action_type == self.action_types.RAISE.value:
-            raise_amount = observation["min_raise"]
-
-        # Return the 4-tuple required by the API schema
-        return action_type, raise_amount, keep_1, keep_2
-
-    def observe(self, observation, reward, terminated, truncated, info):
-        # Optional: update internal state or log hand results
-        if terminated:
-            self.logger.info(f"Hand Over. Reward: {reward}")
