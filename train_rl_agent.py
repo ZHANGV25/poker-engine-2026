@@ -1,3 +1,4 @@
+import os
 import random
 import numpy as np
 import torch
@@ -14,78 +15,75 @@ from agents.prob_agent import ProbabilityAgent
 def compute_equity(obs, num_simulations=100):
     """
     Compute an approximate equity (win probability) given the observation.
-    Uses a Monte Carlo simulation by sampling the missing cards.
+    New variant: 27-card deck, opp_discarded_cards (3 cards). Uses first 2 hole cards for equity.
     """
-    my_cards = obs["my_cards"]
+    my_cards_raw = [c for c in obs["my_cards"] if c != -1]
+    my_cards = my_cards_raw[:2] if len(my_cards_raw) >= 2 else my_cards_raw
+    if len(my_cards) != 2:
+        return 0.5
     community_cards = [c for c in obs["community_cards"] if c != -1]
-    opp_cards = []
-    if obs["opp_discarded_card"] != -1:
-        opp_cards.append(obs["opp_discarded_card"])
-    if obs["opp_drawn_card"] != -1:
-        opp_cards.append(obs["opp_drawn_card"])
-
-    shown_cards = set(my_cards + community_cards + opp_cards)
-    deck = list(range(27))  # our deck consists of 27 cards
+    opp_discarded = list(obs.get("opp_discarded_cards", [-1, -1, -1]))
+    shown_cards = set(my_cards) | set(community_cards) | {c for c in opp_discarded if c != -1}
+    deck = list(range(27))
     non_shown_cards = [card for card in deck if card not in shown_cards]
 
     wins = 0
     for _ in range(num_simulations):
-        opp_needed = 2 - len(opp_cards)
+        opp_needed = 2
         board_needed = 5 - len(community_cards)
         sample_size = opp_needed + board_needed
-
         if sample_size > len(non_shown_cards):
             continue
-
         sample = random.sample(non_shown_cards, sample_size)
-        opp_sample = sample[:opp_needed]
-        board_sample = sample[opp_needed:]
-        opp_full = opp_cards + opp_sample
-        community_full = community_cards + board_sample
+        opp_full = sample[:opp_needed]
+        community_full = community_cards + sample[opp_needed:]
 
         my_hand = [PokerEnv.int_to_card(card) for card in my_cards]
         opp_hand = [PokerEnv.int_to_card(card) for card in opp_full]
         board = [PokerEnv.int_to_card(card) for card in community_full]
-
-        evaluator = PokerEnv().evaluator  # temporary evaluator instance
+        evaluator = PokerEnv().evaluator
         my_rank = evaluator.evaluate(my_hand, board)
         opp_rank = evaluator.evaluate(opp_hand, board)
-        if my_rank < opp_rank:  # lower rank is better in Treys
+        if my_rank < opp_rank:
             wins += 1
-
     return wins / num_simulations if num_simulations > 0 else 0.0
+
+# New variant: 5 hole card slots, 27-card deck. Feature dim = 1 + 5 + 5 + 1+1+1+1+1 = 16
+INPUT_DIM = 16
 
 def preprocess_observation(obs):
     """
-    Converts the observation dictionary for one player into a feature tensor.
-    Features include:
-      - street (normalized by 3)
-      - my_cards (2 values, shifted and normalized)
-      - community_cards (5 values, shifted and normalized)
-      - my_bet and opp_bet (normalized by 100)
-      - min_raise and max_raise (normalized by 100)
-      - computed equity (a scalar between 0 and 1)
+    Converts the observation into a feature tensor for the new variant.
+    Features: street(1), my_cards(5), community_cards(5), my_bet, opp_bet, min_raise, max_raise, equity(1).
+    Cards normalized (card+1)/28; -1 -> 0.
     """
     street = np.array([obs["street"] / 3.0])
-    my_cards = np.array([(card + 1) / 28.0 for card in obs["my_cards"]])
-    community_cards = np.array([(card + 1) / 28.0 for card in obs["community_cards"]])
+    my_cards = np.array([((c + 1) / 28.0) if c != -1 else 0.0 for c in obs["my_cards"]])
+    if len(my_cards) < 5:
+        my_cards = np.resize(my_cards, 5)
+    community_cards = np.array([((c + 1) / 28.0) if c != -1 else 0.0 for c in obs["community_cards"]])
     my_bet = np.array([obs["my_bet"] / 100.0])
     opp_bet = np.array([obs["opp_bet"] / 100.0])
     min_raise = np.array([obs["min_raise"] / 100.0])
     max_raise = np.array([obs["max_raise"] / 100.0])
     equity = np.array([compute_equity(obs)])
-    features = np.concatenate([street, my_cards, community_cards, my_bet, opp_bet, min_raise, max_raise, equity])
+    features = np.concatenate([street, my_cards[:5], community_cards[:5], my_bet, opp_bet, min_raise, max_raise, equity])
     return torch.tensor(features, dtype=torch.float32)
 
 # --- Define the Policy Network ---
 
+# Which pair of indices (out of 5) to keep when discarding: (0,1), (0,2), ..., (3,4)
+KEEP_PAIRS = [(i, j) for i in range(5) for j in range(i + 1, 5)]
+NUM_DISCARD_CLASSES = len(KEEP_PAIRS)  # 10
+
+
 class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_action_types=5, num_raise_classes=100, num_discard_classes=3):
+    def __init__(self, input_dim, hidden_dim=128, num_action_types=5, num_raise_classes=100, num_discard_classes=NUM_DISCARD_CLASSES):
         """
-        The network uses a shared base and three heads:
-          - Action type head: outputs logits over 5 actions (FOLD, RAISE, CHECK, CALL, DISCARD)
-          - Raise head: outputs logits over 100 values (to be shifted to [1, 100])
-          - Discard head: outputs logits over 3 values (mapped to [-1, 0, 1])
+        New variant: shared base and three heads.
+          - Action type: 5 actions (FOLD, RAISE, CHECK, CALL, DISCARD)
+          - Raise: 100 classes -> [1, 100]
+          - Discard: 10 classes -> which pair (i,j) of 5 hole cards to keep
         """
         super(PolicyNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -112,13 +110,10 @@ class RLAgent:
 
     def select_action(self, state, valid_actions, min_raise, max_raise):
         """
-        Given the state tensor and valid actions, sample an action tuple.
-        Returns:
-          (action_type, raise_amount, card_to_discard), log_prob
+        Sample an action. Returns (action_type, raise_amount, keep1, keep2), log_prob.
+        For DISCARD, keep1 and keep2 are the two indices (0-4) to keep from 5 hole cards.
         """
         action_type_logits, raise_logits, discard_logits = self.policy_net(state)
-        
-        # Mask invalid actions before sampling action type.
         mask = (valid_actions == 0)
         masked_logits = action_type_logits.clone()
         masked_logits[mask] = -1e9
@@ -129,29 +124,25 @@ class RLAgent:
 
         action_type = action_type_dist.sample()
         raise_amount = raise_dist.sample()
-        discard_action = discard_dist.sample()
+        discard_idx = discard_dist.sample()
 
         log_prob = (action_type_dist.log_prob(action_type) +
                     raise_dist.log_prob(raise_amount) +
-                    discard_dist.log_prob(discard_action))
+                    discard_dist.log_prob(discard_idx))
 
         action_type = action_type.item()
-        # Shift raise amount to the range 1..100; clamp if necessary.
         raise_amount = raise_amount.item() + 1
         if action_type == PokerEnv.ActionType.RAISE.value:
             raise_amount = int(max(min(raise_amount, max_raise), min_raise))
         else:
             raise_amount = 0
 
-        # Map discard output: 0 -> -1, 1 -> 0, 2 -> 1.
-        discard_action = discard_action.item() - 1
         if action_type == PokerEnv.ActionType.DISCARD.value:
-            if discard_action < 0:
-                discard_action = 0  # force a valid index (0 or 1)
+            keep1, keep2 = KEEP_PAIRS[discard_idx.item() % NUM_DISCARD_CLASSES]
         else:
-            discard_action = -1
+            keep1, keep2 = 0, 0
 
-        return (action_type, raise_amount, discard_action), log_prob
+        return (action_type, raise_amount, keep1, keep2), log_prob
 
     def update_policy(self, trajectory):
         R = 0
@@ -173,12 +164,13 @@ class RLAgent:
 
 # --- Training Loop with Opponent Agent, CUDA support, and Weight Saving ---
 
-def train_agent(num_episodes=500, save_every=50, weight_path="rl_agent_weights.pth"):
+def train_agent(num_episodes=500, save_every=50, weight_path=None):
+    if weight_path is None:
+        weight_path = os.path.join(os.path.dirname(__file__), "agents", "rl_agent_weights.pth")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     env = PokerEnv()
-    # Feature vector is 13-dimensional.
-    agent = RLAgent(input_dim=13)
+    agent = RLAgent(input_dim=INPUT_DIM)
     agent.policy_net.to(device)
     
     # Use ProbabilityAgent as the opponent.
