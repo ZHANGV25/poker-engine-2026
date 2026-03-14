@@ -50,6 +50,8 @@ class PlayerAgent(Agent):
 
         # Pre-flop hand potential lookup table
         self._preflop_table = self._load_preflop_table()
+        # Sorted list of (potential, bitmask) for all hands — used for opponent range estimation
+        self._all_hand_potentials = self._build_potential_index()
 
         # Per-hand state
         self._current_hand = -1
@@ -82,6 +84,114 @@ class PlayerAgent(Agent):
         for c in my_cards:
             mask |= 1 << c
         return self._preflop_table.get(mask)
+
+    def _build_potential_index(self):
+        """Build sorted array of (potential, card_list) for opponent range estimation."""
+        if self._preflop_table is None:
+            return None
+        entries = []
+        for mask, pot in self._preflop_table.items():
+            cards = [i for i in range(27) if mask & (1 << i)]
+            entries.append((pot, cards))
+        entries.sort(key=lambda x: -x[0])  # highest potential first
+        return entries
+
+    def _estimate_preflop_equity_vs_range(self, my_cards, raise_size):
+        """Compute our equity against the opponent's estimated raising range.
+
+        Instead of using raw hand potential (which is equity vs random hands),
+        this estimates what hands would raise this amount, samples matchups
+        against those hands, and returns our actual equity.
+
+        Args:
+            my_cards: list of 5 card ints
+            raise_size: how much opponent raised above the blind (opp_bet - 2)
+
+        Returns:
+            float equity (0-1) against opponent's estimated range
+        """
+        if self._all_hand_potentials is None:
+            return self._preflop_potential(my_cards) or 0.5
+
+        # Estimate what fraction of hands would raise this amount
+        # Bigger raise → tighter range (fewer, stronger hands)
+        # Map raise size to range percentile:
+        #   raise 2-4:   top 60% of hands
+        #   raise 10-20: top 35% of hands
+        #   raise 30-50: top 20% of hands
+        #   raise 60-80: top 10% of hands
+        #   raise 80+:   top 5% of hands
+        if raise_size <= 4:
+            range_pct = 0.60
+        elif raise_size <= 20:
+            range_pct = 0.60 - (raise_size - 4) / 16 * 0.25  # 0.60 → 0.35
+        elif raise_size <= 50:
+            range_pct = 0.35 - (raise_size - 20) / 30 * 0.15  # 0.35 → 0.20
+        else:
+            range_pct = 0.20 - (raise_size - 50) / 50 * 0.15  # 0.20 → 0.05
+        range_pct = max(range_pct, 0.05)
+
+        # Get opponent hands in this range (top range_pct by potential)
+        my_card_set = set(my_cards)
+        total_hands = len(self._all_hand_potentials)
+        cutoff = int(total_hands * range_pct)
+
+        # Collect valid opponent hands (no card overlap with ours)
+        opp_hands = []
+        for pot, cards in self._all_hand_potentials:
+            if not (set(cards) & my_card_set):
+                opp_hands.append(cards)
+            if len(opp_hands) >= cutoff:
+                break
+
+        if not opp_hands:
+            return self._preflop_potential(my_cards) or 0.5
+
+        # Sample matchups: pick N opponent hands, M random flops, simulate
+        rng = random.Random(hash(tuple(my_cards)))  # deterministic per hand
+        n_opp_sample = min(len(opp_hands), 150)
+        n_flop_sample = 30
+
+        opp_sample = rng.sample(opp_hands, n_opp_sample)
+
+        # Available cards for flop (not in our hand)
+        available_for_flop_base = [c for c in range(27) if c not in my_card_set]
+
+        KEEP_PAIRS = [(i,j) for i in range(5) for j in range(i+1, 5)]
+        five_lookup = self.engine.lookup_five
+        wins = 0.0
+        total = 0.0
+
+        for opp_cards in opp_sample:
+            opp_set = set(opp_cards)
+            available = [c for c in available_for_flop_base if c not in opp_set]
+
+            # Sample random flops
+            for _ in range(n_flop_sample):
+                flop = rng.sample(available, 3)
+
+                # Find our best keep
+                best_hero_rank = float('inf')
+                for i, j in KEEP_PAIRS:
+                    rank = five_lookup([my_cards[i], my_cards[j]] + flop)
+                    if rank < best_hero_rank:
+                        best_hero_rank = rank
+
+                # Find opponent's best keep
+                best_opp_rank = float('inf')
+                for i, j in KEEP_PAIRS:
+                    rank = five_lookup([opp_cards[i], opp_cards[j]] + flop)
+                    if rank < best_opp_rank:
+                        best_opp_rank = rank
+
+                # Compare
+                if best_hero_rank < best_opp_rank:
+                    wins += 1.0
+                elif best_hero_rank == best_opp_rank:
+                    wins += 0.5
+                total += 1.0
+
+        return wins / total if total > 0 else 0.5
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
@@ -184,28 +294,62 @@ class PlayerAgent(Agent):
     # ----------------------------------------------------------------
 
     def _handle_preflop(self, observation, my_cards):
-        """Pre-flop strategy using precomputed hand potential table."""
-        valid_actions = observation["valid_actions"]
+        """Pre-flop strategy with pot-odds-based calling and opponent range estimation.
 
+        When facing a raise, we estimate what hands the opponent would raise
+        with (bigger raise = tighter range), simulate matchups against that
+        range, and only call if our equity exceeds pot odds.
+
+        This prevents the biggest leak: calling 80-chip raises with mediocre
+        hands and bleeding chips pre-flop.
+        """
+        valid_actions = observation["valid_actions"]
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        continue_cost = opp_bet - my_bet
+        pot_size = self._get_pot_size(observation)
+
+        # Get hand potential for raise decisions
         potential = self._preflop_potential(my_cards)
         if potential is not None:
             strength = max(0.0, min(10.0, (potential - 0.37) / 0.028))
         else:
             strength = self._preflop_heuristic(my_cards)
 
-        continue_cost = observation["opp_bet"] - observation["my_bet"]
-
         if valid_actions[CALL]:
-            if strength >= 7.0 and valid_actions[RAISE]:
-                raise_amt = self._compute_raise_amount(observation, 0.65)
-                return (RAISE, raise_amt, 0, 0)
             if continue_cost <= 1:
+                # SB completing to 2: always call (33% pot odds, all hands qualify)
+                if strength >= 7.0 and valid_actions[RAISE]:
+                    raise_amt = self._compute_raise_amount(observation, 0.65)
+                    return (RAISE, raise_amt, 0, 0)
                 return (CALL, 0, 0, 0)
-            if strength >= 3.0:
+
+            # Facing a raise: use pot odds + opponent range estimation
+            required_equity = continue_cost / (continue_cost + pot_size)
+            raise_size = opp_bet - 2  # how much above the blind
+
+            if raise_size >= 6:
+                # Significant raise: compute equity against estimated range
+                equity_vs_range = self._estimate_preflop_equity_vs_range(
+                    my_cards, raise_size)
+
+                if equity_vs_range < required_equity:
+                    return (FOLD, 0, 0, 0)
+
+                # Only re-raise with hands that have strong equity vs their range
+                if equity_vs_range > required_equity + 0.15 and valid_actions[RAISE]:
+                    raise_amt = self._compute_raise_amount(observation, 0.65)
+                    return (RAISE, raise_amt, 0, 0)
+
                 return (CALL, 0, 0, 0)
-            if continue_cost > 6 and strength < 2.0:
+            else:
+                # Small raise (min-raise): call with decent hands, raise with strong
+                if strength >= 7.0 and valid_actions[RAISE]:
+                    raise_amt = self._compute_raise_amount(observation, 0.65)
+                    return (RAISE, raise_amt, 0, 0)
+                if strength >= 2.0:
+                    return (CALL, 0, 0, 0)
                 return (FOLD, 0, 0, 0)
-            return (CALL, 0, 0, 0)
 
         if valid_actions[CHECK]:
             if strength >= 8.0 and valid_actions[RAISE]:
