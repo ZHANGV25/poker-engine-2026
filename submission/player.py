@@ -68,6 +68,9 @@ class PlayerAgent(Agent):
         self._last_seen_action = None  # to avoid double-counting actions
         self._hand_street_seen = set() # track which streets we've recorded actions for
         self._my_player_index = None   # 0 or 1, determined from first hand
+        self._my_raises_this_street = 0  # how many times WE raised on current street
+        self._current_street = -1        # track street changes to reset raise count
+        self._opp_reraised_us = False    # did opponent re-raise after our raise this street?
 
     def __name__(self):
         return "PlayerAgent"
@@ -111,6 +114,9 @@ class PlayerAgent(Agent):
             self._opp_weights = None
             self._last_seen_action = None
             self._hand_street_seen = set()
+            self._my_raises_this_street = 0
+            self._current_street = -1
+            self._opp_reraised_us = False
 
     def _determine_player_index(self, observation, info):
         """Figure out if we are player 0 or player 1.
@@ -307,6 +313,17 @@ class PlayerAgent(Agent):
         continue_cost = opp_bet - my_bet
         pot_odds = continue_cost / (continue_cost + pot_size) if continue_cost > 0 else 0
 
+        # Track raise escalation on this street
+        if street != self._current_street:
+            self._current_street = street
+            self._my_raises_this_street = 0
+            self._opp_reraised_us = False
+
+        # Detect if opponent re-raised us (we raised, they raised back)
+        opp_action = observation.get("opp_last_action", "None")
+        if opp_action == "RAISE" and self._my_raises_this_street > 0:
+            self._opp_reraised_us = True
+
         # --- Adjust thresholds ---
         raise_thresh = self.base_raise_threshold
         strong_raise_thresh = self.base_strong_raise_threshold
@@ -361,20 +378,43 @@ class PlayerAgent(Agent):
                 raise_thresh -= 0.03
                 bluff_freq *= 1.5
 
+        # --- Re-raise protection ---
+        # When opponent re-raises us, they're representing a strong hand.
+        # Don't keep escalating unless we have near-nuts equity.
+        # This fixes the biggest leak: losing 100 chips by re-raising wars
+        # with two pair or trips when opponent has a better hand.
+        if self._opp_reraised_us and self._my_raises_this_street >= 1:
+            # Opponent re-raised after we raised. Tighten significantly.
+            if equity > 0.90 and valid_actions[RAISE]:
+                # Near-nuts: keep raising
+                self._my_raises_this_street += 1
+                return (RAISE, max_raise, 0, 0)
+            elif equity >= pot_odds and valid_actions[CALL]:
+                # Decent hand but not nuts: just call, don't escalate
+                return (CALL, 0, 0, 0)
+            elif valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            else:
+                # Can't call profitably: fold
+                return (FOLD, 0, 0, 0)
+
         # --- Make decision ---
 
         # All-in with near-certain hands
         if equity > 0.95 and valid_actions[RAISE]:
+            self._my_raises_this_street += 1
             return (RAISE, max_raise, 0, 0)
 
         # Strong raise
         if equity > strong_raise_thresh and valid_actions[RAISE]:
+            self._my_raises_this_street += 1
             frac = 0.75 + 0.25 * (equity - strong_raise_thresh) / (1.0 - strong_raise_thresh)
             raise_amt = self._compute_raise_amount(observation, frac)
             return (RAISE, raise_amt, 0, 0)
 
-        # Medium raise
-        if equity > raise_thresh and valid_actions[RAISE]:
+        # Medium raise (only if we haven't already raised twice this street)
+        if equity > raise_thresh and valid_actions[RAISE] and self._my_raises_this_street < 2:
+            self._my_raises_this_street += 1
             frac = 0.5 + 0.25 * (equity - raise_thresh) / (strong_raise_thresh - raise_thresh)
             raise_amt = self._compute_raise_amount(observation, frac)
             return (RAISE, raise_amt, 0, 0)
