@@ -1,6 +1,6 @@
 {
     "bot0": {
-        "file_path": "submission.player.PlayerAgent",
+        "file_path": "agents.rl_agent.ProbabilityAgent",
         "port": 8000,
         "player_id": "bot0"
     },
