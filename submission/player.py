@@ -260,18 +260,22 @@ class PlayerAgent(Agent):
         implicitly — these all emerge from the equilibrium computation.
         """
         dead_cards = my_discards + opp_discards
-        blind_pos = self._get_blind_position(observation)
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
 
-        # Post-flop: BB (blind_position=1) acts first
-        hero_is_first = (blind_pos == 1)
+        # Determine if we're initiating action or responding to a bet.
+        # This determines the tree shape: initiating = CHECK/BET options,
+        # responding = FOLD/CALL/RAISE options.
+        # We're "first" if bets are equal (no outstanding bet to respond to).
+        hero_is_first = (my_bet == opp_bet)
 
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
             opp_range=self._opp_weights,
             dead_cards=dead_cards,
-            my_bet=observation["my_bet"],
-            opp_bet=observation["opp_bet"],
+            my_bet=my_bet,
+            opp_bet=opp_bet,
             street=observation["street"],
             min_raise=observation["min_raise"],
             max_raise=observation["max_raise"],

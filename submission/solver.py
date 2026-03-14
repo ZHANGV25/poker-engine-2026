@@ -79,13 +79,19 @@ class SubgameSolver:
         opp_weights /= opp_weights.sum()
         n_opp = len(opp_hands)
 
-        # Choose iteration count based on time remaining
-        if time_remaining > 200:
-            iterations = 150
+        # Choose iteration count based on time remaining.
+        # Budget: 500s for 1000 hands = 0.5s/hand. Each hand has ~4 decisions.
+        # Target: <100ms per solver call. ARM64 is ~1.5x slower than Apple Silicon.
+        if time_remaining > 300:
+            iterations = 100
+        elif time_remaining > 150:
+            iterations = 60
         elif time_remaining > 50:
-            iterations = 75
+            iterations = 30
         else:
-            iterations = 40
+            # Critical: fall back to thresholds entirely
+            return self._fallback(hero_cards, board, dead_cards,
+                                  my_bet, opp_bet, valid_actions, min_raise, max_raise)
 
         # Build game tree
         max_bet = 100  # MAX_PLAYER_BET
