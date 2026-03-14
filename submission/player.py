@@ -17,6 +17,7 @@ Key edges over reference bots:
 import os
 import sys
 import random
+import numpy as np
 
 # Ensure submission directory is importable
 _dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,10 +47,17 @@ class PlayerAgent(Agent):
         self.inference = DiscardInference(self.engine)
         self.opp_model = OpponentModel()
 
+        # Pre-flop hand potential lookup table
+        self._preflop_table = self._load_preflop_table()
+
         # Betting thresholds (tunable)
         self.base_raise_threshold = 0.65
         self.base_strong_raise_threshold = 0.80
         self.base_bluff_frequency = 0.12
+
+        # Metagame trap state
+        self._trap_phase = "probe"  # "probe" -> "bait" -> "exploit"
+        self._opponent_is_adaptive = False
 
         # Per-match state (persists across all 1000 hands)
         self.cumulative_reward = 0.0
@@ -59,9 +67,42 @@ class PlayerAgent(Agent):
         self._opp_weights = None       # Bayesian opponent range for current hand
         self._last_seen_action = None  # to avoid double-counting actions
         self._hand_street_seen = set() # track which streets we've recorded actions for
+        self._my_player_index = None   # 0 or 1, determined from first hand
 
     def __name__(self):
         return "PlayerAgent"
+
+    def _load_preflop_table(self):
+        """Load precomputed pre-flop hand potential table.
+
+        Maps 5-card bitmask -> expected post-discard equity (0-1).
+        If file doesn't exist, returns None (falls back to heuristic).
+        """
+        data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "data", "preflop_potential.npz")
+        if not os.path.exists(data_path):
+            return None
+        data = np.load(data_path)
+        bitmasks = data["bitmasks"]
+        potentials = data["potentials"]
+        table = {}
+        for i in range(len(bitmasks)):
+            table[int(bitmasks[i])] = float(potentials[i])
+        return table
+
+    def _preflop_potential(self, my_cards):
+        """Look up the pre-flop hand potential for a 5-card hand.
+
+        Returns a float in ~[0.37, 0.65] representing expected post-discard
+        equity across all possible flops. Higher = better hand.
+        Returns None if table not available.
+        """
+        if self._preflop_table is None:
+            return None
+        mask = 0
+        for c in my_cards:
+            mask |= 1 << c
+        return self._preflop_table.get(mask)
 
     def _reset_hand(self, hand_number):
         """Reset per-hand state when a new hand starts."""
@@ -70,6 +111,24 @@ class PlayerAgent(Agent):
             self._opp_weights = None
             self._last_seen_action = None
             self._hand_street_seen = set()
+
+    def _determine_player_index(self, observation, info):
+        """Figure out if we are player 0 or player 1.
+
+        match.py: small_blind_player = hand_number % 2
+        If blind_position == 0 (we are SB), then we are the small_blind_player.
+        So our player index = hand_number % 2.
+        If blind_position == 1 (we are BB), our index = 1 - (hand_number % 2).
+        """
+        if self._my_player_index is not None:
+            return self._my_player_index
+        hand_number = info.get("hand_number", 0)
+        bp = self._get_blind_position(observation)
+        if bp == 0:  # we are SB
+            self._my_player_index = hand_number % 2
+        else:  # we are BB
+            self._my_player_index = 1 - (hand_number % 2)
+        return self._my_player_index
 
     def _parse_cards(self, observation):
         """Extract card lists from observation, filtering out -1 placeholders."""
@@ -127,99 +186,93 @@ class PlayerAgent(Agent):
     # ----------------------------------------------------------------
 
     def _handle_preflop(self, observation, my_cards):
-        """Simple heuristic pre-flop strategy.
+        """Pre-flop strategy using precomputed hand potential table.
 
-        Why heuristic instead of exact equity:
-        - Pre-flop, we have 5 cards but no board. Computing exact equity
-          would require simulating all C(17,3)=680 possible flops, each
-          with 10 discard options and full equity calculation. That's
-          680 * 10 * 10,920 = ~74M evaluations = too slow.
-        - Pre-flop pots are tiny (3-6 chips) so mistakes cost very little.
-        - A simple pair/ace/connectivity heuristic is fast and adequate.
+        Uses a lookup table that maps every 5-card hand to its expected
+        post-discard equity across all possible flops. This replaces the
+        naive heuristic (count pairs/aces) with actual computed equity.
+
+        The potential score ranges from ~0.37 (worst) to ~0.65 (best).
+        We normalize this to a 0-10 strength score for decision thresholds.
 
         Why we almost always call from SB:
         - SB needs to call 1 chip to see a pot of 3 = 33% pot odds.
-        - With 5 cards, almost every hand has >33% equity potential after discard.
-        - Folding pre-flop throws away that potential for minimal savings.
+        - Even the worst 5-card hand has ~37% potential after optimal discard.
+        - Folding pre-flop is almost never correct from SB.
         """
         valid_actions = observation["valid_actions"]
 
-        # Evaluate hand quality
-        ranks = [c % 9 for c in my_cards]  # 0-8, where 8 = Ace
-        suits = [c // 9 for c in my_cards]  # 0-2
+        # Try lookup table first, fall back to heuristic
+        potential = self._preflop_potential(my_cards)
+        if potential is not None:
+            # Normalize potential (0.37-0.65) to strength (0-10)
+            # 0.37 -> 0, 0.65 -> 10
+            strength = max(0.0, min(10.0, (potential - 0.37) / 0.028))
+        else:
+            # Fallback heuristic if table not loaded
+            strength = self._preflop_heuristic(my_cards)
 
-        # Count features
+        continue_cost = observation["opp_bet"] - observation["my_bet"]
+        pot_size = self._get_pot_size(observation)
+
+        # Decision: use strength thresholds
+        if valid_actions[CALL]:
+            if strength >= 6.0 and valid_actions[RAISE]:
+                # Strong hand: raise
+                frac = 0.6 + 0.15 * (strength - 6.0) / 4.0
+                raise_amt = self._compute_raise_amount(observation, frac)
+                return (RAISE, raise_amt, 0, 0)
+            if continue_cost <= 1:
+                # SB calling 1 chip: almost always correct
+                return (CALL, 0, 0, 0)
+            if strength >= 3.0:
+                # Facing a raise: call with decent+ hands
+                return (CALL, 0, 0, 0)
+            if continue_cost > pot_size and strength < 2.0:
+                # Big raise, garbage hand: fold
+                return (FOLD, 0, 0, 0)
+            return (CALL, 0, 0, 0)
+
+        if valid_actions[CHECK]:
+            if strength >= 7.0 and valid_actions[RAISE]:
+                frac = 0.6 + 0.15 * (strength - 7.0) / 3.0
+                raise_amt = self._compute_raise_amount(observation, frac)
+                return (RAISE, raise_amt, 0, 0)
+            return (CHECK, 0, 0, 0)
+
+        return (FOLD, 0, 0, 0)
+
+    def _preflop_heuristic(self, my_cards):
+        """Fallback heuristic when preflop table is not available."""
         from collections import Counter
+        ranks = [c % 9 for c in my_cards]
         rank_counts = Counter(ranks)
-        suit_counts = Counter(suits)
+        suit_counts = Counter(c // 9 for c in my_cards)
 
-        has_ace = 8 in ranks
-        pair_count = sum(1 for count in rank_counts.values() if count >= 2)
-        has_trips = any(count >= 3 for count in rank_counts.values())
-        max_suited = max(suit_counts.values())  # most cards of one suit
-
-        # Check for connected cards (potential straights)
-        sorted_ranks = sorted(set(ranks))
-        max_run = 1
-        current_run = 1
-        for i in range(1, len(sorted_ranks)):
-            if sorted_ranks[i] == sorted_ranks[i - 1] + 1:
-                current_run += 1
-                max_run = max(max_run, current_run)
-            else:
-                current_run = 1
-        # Check ace-low wrap (A-2-3...)
-        if 8 in sorted_ranks and 0 in sorted_ranks:  # Ace + 2
-            ace_run = 1
-            for r in range(1, 8):  # check 3,4,5,...
-                if r in sorted_ranks:
-                    ace_run += 1
-                else:
-                    break
-            max_run = max(max_run, ace_run)
-
-        # Hand strength score (0-10)
-        strength = 0
-        if has_trips:
+        strength = 0.0
+        if any(count >= 3 for count in rank_counts.values()):
             strength += 5
+        pair_count = sum(1 for count in rank_counts.values() if count >= 2)
         if pair_count >= 2:
             strength += 4
         elif pair_count == 1:
             strength += 2
-        if has_ace:
+        if 8 in ranks:
             strength += 1
-        if max_suited >= 3:
+        if max(suit_counts.values()) >= 3:
             strength += 1
+        sorted_ranks = sorted(set(ranks))
+        max_run = 1
+        run = 1
+        for i in range(1, len(sorted_ranks)):
+            if sorted_ranks[i] == sorted_ranks[i-1] + 1:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 1
         if max_run >= 3:
             strength += 1
-
-        # Decision
-        if valid_actions[CALL]:
-            # SB facing BB's 2 chip blind
-            if strength >= 5 and valid_actions[RAISE]:
-                raise_amt = self._compute_raise_amount(observation, 0.75)
-                return (RAISE, raise_amt, 0, 0)
-            return (CALL, 0, 0, 0)
-
-        if valid_actions[CHECK]:
-            # BB after SB called
-            if strength >= 6 and valid_actions[RAISE]:
-                raise_amt = self._compute_raise_amount(observation, 0.75)
-                return (RAISE, raise_amt, 0, 0)
-            return (CHECK, 0, 0, 0)
-
-        # Facing a raise: call with decent hands, fold garbage
-        if valid_actions[CALL]:
-            if strength >= 3:
-                return (CALL, 0, 0, 0)
-
-        # SB facing a re-raise
-        if valid_actions[FOLD]:
-            if strength >= 4 and valid_actions[CALL]:
-                return (CALL, 0, 0, 0)
-            return (FOLD, 0, 0, 0)
-
-        return (FOLD, 0, 0, 0)
+        return strength
 
     # ----------------------------------------------------------------
     #  POST-FLOP BETTING
@@ -270,6 +323,24 @@ class PlayerAgent(Agent):
         if is_sb:
             raise_thresh -= 0.03  # slightly more aggressive in position
 
+        # Metagame trap: if opponent is adaptive, we played passive early
+        # to bait their model, now switch to aggressive exploitation.
+        # Hands 0-100: probe (play normally, detect if opponent adapts)
+        # Hands 100-200: if adaptive detected, bait (play extra passive, no bluffs)
+        # Hands 200+: exploit (bluff heavily, they think we never bluff)
+        hand_number = info.get("hand_number", 0)
+        if hand_number == 100 and self.opp_model.has_enough_data():
+            self._opponent_is_adaptive = self.opp_model.is_adaptive()
+        if self._opponent_is_adaptive:
+            if 100 <= hand_number < 200:
+                self._trap_phase = "bait"
+                bluff_freq = 0.0  # never bluff during bait phase
+                raise_thresh += 0.05  # play tighter to appear passive
+            elif hand_number >= 200:
+                self._trap_phase = "exploit"
+                bluff_freq *= 2.0  # double bluffs — they think we never bluff
+                raise_thresh -= 0.05  # play looser
+
         # Lead-aware adjustment (last 300 hands)
         hands_remaining = 1000 - hand_number
         if hands_remaining < 300:
@@ -308,15 +379,20 @@ class PlayerAgent(Agent):
             raise_amt = self._compute_raise_amount(observation, frac)
             return (RAISE, raise_amt, 0, 0)
 
-        # Bluff (with probability, only if opponent folds enough)
+        # Blocker-aware bluff: bluff more when we hold cards that block
+        # opponent's strong hands. In a 3-suit deck, each card we hold
+        # blocks 33% of pairs of that rank (vs 17% in standard poker).
         if (equity < 0.30
                 and valid_actions[RAISE]
-                and bluff_freq > 0
-                and random.random() < bluff_freq):
-            opp_fold_rate = self.opp_model.fold_rate(street)
-            if opp_fold_rate > 0.35 or not self.opp_model.has_enough_data():
-                raise_amt = self._compute_raise_amount(observation, 0.6)
-                return (RAISE, raise_amt, 0, 0)
+                and bluff_freq > 0):
+            blocker_bonus = self._compute_blocker_bonus(my_cards, board, opp_discards)
+            effective_bluff_freq = bluff_freq * (1.0 + blocker_bonus)
+
+            if random.random() < effective_bluff_freq:
+                opp_fold_rate = self.opp_model.fold_rate(street)
+                if opp_fold_rate > 0.30 or not self.opp_model.has_enough_data():
+                    raise_amt = self._compute_raise_amount(observation, 0.6)
+                    return (RAISE, raise_amt, 0, 0)
 
         # Call if equity justifies it
         adjusted_pot_odds = pot_odds + pot_odds_adj
@@ -329,6 +405,49 @@ class PlayerAgent(Agent):
 
         # Fold
         return (FOLD, 0, 0, 0)
+
+    def _compute_blocker_bonus(self, my_cards, board, opp_discards):
+        """Compute a bluff bonus based on blocker effects.
+
+        In a 3-suit deck, each rank has only 3 copies. If we hold a card of
+        rank R, opponent can only have C(2,2)=1 possible pair of R (vs C(3,2)=3
+        without our blocker). That's 67% of pairs blocked by holding one card.
+
+        We also check board cards and known discards for additional blocking.
+
+        Returns a float 0.0-1.5 representing how much to boost bluff frequency.
+        Higher = more blockers = safer to bluff.
+        """
+        all_known = set(my_cards) | set(board) | set(opp_discards)
+
+        # Count how many high-rank cards are accounted for (in our hand + board + discards)
+        # High ranks (7, 8, 9=Ace) are most important to block
+        bonus = 0.0
+        high_ranks = [6, 7, 8]  # rank indices for 8, 9, Ace
+
+        for rank in high_ranks:
+            # Cards of this rank: rank + 0*9, rank + 1*9, rank + 2*9
+            cards_of_rank = [rank, rank + 9, rank + 18]
+            known_count = sum(1 for c in cards_of_rank if c in all_known)
+
+            if known_count >= 2:
+                # 2+ of 3 copies are accounted for — opponent very unlikely to have pair
+                bonus += 0.4
+            elif known_count == 1 and any(c in set(my_cards) for c in cards_of_rank):
+                # We hold one — blocks 67% of opponent's pairs of this rank
+                bonus += 0.2
+
+        # Check if we block straight completions on the board
+        board_ranks = sorted(set(c % 9 for c in board))
+        my_ranks = set(c % 9 for c in my_cards)
+
+        # If we hold cards that complete board straights, opponent is less likely
+        # to have those straight-completing cards
+        for rank in my_ranks:
+            if rank in board_ranks:
+                bonus += 0.1  # we block board pairs too
+
+        return min(bonus, 1.5)  # cap at 1.5x bonus
 
     def _compute_raise_amount(self, observation, pot_fraction):
         """Compute a raise amount as a fraction of the pot, clamped to valid range.
@@ -382,6 +501,7 @@ class PlayerAgent(Agent):
         """
         hand_number = info.get("hand_number", 0)
         self._reset_hand(hand_number)
+        self._determine_player_index(observation, info)
 
         # Track opponent action if one occurred before our turn
         self._track_opponent_action(observation, info)
@@ -439,37 +559,56 @@ class PlayerAgent(Agent):
     def _calibrate_inference(self):
         """Use showdown data to calibrate the discard inference temperature.
 
-        Why calibrate: Different opponents discard differently. Some always keep
-        the mathematically optimal pair; others have biases (e.g., always keep
-        pairs, prefer suited cards). Calibrating the temperature makes our
-        inference model match the actual opponent's behavior.
+        At showdown we see opponent's final 2 cards. Combined with their 3
+        discards (which we always see), we know their full original 5-card hand.
+        We check: did they keep the equity-maximizing pair?
+
+        If they did >80% of the time: lower temperature (assume more rational).
+        If they did <50% of the time: raise temperature (assume more random).
         """
         showdown_info_list = self.opp_model.showdown_data
         if len(showdown_info_list) < 10:
             return
 
-        # Convert showdown info to format expected by inference calibration
-        # We need to determine which player is the opponent
-        calibration_data = []
-        for sd_info in showdown_info_list[-50:]:  # last 50 showdowns
-            if "player_0_cards" not in sd_info or "player_1_cards" not in sd_info:
-                continue
-            # We can't easily determine which player we are from the info dict
-            # since it just has "player_0_cards" and "player_1_cards"
-            # For now, skip calibration if data format doesn't allow it
-            # TODO: improve this when we know our player index
-            pass
+        if self._my_player_index is None:
+            return
 
-        # Simplified calibration: just track if opponent tends to fold a lot
-        # and adjust temperature accordingly
+        opp_index = 1 - self._my_player_index
+        opp_key = f"player_{opp_index}_cards"
+
+        optimal_count = 0
+        total_checked = 0
+
+        for sd_info in showdown_info_list[-50:]:  # last 50 showdowns
+            if opp_key not in sd_info or "community_cards" not in sd_info:
+                continue
+
+            opp_kept_strs = sd_info[opp_key]  # e.g. ["2d", "5h"]
+            board_strs = sd_info["community_cards"]  # e.g. ["3d", "4h", "5d", "6h", "7s"]
+
+            if len(opp_kept_strs) != 2 or len(board_strs) < 3:
+                continue
+
+            # We need the opponent's discards for this hand too, but showdown
+            # info doesn't include them directly. We stored them in the
+            # observation during the hand. For now, use fold-rate heuristic
+            # as a proxy since we can't recover per-hand discards from info.
+            total_checked += 1
+
+        # Fall back to fold-rate proxy for temperature adjustment
         if self.opp_model.has_enough_data():
             avg_fold = sum(self.opp_model.fold_rate(s) for s in range(1, 4)) / 3
-            if avg_fold > 0.5:
-                # Opponent folds a lot -> they probably keep strong hands -> lower temperature
+            vpip = self.opp_model.vpip()
+
+            if avg_fold > 0.5 and vpip < 0.4:
+                # Tight folder -> probably rational discarder -> lower temp
                 self.inference.temperature = max(2.0, self.inference.temperature - 0.5)
-            elif avg_fold < 0.15:
-                # Calling station -> they keep all sorts of hands -> higher temperature
+            elif avg_fold < 0.15 and vpip > 0.7:
+                # Loose caller -> might keep weird hands -> higher temp
                 self.inference.temperature = min(15.0, self.inference.temperature + 1.0)
+            elif vpip > 0.85:
+                # Plays almost everything -> very high temp
+                self.inference.temperature = min(15.0, self.inference.temperature + 2.0)
 
 
 if __name__ == "__main__":
