@@ -10,15 +10,17 @@ without running CFR in real-time. The lookup flow:
 
 The lookup itself is O(1) -- just array indexing. The only computation
 is the initial equity calculation for hand bucketing (~5-10ms).
+
+(Copied from blueprint/lookup.py for self-contained deployment.)
 """
 
 import os
 import sys
 import numpy as np
 
-_submission_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "submission")
-if _submission_dir not in sys.path:
-    sys.path.insert(0, _submission_dir)
+_dir = os.path.dirname(os.path.abspath(__file__))
+if _dir not in sys.path:
+    sys.path.insert(0, _dir)
 
 from game_tree import (
     ACT_FOLD, ACT_CHECK, ACT_CALL,
@@ -61,16 +63,24 @@ class BlueprintLookup:
 
         data = np.load(strategy_file, allow_pickle=True)
 
-        self.strategies = data['strategies']          # (n_solved, n_buckets, n_nodes, n_actions)
-        self.cluster_ids = data['cluster_ids']        # (n_solved,)
-        self.boards = data['boards']                  # (n_solved, 3)
-        self.board_features = data['board_features']  # (n_solved, 12)
-        self.action_types = data['action_types']      # (n_solved, n_nodes, n_actions)
-        self.bucket_boundaries = data['bucket_boundaries']  # (n_buckets+1,)
+        self.strategies = data['strategies']
+        self.cluster_ids = data['cluster_ids']
+        self.boards = data['boards']
+        self.board_features = data['board_features']
+        self.action_types = data['action_types']
+        self.bucket_boundaries = data['bucket_boundaries']
 
         self.n_buckets = int(data['config_n_buckets'])
         self.n_clusters = int(data['config_n_clusters'])
         self.max_bet = int(data['config_max_bet'])
+
+        # Multi-pot-size support (turn/river blueprints)
+        if 'pot_sizes' in data:
+            self.pot_sizes = data['pot_sizes']  # e.g. [[2,2],[4,4],[16,16],[50,50]]
+            self._has_pot_sizes = True
+        else:
+            self.pot_sizes = None
+            self._has_pot_sizes = False
 
         # Build cluster_id -> index map
         self._cluster_to_idx = {}
@@ -117,8 +127,12 @@ class BlueprintLookup:
         # 3. Determine which node in the tree corresponds to the action history
         node_idx = self._action_history_to_node(action_history)
 
-        # 4. Look up strategy
-        strat = self.strategies[cluster_idx, bucket, node_idx, :]
+        # 4. Look up strategy (handle multi-pot-size format)
+        if self._has_pot_sizes:
+            pot_idx = self._find_nearest_pot(pot_state)
+            strat = self.strategies[cluster_idx, pot_idx, bucket, node_idx, :]
+        else:
+            strat = self.strategies[cluster_idx, bucket, node_idx, :]
         act_types = self.action_types[cluster_idx, node_idx, :]
 
         # Build result dict
@@ -168,7 +182,7 @@ class BlueprintLookup:
 
         Uses feature-space distance to the representative boards.
         """
-        from abstraction import compute_board_features, compute_board_cluster
+        from blueprint_abstraction import compute_board_features, compute_board_cluster
 
         # First, try exact cluster match
         cid = compute_board_cluster(list(board), self.n_clusters)
@@ -188,6 +202,23 @@ class BlueprintLookup:
                 best_cid = int(self.cluster_ids[i])
 
         return best_cid
+
+    def _find_nearest_pot(self, pot_state):
+        """Find the nearest pot size index for multi-pot blueprints."""
+        if self.pot_sizes is None or pot_state is None:
+            return 0
+
+        hero_bet, opp_bet = pot_state if pot_state else (2, 2)
+        pot = hero_bet + opp_bet
+
+        best_idx = 0
+        best_dist = float('inf')
+        for i, ps in enumerate(self.pot_sizes):
+            dist = abs(ps[0] + ps[1] - pot)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        return best_idx
 
     def _compute_bucket(self, hero_cards, board):
         """
@@ -283,7 +314,7 @@ class BlueprintLookup:
         Human-readable description of the blueprint strategy.
         Useful for debugging and analysis.
         """
-        from abstraction import compute_board_cluster, compute_board_features
+        from blueprint_abstraction import compute_board_cluster, compute_board_features
 
         cluster_id = self._find_nearest_cluster(board)
         bucket = self._compute_bucket(hero_cards, board)

@@ -313,7 +313,9 @@ class PlayerAgent(Agent):
 
         # Get blueprint strategy (action type -> probability)
         try:
-            strategy = blueprint.get_strategy(hero_cards=my_cards, board=board)
+            pot_state = (observation["my_bet"], observation["opp_bet"])
+            strategy = blueprint.get_strategy(
+                hero_cards=my_cards, board=board, pot_state=pot_state)
         except Exception:
             return None
 
