@@ -1,8 +1,9 @@
 """
 Competitive poker bot for CMU DSC Poker Bot Competition 2026.
 
-Threshold-based GTO with exact equity, discard inference, pot control,
-precomputed preflop strategy, and bet-size-based range narrowing.
+Hybrid approach: CFR solver for post-flop action decisions with
+proportional bet sizing (40%/70%/100% pot). All-in override for
+near-nuts hands only (equity > 0.95).
 """
 
 import os
@@ -19,6 +20,7 @@ from gym_env import PokerEnv
 
 from equity import ExactEquityEngine
 from inference import DiscardInference
+from solver import SubgameSolver
 
 FOLD = PokerEnv.ActionType.FOLD.value      # 0
 RAISE = PokerEnv.ActionType.RAISE.value    # 1
@@ -33,23 +35,15 @@ class PlayerAgent(Agent):
 
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)
+        self.solver = SubgameSolver(self.engine)
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
-
-        # Betting thresholds
-        self.RAISE_THRESHOLD = 0.72
-        self.STRONG_RAISE_THRESHOLD = 0.82
-        self.ALL_IN_THRESHOLD = 0.92
-        self.MAX_RAISE_STREETS = 2
 
         # Per-hand state
         self._current_hand = -1
         self._opp_weights = None
         self._last_seen_action = None
-        self._streets_raised = 0
-        self._current_street = -1
-        self._raised_this_street = False
 
     def __name__(self):
         return "PlayerAgent"
@@ -140,9 +134,6 @@ class PlayerAgent(Agent):
             self._current_hand = hand_number
             self._opp_weights = None
             self._last_seen_action = None
-            self._streets_raised = 0
-            self._current_street = -1
-            self._raised_this_street = False
 
     def _parse_cards(self, observation):
         my_cards = [c for c in observation["my_cards"] if c != -1]
@@ -304,89 +295,44 @@ class PlayerAgent(Agent):
         return (FOLD, 0, 0, 0)
 
     # ----------------------------------------------------------------
-    #  POST-FLOP (threshold-based)
+    #  POST-FLOP (hybrid: CFR solver with proportional sizing)
     # ----------------------------------------------------------------
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        dead_cards = my_discards + opp_discards
-        equity = self.engine.compute_equity(my_cards, board, dead_cards, self._opp_weights)
+        """Hybrid approach: CFR solver decides the action, proportional sizing.
 
-        valid_actions = observation["valid_actions"]
+        The solver uses 3 proportional bet sizes (40%/70%/100% pot) so the
+        tree never contains overbets. The solver computes Nash equilibrium
+        for fold/check/call/raise decisions. For near-nuts hands (equity > 0.95),
+        we override to all-in to maximize value.
+        """
+        dead_cards = my_discards + opp_discards
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        pot_size = self._get_pot_size(observation)
-        min_raise = observation["min_raise"]
         max_raise = observation["max_raise"]
-        street = observation["street"]
 
-        continue_cost = opp_bet - my_bet
-        pot_odds = continue_cost / (continue_cost + pot_size) if continue_cost > 0 else 0
-
-        if street != self._current_street:
-            self._current_street = street
-            self._raised_this_street = False
-
-        # Re-raise protection
-        opp_action = observation.get("opp_last_action", "None")
-        if opp_action == "RAISE" and self._raised_this_street:
-            if equity > self.ALL_IN_THRESHOLD and valid_actions[RAISE]:
-                return (RAISE, max_raise, 0, 0)
-            elif equity >= pot_odds and valid_actions[CALL]:
-                return (CALL, 0, 0, 0)
-            elif valid_actions[CHECK]:
-                return (CHECK, 0, 0, 0)
-            return (FOLD, 0, 0, 0)
-
-        # Pot control
-        can_raise = (
-            self._streets_raised < self.MAX_RAISE_STREETS
-            or equity > self.ALL_IN_THRESHOLD
-        )
-
-        # Check-raise
-        is_first = (my_bet == opp_bet)
-        if (is_first and equity > self.STRONG_RAISE_THRESHOLD
-                and valid_actions[CHECK] and random.random() < 0.3):
-            return (CHECK, 0, 0, 0)
-
-        # All-in
-        if equity > self.ALL_IN_THRESHOLD and valid_actions[RAISE]:
-            self._raised_this_street = True
-            self._streets_raised += 1
+        # Near-nuts override: go all-in with overwhelming equity
+        equity = self.engine.compute_equity(my_cards, board, dead_cards, self._opp_weights)
+        if equity > 0.95 and observation["valid_actions"][RAISE] and max_raise > 0:
             return (RAISE, max_raise, 0, 0)
 
-        # Strong raise
-        if equity > self.STRONG_RAISE_THRESHOLD and valid_actions[RAISE] and can_raise:
-            self._raised_this_street = True
-            self._streets_raised += 1
-            frac = 0.65 + 0.15 * (equity - self.STRONG_RAISE_THRESHOLD) / (1.0 - self.STRONG_RAISE_THRESHOLD)
-            return (RAISE, self._compute_raise_amount(observation, frac), 0, 0)
-
-        # Medium raise
-        if equity > self.RAISE_THRESHOLD and valid_actions[RAISE] and can_raise:
-            self._raised_this_street = True
-            self._streets_raised += 1
-            frac = 0.5 + 0.15 * (equity - self.RAISE_THRESHOLD) / (self.STRONG_RAISE_THRESHOLD - self.RAISE_THRESHOLD)
-            return (RAISE, self._compute_raise_amount(observation, frac), 0, 0)
-
-        # GTO bluff
-        if equity < 0.25 and valid_actions[RAISE] and can_raise:
-            bet_size = max(int(pot_size * 0.6), min_raise)
-            gto_bluff_freq = bet_size / (bet_size + pot_size) if pot_size > 0 else 0.1
-            street_scale = {1: 0.20, 2: 0.40, 3: 1.0}.get(street, 0.1)
-            if random.random() < gto_bluff_freq * street_scale * 0.5:
-                self._raised_this_street = True
-                self._streets_raised += 1
-                return (RAISE, self._compute_raise_amount(observation, 0.6), 0, 0)
-
-        # Call
-        if valid_actions[CALL] and equity >= pot_odds:
-            return (CALL, 0, 0, 0)
-
-        if valid_actions[CHECK]:
-            return (CHECK, 0, 0, 0)
-
-        return (FOLD, 0, 0, 0)
+        # Use the CFR solver for everything else
+        # The solver's game tree uses proportional bet sizes (40%/70%/100% pot)
+        # so it never overbets
+        return self.solver.solve_and_act(
+            hero_cards=my_cards,
+            board=board,
+            opp_range=self._opp_weights,
+            dead_cards=dead_cards,
+            my_bet=my_bet,
+            opp_bet=opp_bet,
+            street=observation["street"],
+            min_raise=observation["min_raise"],
+            max_raise=max_raise,
+            valid_actions=observation["valid_actions"],
+            hero_is_first=True,
+            time_remaining=observation.get("time_left", 400),
+        )
 
     # ----------------------------------------------------------------
     #  MAIN

@@ -98,24 +98,26 @@ class GameTree:
         call_amount = other_bet - acting_bet  # amount to match first
         sizes = []
 
-        # Half pot raise
-        half = max(self._min_raise, int(0.5 * pot))
-        half = min(half, remaining)
-        new_bet_half = other_bet + half
-        if new_bet_half <= self._max_bet:
-            sizes.append((ACT_RAISE_HALF, new_bet_half))
+        # PROPORTIONAL bet sizes — all relative to pot, never overbetting.
+        # This prevents the abstraction gap that caused overbets (96 into 4).
+        # The solver computes equilibria for these ACTUAL bet amounts.
 
-        # Pot raise
-        pot_raise = max(self._min_raise, pot)
-        pot_raise = min(pot_raise, remaining)
-        new_bet_pot = other_bet + pot_raise
-        if new_bet_pot <= self._max_bet:
-            sizes.append((ACT_RAISE_POT, new_bet_pot))
+        # Small: 40% pot
+        small = max(self._min_raise, int(0.4 * pot))
+        small = min(small, remaining)
+        new_bet_small = other_bet + small
+        if new_bet_small <= self._max_bet:
+            sizes.append((ACT_RAISE_HALF, new_bet_small))
 
-        # Large raise (2x pot or all-in, whichever is smaller)
-        # Capping at 2x pot prevents the solver from overbetting massively
-        # into small pots (e.g., betting 96 into a 4-chip pot).
-        large = max(self._min_raise, int(2.0 * pot))
+        # Medium: 70% pot
+        med = max(self._min_raise, int(0.7 * pot))
+        med = min(med, remaining)
+        new_bet_med = other_bet + med
+        if new_bet_med <= self._max_bet:
+            sizes.append((ACT_RAISE_POT, new_bet_med))
+
+        # Large: 100% pot (never more than pot)
+        large = max(self._min_raise, pot)
         large = min(large, remaining)
         new_bet_large = other_bet + large
         new_bet_large = min(new_bet_large, self._max_bet)
