@@ -52,6 +52,8 @@ class PlayerAgent(Agent):
         self._preflop_table = self._load_preflop_table()
         # Sorted list of (potential, bitmask) for all hands — used for opponent range estimation
         self._all_hand_potentials = self._build_potential_index()
+        # Precomputed preflop GTO strategy (mixed strategies from CFR)
+        self._preflop_strategy = self._load_preflop_strategy()
 
         # Per-hand state
         self._current_hand = -1
@@ -84,6 +86,71 @@ class PlayerAgent(Agent):
         for c in my_cards:
             mask |= 1 << c
         return self._preflop_table.get(mask)
+
+    def _load_preflop_strategy(self):
+        """Load precomputed GTO preflop strategy from CFR solve."""
+        strat_path = os.path.join(_dir, "data", "preflop_strategy.npz")
+        tree_path = os.path.join(_dir, "data", "preflop_tree.pkl")
+        if not os.path.exists(strat_path) or not os.path.exists(tree_path):
+            return None
+        import pickle
+        data = np.load(strat_path)
+        with open(tree_path, 'rb') as f:
+            children_map = pickle.load(f)
+        return {
+            'strategies': data['strategies'],
+            'pot_min': float(data['pot_min']),
+            'pot_max': float(data['pot_max']),
+            'n_buckets': int(data['n_buckets']),
+            'raise_levels': data['raise_levels'].tolist(),
+            'node_players': data['node_players'],
+            'node_bet_sb': data['node_bet_sb'],
+            'node_bet_bb': data['node_bet_bb'],
+            'children_map': children_map,
+        }
+
+    def _get_preflop_bucket(self, my_cards):
+        """Map hand potential to a strategy bucket index."""
+        if self._preflop_strategy is None or self._preflop_table is None:
+            return None
+        potential = self._preflop_potential(my_cards)
+        if potential is None:
+            return None
+        ps = self._preflop_strategy
+        frac = (potential - ps['pot_min']) / (ps['pot_max'] - ps['pot_min'])
+        frac = max(0.0, min(1.0 - 1e-9, frac))
+        return int(frac * ps['n_buckets'])
+
+    def _find_preflop_node(self, observation):
+        """Find the current node in the preflop game tree based on bet state.
+
+        Matches the current (my_bet, opp_bet, who_acts) to a node in the
+        precomputed tree.
+        """
+        if self._preflop_strategy is None:
+            return None
+
+        ps = self._preflop_strategy
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        blind_pos = self._get_blind_position(observation)
+
+        # Walk the tree to find a matching node
+        # We are SB (blind_pos=0) or BB (blind_pos=1)
+        # In the tree, player 0 = SB, player 1 = BB
+        my_player = blind_pos  # 0=SB, 1=BB
+
+        # Find node where player matches and bets match
+        bet_sb = my_bet if my_player == 0 else opp_bet
+        bet_bb = my_bet if my_player == 1 else opp_bet
+
+        for nid in range(len(ps['node_players'])):
+            if (ps['node_players'][nid] == my_player and
+                    ps['node_bet_sb'][nid] == bet_sb and
+                    ps['node_bet_bb'][nid] == bet_bb):
+                return nid
+
+        return None
 
     def _build_potential_index(self):
         """Build sorted array of (potential, card_list) for opponent range estimation."""
@@ -294,14 +361,11 @@ class PlayerAgent(Agent):
     # ----------------------------------------------------------------
 
     def _handle_preflop(self, observation, my_cards):
-        """Pre-flop strategy with pot-odds-based calling and opponent range estimation.
+        """Pre-flop strategy using precomputed GTO mixed strategies from CFR.
 
-        When facing a raise, we estimate what hands the opponent would raise
-        with (bigger raise = tighter range), simulate matchups against that
-        range, and only call if our equity exceeds pot odds.
-
-        This prevents the biggest leak: calling 80-chip raises with mediocre
-        hands and bleeding chips pre-flop.
+        Looks up our hand strength bucket and current game tree node,
+        then samples an action from the Nash equilibrium distribution.
+        Falls back to pot-odds-based logic if precomputed strategy unavailable.
         """
         valid_actions = observation["valid_actions"]
         my_bet = observation["my_bet"]
@@ -309,7 +373,54 @@ class PlayerAgent(Agent):
         continue_cost = opp_bet - my_bet
         pot_size = self._get_pot_size(observation)
 
-        # Get hand potential for raise decisions
+        # Try precomputed GTO strategy first
+        bucket = self._get_preflop_bucket(my_cards)
+        node_id = self._find_preflop_node(observation)
+
+        if bucket is not None and node_id is not None and self._preflop_strategy is not None:
+            ps = self._preflop_strategy
+            strategy = ps['strategies'][node_id, bucket]  # action probabilities
+            children = ps['children_map'].get(node_id, {})
+
+            if len(children) > 0:
+                # Filter to valid actions and renormalize
+                valid_mask = np.zeros(len(strategy))
+                for act_id in children:
+                    if act_id == 0 and valid_actions[FOLD]:
+                        valid_mask[act_id] = strategy[act_id]
+                    elif act_id == 1:
+                        # "call" in tree = CALL or CHECK depending on context
+                        if valid_actions[CALL] or valid_actions[CHECK]:
+                            valid_mask[act_id] = strategy[act_id]
+                    elif act_id >= 2 and valid_actions[RAISE]:
+                        valid_mask[act_id] = strategy[act_id]
+
+                total = valid_mask.sum()
+                if total > 0:
+                    valid_mask /= total
+                    # Sample from distribution
+                    chosen = np.random.choice(len(valid_mask), p=valid_mask)
+
+                    if chosen == 0:
+                        return (FOLD, 0, 0, 0)
+                    elif chosen == 1:
+                        if valid_actions[CALL]:
+                            return (CALL, 0, 0, 0)
+                        return (CHECK, 0, 0, 0)
+                    elif chosen >= 2:
+                        raise_to = ps['raise_levels'][chosen - 2]
+                        # Compute raise amount (increment above matching)
+                        raise_amount = raise_to - opp_bet
+                        raise_amount = max(raise_amount, observation["min_raise"])
+                        raise_amount = min(raise_amount, observation["max_raise"])
+                        if raise_amount > 0 and valid_actions[RAISE]:
+                            return (RAISE, raise_amount, 0, 0)
+                        # Raise not possible, call instead
+                        if valid_actions[CALL]:
+                            return (CALL, 0, 0, 0)
+                        return (CHECK, 0, 0, 0)
+
+        # Fallback: pot-odds based with opponent range estimation
         potential = self._preflop_potential(my_cards)
         if potential is not None:
             strength = max(0.0, min(10.0, (potential - 0.37) / 0.028))
@@ -318,32 +429,23 @@ class PlayerAgent(Agent):
 
         if valid_actions[CALL]:
             if continue_cost <= 1:
-                # SB completing to 2: always call (33% pot odds, all hands qualify)
                 if strength >= 7.0 and valid_actions[RAISE]:
                     raise_amt = self._compute_raise_amount(observation, 0.65)
                     return (RAISE, raise_amt, 0, 0)
                 return (CALL, 0, 0, 0)
 
-            # Facing a raise: use pot odds + opponent range estimation
+            # Facing a raise: use pot odds
             required_equity = continue_cost / (continue_cost + pot_size)
-            raise_size = opp_bet - 2  # how much above the blind
-
+            raise_size = opp_bet - 2
             if raise_size >= 6:
-                # Significant raise: compute equity against estimated range
-                equity_vs_range = self._estimate_preflop_equity_vs_range(
-                    my_cards, raise_size)
-
+                equity_vs_range = self._estimate_preflop_equity_vs_range(my_cards, raise_size)
                 if equity_vs_range < required_equity:
                     return (FOLD, 0, 0, 0)
-
-                # Only re-raise with hands that have strong equity vs their range
                 if equity_vs_range > required_equity + 0.15 and valid_actions[RAISE]:
                     raise_amt = self._compute_raise_amount(observation, 0.65)
                     return (RAISE, raise_amt, 0, 0)
-
                 return (CALL, 0, 0, 0)
             else:
-                # Small raise (min-raise): call with decent hands, raise with strong
                 if strength >= 7.0 and valid_actions[RAISE]:
                     raise_amt = self._compute_raise_amount(observation, 0.65)
                     return (RAISE, raise_amt, 0, 0)
