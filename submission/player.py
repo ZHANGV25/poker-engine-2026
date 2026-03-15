@@ -1,19 +1,13 @@
 """
 Competitive poker bot for CMU DSC Poker Bot Competition 2026.
 
-Strategy: Pure GTO via real-time CFR subgame solving. Zero exploitation.
-
-All decisions are derived from:
-  1. Nash equilibrium computation (CFR+ solver for post-flop)
-  2. Precomputed Nash equilibrium (CFR for pre-flop)
-  3. Bayesian inference (discard inference — math, not exploitation)
-  4. Exact enumeration (equity engine — math, not exploitation)
-
-Nothing in this bot assumes anything about opponent tendencies.
+Threshold-based GTO with exact equity, discard inference, pot control,
+precomputed preflop strategy, and bet-size-based range narrowing.
 """
 
 import os
 import sys
+import random
 import numpy as np
 
 _dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +19,6 @@ from gym_env import PokerEnv
 
 from equity import ExactEquityEngine
 from inference import DiscardInference
-from solver import SubgameSolver
 
 FOLD = PokerEnv.ActionType.FOLD.value      # 0
 RAISE = PokerEnv.ActionType.RAISE.value    # 1
@@ -38,18 +31,25 @@ class PlayerAgent(Agent):
     def __init__(self, stream: bool = True):
         super().__init__(stream)
 
-        # Core components
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)
-        self.solver = SubgameSolver(self.engine)
 
-        # Precomputed tables
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
+
+        # Betting thresholds
+        self.RAISE_THRESHOLD = 0.72
+        self.STRONG_RAISE_THRESHOLD = 0.82
+        self.ALL_IN_THRESHOLD = 0.92
+        self.MAX_RAISE_STREETS = 2
 
         # Per-hand state
         self._current_hand = -1
         self._opp_weights = None
+        self._last_seen_action = None
+        self._streets_raised = 0
+        self._current_street = -1
+        self._raised_this_street = False
 
     def __name__(self):
         return "PlayerAgent"
@@ -63,10 +63,7 @@ class PlayerAgent(Agent):
         if not os.path.exists(data_path):
             return None
         data = np.load(data_path)
-        bitmasks = data["bitmasks"]
-        potentials = data["potentials"]
-        # Vectorized dict construction (avoids slow Python loop over 80K entries)
-        return dict(zip(bitmasks.tolist(), potentials.tolist()))
+        return dict(zip(data["bitmasks"].tolist(), data["potentials"].tolist()))
 
     def _load_preflop_strategy(self):
         strat_path = os.path.join(_dir, "data", "preflop_strategy.npz")
@@ -109,14 +106,6 @@ class PlayerAgent(Agent):
         return int(frac * ps['n_buckets'])
 
     def _find_preflop_node(self, observation):
-        """Find matching node in precomputed preflop game tree.
-
-        Tries exact match first. If no exact match (opponent used a bet
-        size not in our abstraction), rounds to the nearest node with
-        the same player and closest bet amounts. This avoids falling
-        back to raw pot odds, which is less accurate than the precomputed
-        equilibrium strategy.
-        """
         if self._preflop_strategy is None:
             return None
         ps = self._preflop_strategy
@@ -127,32 +116,33 @@ class PlayerAgent(Agent):
         bet_sb = my_bet if my_player == 0 else opp_bet
         bet_bb = my_bet if my_player == 1 else opp_bet
 
-        # Try exact match first
+        # Exact match
         for nid in range(len(ps['node_players'])):
             if (ps['node_players'][nid] == my_player and
                     ps['node_bet_sb'][nid] == bet_sb and
                     ps['node_bet_bb'][nid] == bet_bb):
                 return nid
 
-        # No exact match — round to nearest node with same player
+        # Round to nearest node
         best_nid = None
         best_dist = float('inf')
         for nid in range(len(ps['node_players'])):
-            if ps['node_players'][nid] != my_player:
-                continue
-            if ps['node_players'][nid] == -1:  # skip terminal nodes
+            if ps['node_players'][nid] != my_player or ps['node_players'][nid] == -1:
                 continue
             dist = abs(ps['node_bet_sb'][nid] - bet_sb) + abs(ps['node_bet_bb'][nid] - bet_bb)
             if dist < best_dist:
                 best_dist = dist
                 best_nid = nid
-
         return best_nid
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
             self._current_hand = hand_number
             self._opp_weights = None
+            self._last_seen_action = None
+            self._streets_raised = 0
+            self._current_street = -1
+            self._raised_this_street = False
 
     def _parse_cards(self, observation):
         my_cards = [c for c in observation["my_cards"] if c != -1]
@@ -179,60 +169,40 @@ class PlayerAgent(Agent):
     # ----------------------------------------------------------------
 
     def _narrow_range_by_raise(self, observation, my_cards, board, dead_cards):
-        """Narrow opponent range when they raise, using pot-odds math.
-
-        This is Bayesian inference, not exploitation: a raise of X into
-        pot P is only a +EV value bet if the raiser's equity exceeds a
-        threshold. Filter the range to hands meeting that threshold.
-
-        The key insight: a 98-chip raise into a 4-chip pot is ONLY
-        rational with a very strong hand. A 2-chip raise into a 4-chip
-        pot is rational with many hands. The narrowing scales with the
-        bet-to-pot ratio.
-        """
-        if self._opp_weights is None:
+        """Narrow opponent range when they raise, scaled by bet-to-pot ratio."""
+        if self._opp_weights is None or len(board) < 3:
             return
 
         opp_bet = observation["opp_bet"]
         my_bet = observation["my_bet"]
         raise_amount = opp_bet - my_bet
-        pot_before_raise = my_bet + my_bet  # pot before opponent raised (both had my_bet)
+        pot_before = my_bet + my_bet
 
-        if raise_amount <= 0 or pot_before_raise <= 0:
+        if raise_amount <= 0 or pot_before <= 0:
             return
 
-        # How aggressive is this raise relative to the pot?
-        # A GTO player bets with value hands that have equity > some threshold
-        # and bluffs at a rate proportional to bet/(bet+pot).
-        # But a very large bet (e.g., 98 into 4) implies very strong hand
-        # because the risk/reward ratio only makes sense with high equity.
-        bet_to_pot = raise_amount / max(pot_before_raise, 1)
+        bet_to_pot = raise_amount / max(pot_before, 1)
 
-        # For large overbets (>3x pot), narrow aggressively
-        # For small bets (<1x pot), narrow mildly
-        # This scales smoothly: bigger bet = tighter range
         if bet_to_pot <= 0.5:
-            keep_fraction = 0.85  # small bet: keep top 85%
+            keep_fraction = 0.85
         elif bet_to_pot <= 1.0:
-            keep_fraction = 0.70  # pot-sized: keep top 70%
+            keep_fraction = 0.70
         elif bet_to_pot <= 3.0:
-            keep_fraction = 0.50  # overbet: keep top 50%
+            keep_fraction = 0.50
         else:
-            keep_fraction = 0.30  # massive overbet (98 into 4): keep top 30%
+            keep_fraction = 0.30
 
-        # Compute hand strength for each opponent hand
         hand_strengths = {}
         for opp_pair in self._opp_weights:
             if self._opp_weights[opp_pair] <= 0:
                 continue
             five = list(opp_pair) + list(board[:3])
             rank = self.engine.lookup_five(five)
-            hand_strengths[opp_pair] = rank  # lower = stronger
+            hand_strengths[opp_pair] = rank
 
         if not hand_strengths:
             return
 
-        # Sort by strength, keep top fraction
         sorted_hands = sorted(hand_strengths.items(), key=lambda x: x[1])
         n = len(sorted_hands)
         cutoff = int(n * keep_fraction)
@@ -241,19 +211,16 @@ class PlayerAgent(Agent):
             for hand, _ in sorted_hands[cutoff:]:
                 self._opp_weights[hand] = 0.0
 
-        # Renormalize
         total = sum(self._opp_weights.values())
         if total > 0:
             for k in self._opp_weights:
                 self._opp_weights[k] /= total
 
     # ----------------------------------------------------------------
-    #  DISCARD DECISION
+    #  DISCARD
     # ----------------------------------------------------------------
 
     def _handle_discard(self, observation, my_cards, board, opp_discards):
-        """Choose which 2 of 5 cards to keep. Uses exact equity over all
-        10 keep-pairs. As SB, uses Bayesian inference on opponent's discards."""
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards
@@ -265,18 +232,10 @@ class PlayerAgent(Agent):
         return (DISCARD, 0, best_keep[0], best_keep[1])
 
     # ----------------------------------------------------------------
-    #  PRE-FLOP STRATEGY (Precomputed GTO)
+    #  PRE-FLOP
     # ----------------------------------------------------------------
 
     def _handle_preflop(self, observation, my_cards):
-        """Pre-flop using precomputed GTO mixed strategies from CFR.
-
-        Looks up our hand strength bucket and current tree node, then
-        samples from the Nash equilibrium distribution.
-
-        For bet levels not in the precomputed tree, uses pot odds with
-        raw hand potential (no opponent range assumption — just math).
-        """
         valid_actions = observation["valid_actions"]
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
@@ -318,28 +277,21 @@ class PlayerAgent(Agent):
                         raise_amount = raise_to - opp_bet
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
-                        # Safety cap: never raise more than 28 pre-flop
-                        raise_amount = min(raise_amount, 28)
+                        raise_amount = min(raise_amount, 28)  # cap preflop
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:
                             return (CALL, 0, 0, 0)
                         return (CHECK, 0, 0, 0)
 
-        # Fallback: pure pot odds using hand potential (no exploitation)
-        # Hand potential is our average equity across all flops against
-        # a random opponent — the GTO-correct value when we have no
-        # information about the opponent's range.
+        # Fallback: pot odds
         potential = self._preflop_potential(my_cards)
         if potential is None:
-            potential = 0.5  # default when table unavailable
+            potential = 0.5
 
         if valid_actions[CALL]:
             if continue_cost <= 1:
-                # SB completing: pot odds = 33%, all hands have potential > 37%
                 return (CALL, 0, 0, 0)
-
-            # Pot odds comparison with raw potential (no range assumption)
             pot_size = self._get_pot_size(observation)
             required_equity = continue_cost / (continue_cost + pot_size)
             if potential >= required_equity:
@@ -352,45 +304,92 @@ class PlayerAgent(Agent):
         return (FOLD, 0, 0, 0)
 
     # ----------------------------------------------------------------
-    #  POST-FLOP BETTING (Real-Time CFR Solver)
+    #  POST-FLOP (threshold-based)
     # ----------------------------------------------------------------
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Post-flop via real-time CFR+ subgame solving.
-
-        Solves the betting game tree (~130 nodes) for 60-100 iterations
-        to find the Nash equilibrium. The solver's opponent model uses
-        the discard-inferred range weights — no exploitative adjustments.
-        """
         dead_cards = my_discards + opp_discards
+        equity = self.engine.compute_equity(my_cards, board, dead_cards, self._opp_weights)
+
+        valid_actions = observation["valid_actions"]
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        # Hero is always root of the solver tree — the solver is only
-        # called when it's our turn. The tree builder uses bet state
-        # (equal vs unequal) to determine actions (CHECK/BET vs FOLD/CALL/RAISE).
-        # BUG FIX: previously set hero_is_first = (my_bet == opp_bet), which
-        # made the tree root the OPPONENT when facing a bet. The solver then
-        # returned the opponent's strategy instead of ours — causing us to
-        # fold 100% equity hands to min-raises.
-        hero_is_first = True
+        pot_size = self._get_pot_size(observation)
+        min_raise = observation["min_raise"]
+        max_raise = observation["max_raise"]
+        street = observation["street"]
 
-        return self.solver.solve_and_act(
-            hero_cards=my_cards,
-            board=board,
-            opp_range=self._opp_weights,
-            dead_cards=dead_cards,
-            my_bet=my_bet,
-            opp_bet=opp_bet,
-            street=observation["street"],
-            min_raise=observation["min_raise"],
-            max_raise=observation["max_raise"],
-            valid_actions=observation["valid_actions"],
-            hero_is_first=hero_is_first,
-            time_remaining=observation.get("time_left", 400),
+        continue_cost = opp_bet - my_bet
+        pot_odds = continue_cost / (continue_cost + pot_size) if continue_cost > 0 else 0
+
+        if street != self._current_street:
+            self._current_street = street
+            self._raised_this_street = False
+
+        # Re-raise protection
+        opp_action = observation.get("opp_last_action", "None")
+        if opp_action == "RAISE" and self._raised_this_street:
+            if equity > self.ALL_IN_THRESHOLD and valid_actions[RAISE]:
+                return (RAISE, max_raise, 0, 0)
+            elif equity >= pot_odds and valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            elif valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            return (FOLD, 0, 0, 0)
+
+        # Pot control
+        can_raise = (
+            self._streets_raised < self.MAX_RAISE_STREETS
+            or equity > self.ALL_IN_THRESHOLD
         )
 
+        # Check-raise
+        is_first = (my_bet == opp_bet)
+        if (is_first and equity > self.STRONG_RAISE_THRESHOLD
+                and valid_actions[CHECK] and random.random() < 0.3):
+            return (CHECK, 0, 0, 0)
+
+        # All-in
+        if equity > self.ALL_IN_THRESHOLD and valid_actions[RAISE]:
+            self._raised_this_street = True
+            self._streets_raised += 1
+            return (RAISE, max_raise, 0, 0)
+
+        # Strong raise
+        if equity > self.STRONG_RAISE_THRESHOLD and valid_actions[RAISE] and can_raise:
+            self._raised_this_street = True
+            self._streets_raised += 1
+            frac = 0.65 + 0.15 * (equity - self.STRONG_RAISE_THRESHOLD) / (1.0 - self.STRONG_RAISE_THRESHOLD)
+            return (RAISE, self._compute_raise_amount(observation, frac), 0, 0)
+
+        # Medium raise
+        if equity > self.RAISE_THRESHOLD and valid_actions[RAISE] and can_raise:
+            self._raised_this_street = True
+            self._streets_raised += 1
+            frac = 0.5 + 0.15 * (equity - self.RAISE_THRESHOLD) / (self.STRONG_RAISE_THRESHOLD - self.RAISE_THRESHOLD)
+            return (RAISE, self._compute_raise_amount(observation, frac), 0, 0)
+
+        # GTO bluff
+        if equity < 0.25 and valid_actions[RAISE] and can_raise:
+            bet_size = max(int(pot_size * 0.6), min_raise)
+            gto_bluff_freq = bet_size / (bet_size + pot_size) if pot_size > 0 else 0.1
+            street_scale = {1: 0.20, 2: 0.40, 3: 1.0}.get(street, 0.1)
+            if random.random() < gto_bluff_freq * street_scale * 0.5:
+                self._raised_this_street = True
+                self._streets_raised += 1
+                return (RAISE, self._compute_raise_amount(observation, 0.6), 0, 0)
+
+        # Call
+        if valid_actions[CALL] and equity >= pot_odds:
+            return (CALL, 0, 0, 0)
+
+        if valid_actions[CHECK]:
+            return (CHECK, 0, 0, 0)
+
+        return (FOLD, 0, 0, 0)
+
     # ----------------------------------------------------------------
-    #  MAIN ACT / OBSERVE
+    #  MAIN
     # ----------------------------------------------------------------
 
     def act(self, observation, reward, terminated, truncated, info):
@@ -400,9 +399,7 @@ class PlayerAgent(Agent):
         my_cards, board, opp_discards, my_discards = self._parse_cards(observation)
         valid_actions = observation["valid_actions"]
 
-        # Narrow opponent range based on their action (Bayesian, not exploitative).
-        # When opponent bets/raises, filter range to hands strong enough to
-        # justify that bet size given pot odds. This is math, not assumption.
+        # Range narrowing on opponent raises
         opp_action = observation.get("opp_last_action", "None")
         if opp_action == "RAISE" and self._opp_weights is not None and len(board) >= 3:
             self._narrow_range_by_raise(observation, my_cards, board, my_discards + opp_discards)
@@ -419,7 +416,6 @@ class PlayerAgent(Agent):
         hand_number = info.get("hand_number", 0)
         self._reset_hand(hand_number)
 
-        # Infer opponent range when we first see their discards
         opp_discards = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_discards) == 3 and self._opp_weights is None:
             my_cards = [c for c in observation["my_cards"] if c != -1]
