@@ -36,6 +36,11 @@ if _submission_dir not in sys.path:
 
 from equity import ExactEquityEngine
 from blueprint_cfr import BlueprintCFR
+try:
+    from blueprint_cfr_fast import BlueprintCFRFast
+    _HAS_FAST_CFR = True
+except ImportError:
+    _HAS_FAST_CFR = False
 from abstraction import (
     enumerate_all_flops,
     compute_board_cluster,
@@ -80,7 +85,10 @@ def solve_single_board(args):
     n_iterations = config['n_iterations']
     pot_sizes = config.get('pot_sizes', FLOP_POT_SIZES)
 
-    solver = BlueprintCFR(n_buckets, n_buckets, engine)
+    if _HAS_FAST_CFR:
+        solver = BlueprintCFRFast(n_buckets, n_buckets, engine)
+    else:
+        solver = BlueprintCFR(n_buckets, n_buckets, engine)
 
     start = time.time()
 
