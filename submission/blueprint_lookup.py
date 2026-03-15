@@ -236,26 +236,65 @@ class BlueprintLookup:
         bucket = int(equity * self.n_buckets)
         return min(bucket, self.n_buckets - 1)
 
-    def _action_history_to_node(self, action_history):
+    def _find_node_for_bet_state(self, my_bet, opp_bet):
         """
-        Map an action history to a node index in the stored strategy.
+        Find the hero node index that best matches the current bet state.
 
-        For the initial version, we only store root-node strategies (node 0).
-        A full implementation would walk the game tree to find the correct node.
+        The blueprint stores strategies for all hero decision nodes in the
+        tree. Each node corresponds to a specific point in the action
+        sequence with certain bet levels. We match the current runtime
+        bet state to the closest blueprint node.
+
+        For equal bets (first action on street): returns node 0 (root).
+        For facing a bet: finds the node where hero faces a similar
+        proportional bet from opponent.
 
         Args:
-            action_history: list of action IDs, or None
+            my_bet: hero's current bet
+            opp_bet: opponent's current bet
 
         Returns:
-            int node index (0 for root)
+            int node index
         """
-        if action_history is None or len(action_history) == 0:
+        if self._tree is None:
             return 0
 
-        # For now, return root node. Full tree navigation would be:
-        # Walk the stored tree structure following the action sequence.
-        # This is a TODO for the full implementation.
-        return 0
+        # Find hero node with closest matching bet ratio
+        tree = self._tree
+        hero_nodes = tree.hero_node_ids
+        if not hero_nodes:
+            return 0
+
+        facing_bet = opp_bet > my_bet
+        pot = my_bet + opp_bet
+        if pot <= 0:
+            return 0
+
+        bet_ratio = (opp_bet - my_bet) / pot if facing_bet else 0.0
+
+        best_idx = 0
+        best_dist = float('inf')
+
+        for i, nid in enumerate(hero_nodes):
+            hp = tree.hero_pot[nid]
+            op = tree.opp_pot[nid]
+            node_pot = hp + op
+            if node_pot <= 0:
+                continue
+
+            node_facing = op > hp
+            node_ratio = (op - hp) / node_pot if node_facing else 0.0
+
+            # Match: both facing bet or both equal
+            if facing_bet != node_facing:
+                continue
+
+            dist = abs(bet_ratio - node_ratio)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        return best_idx
 
     def sample_action(self, hero_cards, board, dead_cards=None):
         """

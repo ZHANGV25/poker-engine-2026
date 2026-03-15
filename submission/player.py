@@ -311,9 +311,13 @@ class PlayerAgent(Agent):
         if blueprint is None:
             return None
 
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        facing_bet = opp_bet > my_bet
+
         # Get blueprint strategy (action type -> probability)
         try:
-            pot_state = (observation["my_bet"], observation["opp_bet"])
+            pot_state = (my_bet, opp_bet)
             strategy = blueprint.get_strategy(
                 hero_cards=my_cards, board=board, pot_state=pot_state)
         except Exception:
@@ -321,6 +325,16 @@ class PlayerAgent(Agent):
 
         if strategy is None:
             return None
+
+        # CRITICAL: When facing a bet, the blueprint root strategy is wrong
+        # (it gives check/bet actions instead of fold/call/raise).
+        # Fall back to solver for facing-bet decisions — the solver correctly
+        # handles fold/call/raise for the specific hand.
+        if facing_bet:
+            has_fold = ACT_FOLD in strategy and strategy[ACT_FOLD] > 0.01
+            if not has_fold:
+                # Root strategy can't fold → wrong node for this situation
+                return None  # fall back to solver
 
         # Sample an action type from the blueprint strategy
         action_ids = list(strategy.keys())
