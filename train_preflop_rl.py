@@ -224,24 +224,28 @@ class PPOTrainer:
     def collect_batch(self, env, rl_agent, opponent, num_hands):
         """Play num_hands and collect preflop transitions.
 
-        Returns lists of: states, actions, log_probs, values, rewards.
+        Returns lists of: states, actions, log_probs, valid_masks, values, rewards.
         Each entry corresponds to one preflop decision by the RL agent.
         """
         states = []
         actions = []
         old_log_probs = []
+        valid_masks = []
         values = []
         rewards = []
 
         for hand_num in range(num_hands):
-            obs, info = env.reset()
+            # Alternate blinds: even hands RL is SB, odd hands RL is BB
+            # RL is always player 0 in the env arrays
+            rl_player = 0
+            sb_player = 0 if hand_num % 2 == 0 else 1
+            obs, info = env.reset(options={"small_blind_player": sb_player})
             info["hand_number"] = hand_num
             rl_agent.reset_hand(hand_num)
             opponent.reset_hand(hand_num)
 
             done = False
-            preflop_data = []  # (state, action_idx, log_prob, value)
-            rl_player = 0  # RL is always player 0
+            preflop_data = []  # (state, action_idx, log_prob, valid_mask, value)
 
             while not done:
                 acting = obs[0]["acting_agent"]
@@ -271,7 +275,7 @@ class PPOTrainer:
                             observation["min_raise"], observation["max_raise"],
                             observation["valid_actions"],
                         )
-                        preflop_data.append((state, action_idx, log_prob, value))
+                        preflop_data.append((state, action_idx, log_prob, valid_mask, value))
                     else:
                         action = rl_agent.postflop_act(observation, info)
                 else:
@@ -281,26 +285,25 @@ class PPOTrainer:
                 obs, reward, done, truncated, info = env.step(action)
                 info["hand_number"] = hand_num
 
-                # Let both agents observe
-                if acting != rl_player:
-                    opponent.observe(obs[1 - rl_player], reward[1 - rl_player],
-                                     done, truncated, info)
-                else:
-                    rl_agent.observe(obs[rl_player], reward[rl_player],
-                                     done, truncated, info)
+                # Both agents observe after every step
+                rl_agent.observe(obs[rl_player], reward[rl_player],
+                                 done, truncated, info)
+                opponent.observe(obs[1 - rl_player], reward[1 - rl_player],
+                                 done, truncated, info)
 
             # Hand over — assign terminal reward to all preflop decisions
             hand_reward = reward[rl_player]
-            for state_t, action_idx_t, log_prob_t, value_t in preflop_data:
+            for state_t, action_idx_t, log_prob_t, valid_mask_t, value_t in preflop_data:
                 states.append(state_t)
                 actions.append(action_idx_t)
                 old_log_probs.append(log_prob_t)
+                valid_masks.append(valid_mask_t)
                 values.append(value_t)
                 rewards.append(hand_reward)
 
-        return states, actions, old_log_probs, values, rewards
+        return states, actions, old_log_probs, valid_masks, values, rewards
 
-    def update(self, states, actions, old_log_probs, values, rewards):
+    def update(self, states, actions, old_log_probs, valid_masks, values, rewards):
         """PPO update using collected batch data."""
         if not states:
             return 0.0
@@ -308,15 +311,13 @@ class PPOTrainer:
         states_t = torch.stack(states).to(self.device)
         actions_t = torch.tensor(actions, dtype=torch.long, device=self.device)
         old_log_probs_t = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
+        valid_masks_t = torch.stack(valid_masks).to(self.device)
         values_t = torch.tensor(values, dtype=torch.float32, device=self.device)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        returns_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
 
-        # Normalize rewards
-        if rewards_t.std() > 1e-5:
-            rewards_t = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-8)
-
-        # Advantages
-        advantages = rewards_t - values_t
+        # Advantages = actual return - predicted value (raw, unnormalized)
+        advantages = returns_t - values_t.detach()
+        # Normalize advantages only (not returns)
         if advantages.std() > 1e-5:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -325,7 +326,9 @@ class PPOTrainer:
             logits, new_values = self.net(states_t)
             new_values = new_values.squeeze(-1)
 
-            dist = torch.distributions.Categorical(logits=logits)
+            # Re-apply valid action masks before computing log probs
+            masked_logits = logits + valid_masks_t
+            dist = torch.distributions.Categorical(logits=masked_logits)
             new_log_probs = dist.log_prob(actions_t)
             entropy = dist.entropy().mean()
 
@@ -335,8 +338,8 @@ class PPOTrainer:
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value loss
-            value_loss = nn.functional.mse_loss(new_values, rewards_t)
+            # Value loss against raw returns (not normalized)
+            value_loss = nn.functional.mse_loss(new_values, returns_t)
 
             # Total loss
             loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
@@ -373,11 +376,11 @@ def train(num_epochs=500, hands_per_epoch=64, save_interval=25):
 
     running_reward = 0.0
     for epoch in range(num_epochs):
-        states, actions, old_log_probs, values, rewards = trainer.collect_batch(
+        states, actions, old_log_probs, valid_masks, values, rewards = trainer.collect_batch(
             env, rl_agent, opponent, hands_per_epoch
         )
 
-        loss = trainer.update(states, actions, old_log_probs, values, rewards)
+        loss = trainer.update(states, actions, old_log_probs, valid_masks, values, rewards)
 
         # Track performance
         epoch_reward = sum(rewards) / max(len(rewards), 1)
