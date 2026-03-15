@@ -315,9 +315,8 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         facing_bet = opp_bet > my_bet
 
-        # Note: flop blueprint must be computed with equal starting bets
-        # (2,2), (4,4), etc. to match runtime state. Old (1,2) blueprints
-        # are incompatible and should not be in submission/data/.
+        # The flop blueprint provides range-balanced pot control:
+        # medium hands check/fold instead of overbetting.
 
         # Get blueprint strategy (action type -> probability)
         try:

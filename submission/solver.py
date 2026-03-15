@@ -349,35 +349,20 @@ class SubgameSolver:
 
     def _fallback(self, hero_cards, board, dead_cards,
                   my_bet, opp_bet, valid_actions, min_raise, max_raise):
-        """Equity-threshold fallback when solver can't run.
-
-        Conservative strategy: only raise with very strong hands,
-        fold medium hands facing big bets. In a 27-card deck,
-        two pair and one pair are NOT strong hands.
-        """
+        """Equity-threshold fallback when solver can't run."""
         equity = self.engine.compute_equity(hero_cards, board, dead_cards)
         pot_size = my_bet + opp_bet
         continue_cost = opp_bet - my_bet
         pot_odds = continue_cost / (continue_cost + pot_size) if continue_cost > 0 else 0
-        facing_bet = continue_cost > 0
 
-        if equity > 0.85 and valid_actions[RAISE]:
-            # Only raise with very strong hands (flush+)
-            amt = max(int(pot_size * 0.7), min_raise)
+        if equity > 0.92 and valid_actions[RAISE]:
+            return (RAISE, max_raise, 0, 0)
+        if equity > 0.72 and valid_actions[RAISE]:
+            amt = max(int(pot_size * 0.6), min_raise)
             amt = min(amt, max_raise)
             return (RAISE, amt, 0, 0)
-
-        if facing_bet:
-            # Facing a bet: need significantly more equity than pot odds
-            # to account for the fact that callers often have the worst hand
-            required = pot_odds + 0.15
-            if equity >= required:
-                return (CALL, 0, 0, 0)
-            if valid_actions[FOLD]:
-                return (FOLD, 0, 0, 0)
-
+        if valid_actions[CALL] and equity >= pot_odds:
+            return (CALL, 0, 0, 0)
         if valid_actions[CHECK]:
             return (CHECK, 0, 0, 0)
-        if valid_actions[CALL] and continue_cost <= 2:
-            return (CALL, 0, 0, 0)
         return (FOLD, 0, 0, 0)
