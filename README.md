@@ -1,8 +1,6 @@
-# Stockfish 🐟 — Poker AI Bot
+# Poker AI Bot
 
-**Team Stockfish** submission for the CMU x Jump Trading Poker AI Tournament 2026.
-
-**#1 on the leaderboard** with 1414 ELO and 78.4% win rate across 199 matches.
+My submission for the CMU x Jump Trading Poker AI Tournament 2026.
 
 ## How the Bot Works
 
