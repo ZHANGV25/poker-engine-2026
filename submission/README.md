@@ -128,21 +128,18 @@ with equity.
 ### 2. Precomputed GTO Preflop Strategy (`precompute_preflop_strategy.py`)
 
 The preflop betting game is solved offline via two-player CFR:
-- 30 hand-strength buckets × 74-node betting tree × 2000 iterations
-- Produces proper mixed strategies: "with 85th percentile hand, raise 65%,
-  call 28%, fold never"
+- 50 hand-strength buckets × 7 raise levels [2,4,8,16,30,60,100] × 2000 iterations
+- Equity matrix computed from simulated matchups (not a constant approximation)
+- Produces proper mixed strategies with balanced fold/call/raise frequencies
 
 **Key solved behaviors:**
-- SB opening: call ~95% (pot odds of 33% justify calling almost everything),
-  raise to 10 with strong hands ~65% of the time
-- BB after SB limps: check weak hands, raise ~97% with strong hands
-- BB facing small raise: mostly call (correct pot odds)
+- SB opening: fold 97% of worst hands, call medium, raise big with strong
+- BB facing raise: fold 99% of garbage, call medium, re-raise monsters
+- BB after SB limps: check weak, raise ~98% with strong hands
 
-**Fallback for unusual raise sizes:** When opponent raises an amount not in
-the precomputed tree (e.g., 80 chips), falls back to runtime computation:
-estimates opponent's raising range from the raise size, samples 150 opponent
-hands × 30 random flops, simulates optimal discards for both players,
-computes equity against the narrowed range, and compares to pot odds.
+**Unmatched bet sizes:** When opponent raises an amount not exactly in the
+precomputed tree, we round to the nearest node by bet distance. This keeps
+us in the equilibrium strategy rather than falling back to heuristics.
 
 ### 3. Exact Equity Engine (`equity.py`)
 
@@ -261,6 +258,48 @@ python agent_test.py         # Submission validator (4 test bots)
 python test_cfr_bot.py       # Comprehensive test suite (24 tests, 6200+ hands)
 python run.py                # 1000-hand match (configure in agent_config.json)
 ```
+
+## Game Theory FAQ
+
+**Q: Is Bayesian discard inference exploitative?**
+No. It computes P(hand | discards) — what a rational player would keep given
+the cards and board. This is math applied to revealed information. Discards
+are mandatory and public; there's no "bluffing" in what you discard. The
+adaptive temperature handles cases where multiple keeps are similarly strong.
+
+**Q: Is range narrowing on raises exploitative?**
+Partially. The percentile cutoffs (85/70/50/30%) are heuristic. True GTO
+would derive narrowing from the equilibrium itself (nested subgame solving,
+planned for Phase 2). However, the narrowing is based on pot-odds math:
+a 98-chip bet into a 4-chip pot is only rational with very strong hands,
+regardless of who the opponent is. This is closer to inference than exploitation.
+
+**Q: What bet sizes does the solver use?**
+Three abstract sizes per action: half-pot, pot, and all-in (whatever's left
+to reach 100 total bet). All-in is NOT always 100 — if you've bet 30, all-in
+is 70 more. When opponent bets a non-abstract amount, the solver's game tree
+already handles it because the tree is built from the CURRENT bet state.
+
+**Q: What happens when a preflop raise doesn't match the tree?**
+We round to the nearest node by bet distance. The equilibrium strategy at
+the closest node is a better approximation than falling back to heuristics.
+
+**Q: Could we use more bet sizes?**
+Yes. Going from 3 to 5 sizes (adding 33% and 75% pot) would reduce abstraction
+error but increase tree size ~1.8x and solver time proportionally. Planned
+for Phase 2 when compute budget doubles.
+
+**Q: Is depth-limited solving accurate?**
+The continuation value uses exact equity (full enumeration, zero error).
+The approximation is that both players play "correctly" on future streets.
+Multi-street solving (flop+turn as one tree) would be more accurate but
+needs ~14x more nodes — not feasible until Phase 3.
+
+**Q: What are the remaining non-GTO elements?**
+1. Range narrowing percentages (heuristic, not equilibrium-derived)
+2. Bet size abstraction (3 discrete sizes, not continuous)
+3. Depth-limited solving (equity proxy for future streets)
+All are planned to be addressed in Phase 2-3.
 
 ## Local Match Results
 
