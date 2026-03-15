@@ -70,10 +70,13 @@ DEFAULT_TURN_CLUSTERS = 250
 # Multiple pot sizes to solve for each board cluster.
 # Each entry is (hero_bet, opp_bet) representing the starting pot state.
 POT_SIZES = [
-    (2, 2),     # post-blind minimum
-    (4, 4),     # small pot
-    (16, 16),   # medium pot
-    (50, 50),   # large pot
+    (2, 2),     # SPR 24.5
+    (4, 4),     # SPR 12.0
+    (10, 10),   # SPR 4.5
+    (25, 25),   # SPR 1.5
+    (50, 50),   # SPR 0.5
+    (75, 75),   # SPR 0.17
+    (100, 100), # SPR 0.0
 ]
 
 

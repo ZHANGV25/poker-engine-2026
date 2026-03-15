@@ -61,10 +61,13 @@ DEFAULT_MIN_RAISE = 2
 
 
 FLOP_POT_SIZES = [
-    (2, 2),     # post-blind minimum
-    (4, 4),     # small pot (standard preflop call)
-    (16, 16),   # medium pot (preflop raise + call)
-    (50, 50),   # large pot (preflop 3-bet)
+    (2, 2),     # SPR 24.5 — post-blind minimum
+    (4, 4),     # SPR 12.0 — standard preflop call
+    (10, 10),   # SPR 4.5  — small raise
+    (25, 25),   # SPR 1.5  — medium raise
+    (50, 50),   # SPR 0.5  — large raise / 3-bet
+    (75, 75),   # SPR 0.17 — big 3-bet
+    (100, 100), # SPR 0.0  — all-in preflop
 ]
 
 
