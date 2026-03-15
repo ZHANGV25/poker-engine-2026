@@ -133,20 +133,12 @@ def save_checkpoint(results, output_dir, iteration_label, config):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"checkpoint_{iteration_label}.npz")
 
-    # Collect all cluster data
     cluster_ids = []
     boards = []
-    hero_strategies = []
-    opp_strategies = []
-    hero_action_type_list = []
 
     for r in results:
         cluster_ids.append(r['cluster_id'])
         boards.append(list(r['board']))
-        hero_strategies.append(r['hero_strategy'])
-        opp_strategies.append(r['opp_strategy'])
-        if r['hero_action_types'] is not None and len(r['hero_action_types']) > 0:
-            hero_action_type_list.append(r['hero_action_types'])
 
     np.savez_compressed(
         path,
@@ -155,7 +147,6 @@ def save_checkpoint(results, output_dir, iteration_label, config):
         n_buckets=config['n_buckets'],
         n_clusters=config['n_clusters'],
         n_iterations=config['n_iterations'],
-        bucket_boundaries=get_bucket_boundaries(config['n_buckets']),
     )
 
     print(f"  Checkpoint saved: {path}")
