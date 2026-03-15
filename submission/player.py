@@ -318,6 +318,8 @@ class PlayerAgent(Agent):
                         raise_amount = raise_to - opp_bet
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
+                        # Safety cap: never raise more than 28 pre-flop
+                        raise_amount = min(raise_amount, 28)
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:

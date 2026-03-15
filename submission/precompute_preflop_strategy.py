@@ -30,8 +30,9 @@ MAX_BET = 100
 SB_BLIND = 1
 BB_BLIND = 2
 
-# Raise levels (total bet amounts in the preflop betting tree)
-RAISE_LEVELS = [2, 4, 8, 16, 30, 60, 100]
+# Raise levels capped at 30. Going all-in preflop is -EV in this variant:
+# you have 5 cards, don't know the board, can't decide which 2 to keep.
+RAISE_LEVELS = [2, 4, 8, 16, 30]
 # Actions: FOLD=0, CALL=1, RAISE_0=2, RAISE_1=3, RAISE_2=4, RAISE_3=5
 N_ACTIONS = 2 + len(RAISE_LEVELS)  # fold, call, + each raise level
 ACT_FOLD = 0
@@ -160,9 +161,13 @@ def compute_equity_matrix(n_buckets, preflop_table):
 
     five_lookup = engine.lookup_five
 
+    import time as _time
+    _eq_start = _time.time()
     for i in range(n_buckets):
-        if i % 5 == 0:
-            print(f"  Equity matrix row {i}/{n_buckets}...")
+        elapsed = _time.time() - _eq_start
+        rate = (i + 1) / elapsed if elapsed > 0 else 0
+        remaining = (n_buckets - i) / rate if rate > 0 else 0
+        print(f"  Equity matrix row {i}/{n_buckets} ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)", flush=True)
         for j in range(n_buckets):
             if i == j:
                 equity[i][j] = 0.50
@@ -300,9 +305,14 @@ def solve_cfr(nodes, root, n_buckets, equity_matrix, iterations):
     # Run CFR iterations
     # For each iteration, sample all bucket pairs
     # (with 30 buckets, that's 900 pairs — fast)
+    import time as _time
+    _cfr_start = _time.time()
     for t in range(iterations):
-        if t % 500 == 0:
-            print(f"  Iteration {t}/{iterations}...")
+        if t % 100 == 0:
+            elapsed = _time.time() - _cfr_start
+            rate = (t + 1) / elapsed if elapsed > 0 else 0
+            remaining = (iterations - t) / rate if rate > 0 else 0
+            print(f"  CFR iteration {t}/{iterations} ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)", flush=True)
 
         for sb_b in range(n_buckets):
             for bb_b in range(n_buckets):
