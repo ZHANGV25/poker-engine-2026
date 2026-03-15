@@ -153,6 +153,79 @@ class PlayerAgent(Agent):
         return min(amount, max_raise)
 
     # ----------------------------------------------------------------
+    #  RANGE NARROWING
+    # ----------------------------------------------------------------
+
+    def _narrow_range_by_raise(self, observation, my_cards, board, dead_cards):
+        """Narrow opponent range when they raise, using pot-odds math.
+
+        This is Bayesian inference, not exploitation: a raise of X into
+        pot P is only a +EV value bet if the raiser's equity exceeds a
+        threshold. Filter the range to hands meeting that threshold.
+
+        The key insight: a 98-chip raise into a 4-chip pot is ONLY
+        rational with a very strong hand. A 2-chip raise into a 4-chip
+        pot is rational with many hands. The narrowing scales with the
+        bet-to-pot ratio.
+        """
+        if self._opp_weights is None:
+            return
+
+        opp_bet = observation["opp_bet"]
+        my_bet = observation["my_bet"]
+        raise_amount = opp_bet - my_bet
+        pot_before_raise = my_bet + my_bet  # pot before opponent raised (both had my_bet)
+
+        if raise_amount <= 0 or pot_before_raise <= 0:
+            return
+
+        # How aggressive is this raise relative to the pot?
+        # A GTO player bets with value hands that have equity > some threshold
+        # and bluffs at a rate proportional to bet/(bet+pot).
+        # But a very large bet (e.g., 98 into 4) implies very strong hand
+        # because the risk/reward ratio only makes sense with high equity.
+        bet_to_pot = raise_amount / max(pot_before_raise, 1)
+
+        # For large overbets (>3x pot), narrow aggressively
+        # For small bets (<1x pot), narrow mildly
+        # This scales smoothly: bigger bet = tighter range
+        if bet_to_pot <= 0.5:
+            keep_fraction = 0.85  # small bet: keep top 85%
+        elif bet_to_pot <= 1.0:
+            keep_fraction = 0.70  # pot-sized: keep top 70%
+        elif bet_to_pot <= 3.0:
+            keep_fraction = 0.50  # overbet: keep top 50%
+        else:
+            keep_fraction = 0.30  # massive overbet (98 into 4): keep top 30%
+
+        # Compute hand strength for each opponent hand
+        hand_strengths = {}
+        for opp_pair in self._opp_weights:
+            if self._opp_weights[opp_pair] <= 0:
+                continue
+            five = list(opp_pair) + list(board[:3])
+            rank = self.engine.lookup_five(five)
+            hand_strengths[opp_pair] = rank  # lower = stronger
+
+        if not hand_strengths:
+            return
+
+        # Sort by strength, keep top fraction
+        sorted_hands = sorted(hand_strengths.items(), key=lambda x: x[1])
+        n = len(sorted_hands)
+        cutoff = int(n * keep_fraction)
+
+        if cutoff < n:
+            for hand, _ in sorted_hands[cutoff:]:
+                self._opp_weights[hand] = 0.0
+
+        # Renormalize
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
+    # ----------------------------------------------------------------
     #  DISCARD DECISION
     # ----------------------------------------------------------------
 
@@ -302,6 +375,13 @@ class PlayerAgent(Agent):
 
         my_cards, board, opp_discards, my_discards = self._parse_cards(observation)
         valid_actions = observation["valid_actions"]
+
+        # Narrow opponent range based on their action (Bayesian, not exploitative).
+        # When opponent bets/raises, filter range to hands strong enough to
+        # justify that bet size given pot odds. This is math, not assumption.
+        opp_action = observation.get("opp_last_action", "None")
+        if opp_action == "RAISE" and self._opp_weights is not None and len(board) >= 3:
+            self._narrow_range_by_raise(observation, my_cards, board, my_discards + opp_discards)
 
         if valid_actions[DISCARD]:
             return self._handle_discard(observation, my_cards, board, opp_discards)
