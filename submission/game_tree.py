@@ -15,7 +15,8 @@ ACT_CALL = 2
 ACT_RAISE_HALF = 3
 ACT_RAISE_POT = 4
 ACT_RAISE_ALLIN = 5
-NUM_ACTIONS = 6
+ACT_RAISE_OVERBET = 6
+NUM_ACTIONS = 7
 
 # Terminal types
 TERM_NONE = 0
@@ -23,8 +24,8 @@ TERM_FOLD_HERO = 1   # hero folded -> hero loses
 TERM_FOLD_OPP = 2    # opponent folded -> hero wins
 TERM_SHOWDOWN = 3    # street ends, compare hands (or use continuation value)
 
-MAX_RAISES_PER_STREET = 3
-MAX_NODES = 300  # upper bound on tree size
+MAX_RAISES_PER_STREET = 2
+MAX_NODES = 500  # upper bound on tree size
 
 
 class GameTree:
@@ -116,13 +117,21 @@ class GameTree:
         if new_bet_med <= self._max_bet:
             sizes.append((ACT_RAISE_POT, new_bet_med))
 
-        # Large: 100% pot (never more than pot)
+        # Large: 100% pot
         large = max(self._min_raise, pot)
         large = min(large, remaining)
         new_bet_large = other_bet + large
         new_bet_large = min(new_bet_large, self._max_bet)
         if new_bet_large > other_bet:
             sizes.append((ACT_RAISE_ALLIN, new_bet_large))
+
+        # Overbet: 150% pot
+        overbet = max(self._min_raise, int(1.5 * pot))
+        overbet = min(overbet, remaining)
+        new_bet_over = other_bet + overbet
+        new_bet_over = min(new_bet_over, self._max_bet)
+        if new_bet_over > other_bet:
+            sizes.append((ACT_RAISE_OVERBET, new_bet_over))
 
         # Deduplicate (if sizes overlap, keep unique values)
         seen = set()

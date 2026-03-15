@@ -1,9 +1,13 @@
 """
 Competitive poker bot for CMU DSC Poker Bot Competition 2026.
 
-Hybrid approach: CFR solver for post-flop action decisions with
-proportional bet sizing (40%/70%/100% pot). All-in override for
-near-nuts hands only (equity > 0.95).
+Hybrid strategy: precomputed blueprint strategies (range-balanced Nash
+equilibria) for post-flop play when available, with real-time CFR solver
+as fallback. Pre-flop uses a separate precomputed strategy table.
+
+Blueprint strategies are loaded from submission/data/ at startup.
+If blueprint files don't exist, the bot seamlessly falls back to the
+real-time CFR solver for that street.
 """
 
 import os
@@ -22,11 +26,31 @@ from equity import ExactEquityEngine
 from inference import DiscardInference
 from solver import SubgameSolver
 
+# Try to import blueprint lookup module (graceful fallback if unavailable)
+try:
+    from blueprint_lookup import BlueprintLookup
+    _BLUEPRINT_AVAILABLE = True
+except Exception:
+    _BLUEPRINT_AVAILABLE = False
+
+# Import action type constants for blueprint action mapping
+from game_tree import (
+    ACT_FOLD, ACT_CHECK, ACT_CALL,
+    ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
+)
+
 FOLD = PokerEnv.ActionType.FOLD.value      # 0
 RAISE = PokerEnv.ActionType.RAISE.value    # 1
 CHECK = PokerEnv.ActionType.CHECK.value    # 2
 CALL = PokerEnv.ActionType.CALL.value      # 3
 DISCARD = PokerEnv.ActionType.DISCARD.value  # 4
+
+# Blueprint file names per street (street 1=flop, 2=turn, 3=river)
+_BLUEPRINT_FILES = {
+    1: "flop_blueprint.npz",
+    2: "turn_blueprint.npz",
+    3: "river_blueprint.npz",
+}
 
 
 class PlayerAgent(Agent):
@@ -39,6 +63,9 @@ class PlayerAgent(Agent):
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
+
+        # Load blueprint strategies for post-flop streets
+        self._blueprints = self._load_blueprints()
 
         # Per-hand state
         self._current_hand = -1
@@ -79,6 +106,33 @@ class PlayerAgent(Agent):
             'node_bet_bb': data['node_bet_bb'],
             'children_map': children_map,
         }
+
+    def _load_blueprints(self):
+        """Load blueprint strategy files for each post-flop street.
+
+        Returns a dict mapping street (1,2,3) -> BlueprintLookup or None.
+        If the blueprint module isn't available or a file doesn't exist,
+        that street maps to None (will use real-time solver instead).
+        """
+        blueprints = {}
+        if not _BLUEPRINT_AVAILABLE:
+            return blueprints
+
+        data_dir = os.path.join(_dir, "data")
+        for street, filename in _BLUEPRINT_FILES.items():
+            filepath = os.path.join(data_dir, filename)
+            if os.path.exists(filepath):
+                try:
+                    blueprints[street] = BlueprintLookup(
+                        filepath, equity_engine=self.engine
+                    )
+                except Exception:
+                    # File exists but failed to load — skip silently
+                    blueprints[street] = None
+            else:
+                blueprints[street] = None
+
+        return blueprints
 
     def _preflop_potential(self, my_cards):
         if self._preflop_table is None:
@@ -156,58 +210,6 @@ class PlayerAgent(Agent):
         return min(amount, max_raise)
 
     # ----------------------------------------------------------------
-    #  RANGE NARROWING
-    # ----------------------------------------------------------------
-
-    def _narrow_range_by_raise(self, observation, my_cards, board, dead_cards):
-        """Narrow opponent range when they raise, scaled by bet-to-pot ratio."""
-        if self._opp_weights is None or len(board) < 3:
-            return
-
-        opp_bet = observation["opp_bet"]
-        my_bet = observation["my_bet"]
-        raise_amount = opp_bet - my_bet
-        pot_before = my_bet + my_bet
-
-        if raise_amount <= 0 or pot_before <= 0:
-            return
-
-        bet_to_pot = raise_amount / max(pot_before, 1)
-
-        if bet_to_pot <= 0.5:
-            keep_fraction = 0.85
-        elif bet_to_pot <= 1.0:
-            keep_fraction = 0.70
-        elif bet_to_pot <= 3.0:
-            keep_fraction = 0.50
-        else:
-            keep_fraction = 0.30
-
-        hand_strengths = {}
-        for opp_pair in self._opp_weights:
-            if self._opp_weights[opp_pair] <= 0:
-                continue
-            five = list(opp_pair) + list(board[:3])
-            rank = self.engine.lookup_five(five)
-            hand_strengths[opp_pair] = rank
-
-        if not hand_strengths:
-            return
-
-        sorted_hands = sorted(hand_strengths.items(), key=lambda x: x[1])
-        n = len(sorted_hands)
-        cutoff = int(n * keep_fraction)
-
-        if cutoff < n:
-            for hand, _ in sorted_hands[cutoff:]:
-                self._opp_weights[hand] = 0.0
-
-        total = sum(self._opp_weights.values())
-        if total > 0:
-            for k in self._opp_weights:
-                self._opp_weights[k] /= total
-
-    # ----------------------------------------------------------------
     #  DISCARD
     # ----------------------------------------------------------------
 
@@ -268,7 +270,6 @@ class PlayerAgent(Agent):
                         raise_amount = raise_to - opp_bet
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
-                        raise_amount = min(raise_amount, 28)  # cap preflop
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:
@@ -295,30 +296,123 @@ class PlayerAgent(Agent):
         return (FOLD, 0, 0, 0)
 
     # ----------------------------------------------------------------
-    #  POST-FLOP (hybrid: CFR solver with proportional sizing)
+    #  POST-FLOP (blueprint + CFR solver fallback)
     # ----------------------------------------------------------------
 
-    def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Hybrid approach: CFR solver decides the action, proportional sizing.
+    def _try_blueprint(self, observation, my_cards, board):
+        """Try to get an action from the blueprint strategy.
 
-        The solver uses 3 proportional bet sizes (40%/70%/100% pot) so the
-        tree never contains overbets. The solver computes Nash equilibrium
-        for fold/check/call/raise decisions. For near-nuts hands (equity > 0.95),
-        we override to all-in to maximize value.
+        Returns a concrete (action_type, amount, 0, 0) tuple if the
+        blueprint has a strategy for this state, or None to signal
+        that the caller should fall back to the real-time solver.
         """
+        street = observation["street"]
+        blueprint = self._blueprints.get(street)
+        if blueprint is None:
+            return None
+
+        # Get blueprint strategy (action type -> probability)
+        try:
+            strategy = blueprint.get_strategy(hero_cards=my_cards, board=board)
+        except Exception:
+            return None
+
+        if strategy is None:
+            return None
+
+        # Sample an action type from the blueprint strategy
+        action_ids = list(strategy.keys())
+        probs = np.array([strategy[a] for a in action_ids])
+        probs /= probs.sum()  # safety normalization
+        chosen_action = int(np.random.choice(action_ids, p=probs))
+
+        # Map the abstract action type to a concrete engine action
+        return self._blueprint_action_to_engine(
+            chosen_action, observation
+        )
+
+    def _blueprint_action_to_engine(self, action_type, observation):
+        """Convert a blueprint action type ID to a concrete engine action.
+
+        Maps abstract blueprint actions (ACT_FOLD, ACT_RAISE_HALF, etc.)
+        to the engine's (action, amount, 0, 0) format.
+
+        Args:
+            action_type: int, one of ACT_FOLD..ACT_RAISE_OVERBET
+            observation: the current game observation
+
+        Returns:
+            (action, amount, 0, 0) tuple, or None if the action is invalid
+            and no safe fallback exists.
+        """
+        valid_actions = observation["valid_actions"]
+        pot_size = self._get_pot_size(observation)
+        min_raise = observation["min_raise"]
+        max_raise = observation["max_raise"]
+
+        if action_type == ACT_FOLD:
+            if valid_actions[FOLD]:
+                return (FOLD, 0, 0, 0)
+            # Can't fold (shouldn't happen, but be safe)
+            if valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            return None
+
+        elif action_type == ACT_CHECK:
+            if valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            # Blueprint says check but we can't — try call
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            return None
+
+        elif action_type == ACT_CALL:
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            if valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            return None
+
+        elif action_type in (ACT_RAISE_HALF, ACT_RAISE_POT,
+                             ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
+            # Map to pot fraction
+            pot_fractions = {
+                ACT_RAISE_HALF: 0.40,
+                ACT_RAISE_POT: 0.70,
+                ACT_RAISE_ALLIN: 1.00,
+                ACT_RAISE_OVERBET: 1.50,
+            }
+            fraction = pot_fractions[action_type]
+            raise_amount = max(int(pot_size * fraction), min_raise)
+            raise_amount = min(raise_amount, max_raise)
+
+            if valid_actions[RAISE] and raise_amount > 0:
+                return (RAISE, raise_amount, 0, 0)
+
+            # Raise not valid — fall back to call or check
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            if valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            return None
+
+        # Unknown action type — signal fallback
+        return None
+
+    def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
+        """Post-flop decision: try blueprint first, then CFR solver."""
+
+        # Try blueprint strategy first
+        blueprint_action = self._try_blueprint(observation, my_cards, board)
+        if blueprint_action is not None:
+            return blueprint_action
+
+        # Fall back to real-time CFR solver
         dead_cards = my_discards + opp_discards
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
         max_raise = observation["max_raise"]
 
-        # Near-nuts override: go all-in with overwhelming equity
-        equity = self.engine.compute_equity(my_cards, board, dead_cards, self._opp_weights)
-        if equity > 0.95 and observation["valid_actions"][RAISE] and max_raise > 0:
-            return (RAISE, max_raise, 0, 0)
-
-        # Use the CFR solver for everything else
-        # The solver's game tree uses proportional bet sizes (40%/70%/100% pot)
-        # so it never overbets
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
@@ -344,11 +438,6 @@ class PlayerAgent(Agent):
 
         my_cards, board, opp_discards, my_discards = self._parse_cards(observation)
         valid_actions = observation["valid_actions"]
-
-        # Range narrowing on opponent raises
-        opp_action = observation.get("opp_last_action", "None")
-        if opp_action == "RAISE" and self._opp_weights is not None and len(board) >= 3:
-            self._narrow_range_by_raise(observation, my_cards, board, my_discards + opp_discards)
 
         if valid_actions[DISCARD]:
             return self._handle_discard(observation, my_cards, board, opp_discards)

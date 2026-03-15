@@ -21,7 +21,7 @@ import numpy as np
 import itertools
 from game_tree import (
     GameTree, ACT_FOLD, ACT_CHECK, ACT_CALL,
-    ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN,
+    ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
     TERM_NONE, TERM_FOLD_HERO, TERM_FOLD_OPP, TERM_SHOWDOWN,
 )
 
@@ -83,11 +83,11 @@ class SubgameSolver:
         # Budget: 500s for 1000 hands = 0.5s/hand. Each hand has ~4 decisions.
         # Target: <100ms per solver call. ARM64 is ~1.5x slower than Apple Silicon.
         if time_remaining > 300:
-            iterations = 100
+            iterations = 150
         elif time_remaining > 150:
-            iterations = 60
+            iterations = 90
         elif time_remaining > 50:
-            iterations = 30
+            iterations = 45
         else:
             # Critical: fall back to thresholds entirely
             return self._fallback(hero_cards, board, dead_cards,
@@ -315,11 +315,8 @@ class SubgameSolver:
         """Convert solver strategy to a concrete engine action."""
         root_children = tree.children[0]
 
-        # Sample action from strategy (deterministic for near-pure)
-        if strategy.max() > 0.90:
-            action_idx = int(np.argmax(strategy))
-        else:
-            action_idx = int(np.random.choice(len(strategy), p=strategy))
+        # Always sample from strategy (GTO: never play deterministically)
+        action_idx = int(np.random.choice(len(strategy), p=strategy))
 
         act_type, child_id = root_children[action_idx]
 
@@ -329,7 +326,7 @@ class SubgameSolver:
             return (CHECK, 0, 0, 0)
         elif act_type == ACT_CALL:
             return (CALL, 0, 0, 0)
-        elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN):
+        elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
             # The tree stored the new total bet; compute the raise amount
             child_hero_pot = tree.hero_pot[child_id]
             child_opp_pot = tree.opp_pot[child_id]
