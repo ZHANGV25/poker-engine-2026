@@ -112,10 +112,15 @@ class GameTree:
         if new_bet_pot <= self._max_bet:
             sizes.append((ACT_RAISE_POT, new_bet_pot))
 
-        # All-in
-        new_bet_allin = self._max_bet
-        if new_bet_allin > other_bet:
-            sizes.append((ACT_RAISE_ALLIN, new_bet_allin))
+        # Large raise (2x pot or all-in, whichever is smaller)
+        # Capping at 2x pot prevents the solver from overbetting massively
+        # into small pots (e.g., betting 96 into a 4-chip pot).
+        large = max(self._min_raise, int(2.0 * pot))
+        large = min(large, remaining)
+        new_bet_large = other_bet + large
+        new_bet_large = min(new_bet_large, self._max_bet)
+        if new_bet_large > other_bet:
+            sizes.append((ACT_RAISE_ALLIN, new_bet_large))
 
         # Deduplicate (if sizes overlap, keep unique values)
         seen = set()
