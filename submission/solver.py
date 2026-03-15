@@ -357,14 +357,12 @@ class SubgameSolver:
             # Sanity check: don't overbet with medium hands.
             # The one-hand solver doesn't range-balance, so it overbets
             # with hands that should check in a range-balanced strategy.
+            # Cap sizing but preserve action choice (keep bluffs intact).
             pot_size = my_bet + opp_bet
-            if equity < 0.75 and raise_amount > pot_size * 0.5:
-                # Medium hand trying to bet big — cap at 40% pot
+            if equity < 0.70 and raise_amount > pot_size * 0.5:
+                # Medium/weak hand trying to bet big — cap at 40% pot
                 raise_amount = max(int(pot_size * 0.4), min_raise)
                 raise_amount = min(raise_amount, max_raise)
-            if equity < 0.55 and valid_actions[CHECK]:
-                # Weak hand — prefer checking
-                return (CHECK, 0, 0, 0)
 
             return (RAISE, raise_amount, 0, 0)
 
