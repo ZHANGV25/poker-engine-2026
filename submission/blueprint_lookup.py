@@ -131,9 +131,10 @@ class BlueprintLookup:
         if self._has_pot_sizes:
             pot_idx = self._find_nearest_pot(pot_state)
             strat = self.strategies[cluster_idx, pot_idx, bucket, node_idx, :]
+            act_types = self.action_types[cluster_idx, pot_idx, node_idx, :]
         else:
             strat = self.strategies[cluster_idx, bucket, node_idx, :]
-        act_types = self.action_types[cluster_idx, node_idx, :]
+            act_types = self.action_types[cluster_idx, node_idx, :]
 
         # Build result dict
         result = {}
