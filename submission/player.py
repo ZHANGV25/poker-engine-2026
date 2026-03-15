@@ -315,11 +315,9 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         facing_bet = opp_bet > my_bet
 
-        # The flop blueprint was computed with (1,2) starting bets which
-        # doesn't match runtime flop state (always equal bets). Non-root
-        # nodes only have fold/call (no raise). Solver handles flop better.
-        if street == 1:
-            return None
+        # Note: flop blueprint must be computed with equal starting bets
+        # (2,2), (4,4), etc. to match runtime state. Old (1,2) blueprints
+        # are incompatible and should not be in submission/data/.
 
         # Get blueprint strategy (action type -> probability)
         try:
