@@ -18,11 +18,6 @@ import math
 class DiscardInference:
     def __init__(self, equity_engine):
         self.engine = equity_engine
-        # Temperature controls how "rational" we assume the opponent is.
-        # Low temperature = assume perfectly rational (only best keep has weight)
-        # High temperature = assume more random (many keeps have weight)
-        # Can be calibrated from showdown data during a match.
-        self.temperature = 5.0
 
     def infer_opponent_weights(self, opp_discards, board, my_cards):
         """
@@ -66,16 +61,29 @@ class DiscardInference:
 
             best_rank = min(pair_ranks)  # lower rank = better hand
 
-            # Boltzmann weight: higher weight for keeps that are close to optimal
-            # delta is how much WORSE this keep is compared to the best keep
-            # (positive delta = worse, since lower rank = better)
+            # Boltzmann weight: higher weight for keeps close to optimal.
+            # Temperature is derived per-hand from the SPREAD of keep-pair
+            # ranks. If all 10 keeps have similar rank (spread is small),
+            # any keep is reasonable → high temperature → flat weights.
+            # If one keep dominates (spread is large), only the best keep
+            # is rational → low temperature → peaked weights.
+            #
+            # This replaces the old arbitrary temperature=5.0 and ÷500.
+            worst_rank = max(pair_ranks)
+            spread = worst_rank - best_rank  # how different the keeps are
+
             delta = candidate_rank - best_rank
 
-            # Normalize delta to a reasonable scale (ranks can range 0-7462 in treys)
-            # Divide by a scaling factor so temperature has intuitive meaning
-            normalized_delta = delta / 500.0
-
-            weight = math.exp(-normalized_delta * self.temperature)
+            if spread <= 0:
+                # All keeps are equal — uniform weight
+                weight = 1.0
+            else:
+                # Normalize delta by the spread so it's in [0, 1]
+                # Then apply a fixed temperature to control sharpness
+                # Temperature of 3.0 means: a keep that's 1 full spread
+                # worse gets weight exp(-3) ≈ 0.05 (very unlikely)
+                normalized_delta = delta / spread
+                weight = math.exp(-3.0 * normalized_delta)
             weights[tuple(sorted(candidate_pair))] = weight
 
         # Normalize
@@ -86,45 +94,3 @@ class DiscardInference:
 
         return weights
 
-    def calibrate_temperature(self, showdown_data):
-        """
-        Adjust temperature based on observed showdown hands.
-
-        If opponent frequently keeps the optimal pair, lower temperature (more rational).
-        If opponent keeps suboptimal pairs often, raise temperature (more random).
-
-        Args:
-            showdown_data: list of dicts with 'opp_kept', 'opp_discards', 'board'
-        """
-        if len(showdown_data) < 10:
-            return  # not enough data
-
-        optimal_count = 0
-        for sd in showdown_data:
-            opp_kept = sd["opp_kept"]
-            opp_discards = sd["opp_discards"]
-            board = sd["board"]
-            original_5 = list(opp_kept) + list(opp_discards)
-
-            # Find the best keep-pair
-            best_rank = float("inf")
-            kept_rank = None
-            for i, j in [(a, b) for a in range(5) for b in range(a + 1, 5)]:
-                pair = [original_5[i], original_5[j]]
-                rank = self.engine.lookup_five(pair + list(board))
-                if rank < best_rank:
-                    best_rank = rank
-                if set(pair) == set(opp_kept):
-                    kept_rank = rank
-
-            if kept_rank is not None and kept_rank == best_rank:
-                optimal_count += 1
-
-        optimal_rate = optimal_count / len(showdown_data)
-
-        # If opponent keeps optimal pair >80% of the time, they're very rational
-        if optimal_rate > 0.8:
-            self.temperature = max(2.0, self.temperature - 1.0)
-        # If <50%, they're more random
-        elif optimal_rate < 0.5:
-            self.temperature = min(15.0, self.temperature + 2.0)

@@ -76,8 +76,18 @@ def compute_hand_potential(engine, hand_5, all_cards):
     total_score = 0.0
     num_flops = len(all_flops)
 
-    for flop in all_flops:
+    # For each flop, compute what fraction of random opponent 2-card hands
+    # our best keep beats. This gives actual equity, not a rank proxy.
+    # Sample 200 flops for speed (vs all 1540). Error: ~2%, acceptable.
+    import random
+    rng = random.Random(hash(tuple(hand_5)))
+    sampled_flops = rng.sample(all_flops, min(200, len(all_flops)))
+    num_flops = len(sampled_flops)
+    for flop in sampled_flops:
         flop_list = list(flop)
+        flop_set = set(flop)
+
+        # Find our best keep-pair rank
         best_rank = float('inf')
         for i, j in KEEP_PAIRS:
             kept = [hand_5[i], hand_5[j]]
@@ -85,9 +95,22 @@ def compute_hand_potential(engine, hand_5, all_cards):
             rank = engine.lookup_five(five_cards)
             if rank < best_rank:
                 best_rank = rank
-        # Convert rank to a 0-1 score (lower rank = better = higher score)
-        # treys ranks range roughly 1-7462; invert so higher is better
-        total_score += (7462 - best_rank) / 7462.0
+
+        # Compute what fraction of random opponent 2-card hands we beat
+        # (opponent picks any 2 cards not in our hand or the flop)
+        opp_available = [c for c in all_cards if c not in hand_set and c not in flop_set]
+        wins = 0
+        total = 0
+        for oi in range(len(opp_available)):
+            for oj in range(oi + 1, len(opp_available)):
+                opp_rank = engine.lookup_five([opp_available[oi], opp_available[oj]] + flop_list)
+                if best_rank < opp_rank:
+                    wins += 1
+                elif best_rank == opp_rank:
+                    wins += 0.5
+                total += 1
+
+        total_score += wins / total if total > 0 else 0.5
 
     return total_score / num_flops
 

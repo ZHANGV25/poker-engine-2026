@@ -124,21 +124,93 @@ def build_game_tree():
     return nodes, 0
 
 
-def compute_equity_matrix(n_buckets):
+def compute_equity_matrix(n_buckets, preflop_table):
     """Compute equity[i][j] = probability bucket i beats bucket j.
 
-    Simple model: higher potential = higher equity.
-    Bucket centers are evenly spaced from 0 to 1 (normalized).
+    Simulates actual matchups: for each pair of buckets, samples hands
+    from each bucket, deals random flops, finds optimal discards for
+    both players, and computes who wins. This replaces the old constant
+    0.65/0.35 approximation with real simulated equity.
     """
+    import itertools, random
+    from submission.equity import ExactEquityEngine
+    engine = ExactEquityEngine()
+    KEEP_PAIRS = [(a, b) for a in range(5) for b in range(a + 1, 5)]
+
+    # Group all hands by bucket
+    all_cards = list(range(27))
+    pot_min = min(preflop_table.values())
+    pot_max = max(preflop_table.values())
+
+    buckets = [[] for _ in range(n_buckets)]
+    for mask, pot in preflop_table.items():
+        frac = (pot - pot_min) / (pot_max - pot_min)
+        frac = max(0.0, min(1.0 - 1e-9, frac))
+        b = int(frac * n_buckets)
+        cards = [c for c in range(27) if mask & (1 << c)]
+        buckets[b].append(cards)
+
+    print(f"  Bucket sizes: min={min(len(b) for b in buckets)}, max={max(len(b) for b in buckets)}, "
+          f"avg={sum(len(b) for b in buckets)/n_buckets:.0f}")
+
     equity = np.zeros((n_buckets, n_buckets), dtype=np.float64)
+    rng = random.Random(42)
+    n_samples = 50       # hands per bucket to sample
+    n_flops = 20         # flops per matchup
+
+    five_lookup = engine.lookup_five
+
     for i in range(n_buckets):
+        if i % 5 == 0:
+            print(f"  Equity matrix row {i}/{n_buckets}...")
         for j in range(n_buckets):
-            if i > j:
-                equity[i][j] = 0.65  # stronger hand wins ~65% (not 100% due to board variance)
-            elif i < j:
-                equity[i][j] = 0.35
-            else:
+            if i == j:
                 equity[i][j] = 0.50
+                continue
+
+            # Sample hands from each bucket
+            hands_i = rng.sample(buckets[i], min(n_samples, len(buckets[i])))
+            hands_j = rng.sample(buckets[j], min(n_samples, len(buckets[j])))
+
+            wins = 0.0
+            total = 0.0
+
+            for hi in hands_i:
+                hi_set = set(hi)
+                for hj in hands_j:
+                    # Skip if hands share cards
+                    if hi_set & set(hj):
+                        continue
+
+                    # Available cards for flop
+                    used = hi_set | set(hj)
+                    available = [c for c in all_cards if c not in used]
+
+                    for _ in range(n_flops):
+                        flop = rng.sample(available, 3)
+
+                        # Best keep for player i
+                        best_i = float('inf')
+                        for a, b in KEEP_PAIRS:
+                            r = five_lookup([hi[a], hi[b]] + flop)
+                            if r < best_i:
+                                best_i = r
+
+                        # Best keep for player j
+                        best_j = float('inf')
+                        for a, b in KEEP_PAIRS:
+                            r = five_lookup([hj[a], hj[b]] + flop)
+                            if r < best_j:
+                                best_j = r
+
+                        if best_i < best_j:
+                            wins += 1.0
+                        elif best_i == best_j:
+                            wins += 0.5
+                        total += 1.0
+
+            equity[i][j] = wins / total if total > 0 else 0.5
+
     return equity
 
 
@@ -266,8 +338,13 @@ def main():
     term = sum(1 for n in nodes if n['terminal'] is not None)
     print(f"  SB decisions: {sb_dec}, BB decisions: {bb_dec}, Terminals: {term}")
 
-    print(f"\nComputing equity matrix ({N_BUCKETS}x{N_BUCKETS})...")
-    equity_matrix = compute_equity_matrix(N_BUCKETS)
+    # Load preflop potential table for equity matrix computation
+    data_path = os.path.join(os.path.dirname(__file__), "data", "preflop_potential.npz")
+    data = np.load(data_path)
+    preflop_table = dict(zip(data["bitmasks"].tolist(), data["potentials"].tolist()))
+
+    print(f"\nComputing equity matrix ({N_BUCKETS}x{N_BUCKETS}) via simulation...")
+    equity_matrix = compute_equity_matrix(N_BUCKETS, preflop_table)
 
     print(f"Running CFR ({CFR_ITERATIONS} iterations, {N_BUCKETS} buckets)...")
     t0 = time.time()
