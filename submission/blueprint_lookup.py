@@ -76,7 +76,7 @@ class BlueprintLookup:
 
         # Multi-pot-size support (turn/river blueprints)
         if 'pot_sizes' in data:
-            self.pot_sizes = data['pot_sizes']  # e.g. [[2,2],[4,4],[16,16],[50,50]]
+            self.pot_sizes = data['pot_sizes']
             self._has_pot_sizes = True
         else:
             self.pot_sizes = None
@@ -86,6 +86,9 @@ class BlueprintLookup:
         self._cluster_to_idx = {}
         for i, cid in enumerate(self.cluster_ids):
             self._cluster_to_idx[int(cid)] = i
+
+        # Precompute hero node bet-state mapping for each tree structure
+        self._node_maps = self._build_node_maps()
 
         # Equity engine for hand bucketing at runtime
         if equity_engine is not None:
@@ -124,15 +127,17 @@ class BlueprintLookup:
         # 2. Compute hand bucket
         bucket = self._compute_bucket(hero_cards, board)
 
-        # 3. Determine which node in the tree corresponds to the action history
-        node_idx = self._action_history_to_node(action_history)
+        # 3. Find the right hero node for current bet state
+        my_bet = pot_state[0] if pot_state else 0
+        opp_bet = pot_state[1] if pot_state else 0
 
-        # 4. Look up strategy (handle multi-pot-size format)
         if self._has_pot_sizes:
             pot_idx = self._find_nearest_pot(pot_state)
+            node_idx = self._find_node_for_state(my_bet, opp_bet, pot_idx)
             strat = self.strategies[cluster_idx, pot_idx, bucket, node_idx, :]
             act_types = self.action_types[cluster_idx, pot_idx, node_idx, :]
         else:
+            node_idx = self._find_node_for_state(my_bet, opp_bet, 0)
             strat = self.strategies[cluster_idx, bucket, node_idx, :]
             act_types = self.action_types[cluster_idx, node_idx, :]
 
@@ -203,6 +208,102 @@ class BlueprintLookup:
                 best_cid = int(self.cluster_ids[i])
 
         return best_cid
+
+    def _build_node_maps(self):
+        """Rebuild game trees and map hero nodes to bet states.
+
+        For each pot size (or the single default), builds the GameTree
+        and records each hero node's bet state and available actions.
+        Returns a dict: pot_idx -> list of (node_strategy_idx, hero_pot, opp_pot, has_fold)
+        """
+        from game_tree import GameTree, ACT_FOLD
+
+        maps = {}
+
+        if self._has_pot_sizes:
+            for pi, ps in enumerate(self.pot_sizes):
+                hb, ob = int(ps[0]), int(ps[1])
+                try:
+                    tree = GameTree(hb, ob, 2, self.max_bet, True)
+                    node_info = []
+                    for i, nid in enumerate(tree.hero_node_ids):
+                        acts = [a for a, _ in tree.children[nid]]
+                        node_info.append((
+                            i,
+                            tree.hero_pot[nid],
+                            tree.opp_pot[nid],
+                            ACT_FOLD in acts,
+                        ))
+                    maps[pi] = node_info
+                except Exception:
+                    maps[pi] = [(0, hb, ob, False)]
+        else:
+            # Flop blueprint: single tree, infer starting bets from action_types
+            # Root has fold → starts with unequal bets; no fold → equal bets
+            root_acts = self.action_types[0, 0, :]
+            has_fold_root = 0 in root_acts[root_acts >= 0]
+            if has_fold_root:
+                hb, ob = 1, 2  # flop SB/BB structure
+            else:
+                hb, ob = 2, 2
+            try:
+                tree = GameTree(hb, ob, 2, self.max_bet, True)
+                node_info = []
+                for i, nid in enumerate(tree.hero_node_ids):
+                    acts = [a for a, _ in tree.children[nid]]
+                    node_info.append((
+                        i,
+                        tree.hero_pot[nid],
+                        tree.opp_pot[nid],
+                        ACT_FOLD in acts,
+                    ))
+                maps[0] = node_info
+            except Exception:
+                maps[0] = [(0, hb, ob, False)]
+
+        return maps
+
+    def _find_node_for_state(self, my_bet, opp_bet, pot_idx=0):
+        """Find the hero node index matching the current bet state.
+
+        Uses the precomputed node map to find the node with the closest
+        bet ratio to the current game state.
+        """
+        node_info = self._node_maps.get(pot_idx, [(0, 0, 0, False)])
+        if not node_info:
+            return 0
+
+        facing_bet = opp_bet > my_bet
+        pot = my_bet + opp_bet
+        if pot <= 0:
+            return 0
+
+        bet_ratio = (opp_bet - my_bet) / pot if facing_bet else 0.0
+
+        best_idx = 0
+        best_dist = float('inf')
+
+        for strategy_idx, hp, op, has_fold in node_info:
+            node_pot = hp + op
+            if node_pot <= 0:
+                continue
+
+            node_facing = op > hp
+
+            # Match facing-bet state
+            if facing_bet and not node_facing:
+                continue
+            if not facing_bet and node_facing:
+                continue
+
+            node_ratio = (op - hp) / node_pot if node_facing else 0.0
+            dist = abs(bet_ratio - node_ratio)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = strategy_idx
+
+        return best_idx
 
     def _find_nearest_pot(self, pot_state):
         """Find the nearest pot size index for multi-pot blueprints."""
