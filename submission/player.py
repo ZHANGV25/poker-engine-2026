@@ -26,6 +26,7 @@ from gym_env import PokerEnv
 from equity import ExactEquityEngine
 from inference import DiscardInference
 from solver import SubgameSolver
+from preflop_rl import PreflopRL
 
 FOLD = PokerEnv.ActionType.FOLD.value      # 0
 RAISE = PokerEnv.ActionType.RAISE.value    # 1
@@ -46,6 +47,10 @@ class PlayerAgent(Agent):
         # Precomputed tables
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
+
+        # Preflop mode: "rl", "cfr", or "fallback"
+        self._preflop_rl = PreflopRL()
+        self._preflop_mode = "rl" if self._preflop_rl.available else "cfr"
 
         # Per-hand state
         self._current_hand = -1
@@ -265,79 +270,99 @@ class PlayerAgent(Agent):
         return (DISCARD, 0, best_keep[0], best_keep[1])
 
     # ----------------------------------------------------------------
-    #  PRE-FLOP STRATEGY (Precomputed GTO)
+    #  PRE-FLOP STRATEGY
     # ----------------------------------------------------------------
 
     def _handle_preflop(self, observation, my_cards):
-        """Pre-flop using precomputed GTO mixed strategies from CFR.
+        """Route to the active preflop strategy."""
+        if self._preflop_mode == "rl":
+            result = self._handle_preflop_rl(observation, my_cards)
+            if result is not None:
+                return result
+            # RL unavailable or returned None — fall through to CFR
+        if self._preflop_mode in ("rl", "cfr"):
+            result = self._handle_preflop_cfr(observation, my_cards)
+            if result is not None:
+                return result
+        return self._handle_preflop_fallback(observation, my_cards)
 
-        Looks up our hand strength bucket and current tree node, then
-        samples from the Nash equilibrium distribution.
+    def _handle_preflop_rl(self, observation, my_cards):
+        """Pre-flop using RL-trained policy network."""
+        potential = self._preflop_potential(my_cards)
+        if potential is None:
+            return None
+        position = self._get_blind_position(observation)
+        return self._preflop_rl.get_action(
+            potential, position,
+            observation["my_bet"], observation["opp_bet"],
+            observation["valid_actions"],
+            observation["min_raise"], observation["max_raise"],
+        )
 
-        For bet levels not in the precomputed tree, uses pot odds with
-        raw hand potential (no opponent range assumption — just math).
-        """
+    def _handle_preflop_cfr(self, observation, my_cards):
+        """Pre-flop using precomputed GTO mixed strategies from CFR."""
         valid_actions = observation["valid_actions"]
-        my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        continue_cost = opp_bet - my_bet
 
-        # Try precomputed GTO strategy
         bucket = self._get_preflop_bucket(my_cards)
         node_id = self._find_preflop_node(observation)
 
-        if bucket is not None and node_id is not None and self._preflop_strategy is not None:
-            ps = self._preflop_strategy
-            strategy = ps['strategies'][node_id, bucket]
-            children = ps['children_map'].get(node_id, {})
+        if bucket is None or node_id is None or self._preflop_strategy is None:
+            return None
 
-            if len(children) > 0:
-                valid_mask = np.zeros(len(strategy))
-                for act_id in children:
-                    if act_id == 0 and valid_actions[FOLD]:
-                        valid_mask[act_id] = strategy[act_id]
-                    elif act_id == 1:
-                        if valid_actions[CALL] or valid_actions[CHECK]:
-                            valid_mask[act_id] = strategy[act_id]
-                    elif act_id >= 2 and valid_actions[RAISE]:
-                        valid_mask[act_id] = strategy[act_id]
+        ps = self._preflop_strategy
+        strategy = ps['strategies'][node_id, bucket]
+        children = ps['children_map'].get(node_id, {})
 
-                total = valid_mask.sum()
-                if total > 0:
-                    valid_mask /= total
-                    chosen = int(np.random.choice(len(valid_mask), p=valid_mask))
+        if len(children) == 0:
+            return None
 
-                    if chosen == 0:
-                        return (FOLD, 0, 0, 0)
-                    elif chosen == 1:
-                        if valid_actions[CALL]:
-                            return (CALL, 0, 0, 0)
-                        return (CHECK, 0, 0, 0)
-                    elif chosen >= 2:
-                        raise_to = ps['raise_levels'][chosen - 2]
-                        raise_amount = raise_to - opp_bet
-                        raise_amount = max(raise_amount, observation["min_raise"])
-                        raise_amount = min(raise_amount, observation["max_raise"])
-                        if raise_amount > 0 and valid_actions[RAISE]:
-                            return (RAISE, raise_amount, 0, 0)
-                        if valid_actions[CALL]:
-                            return (CALL, 0, 0, 0)
-                        return (CHECK, 0, 0, 0)
+        valid_mask = np.zeros(len(strategy))
+        for act_id in children:
+            if act_id == 0 and valid_actions[FOLD]:
+                valid_mask[act_id] = strategy[act_id]
+            elif act_id == 1:
+                if valid_actions[CALL] or valid_actions[CHECK]:
+                    valid_mask[act_id] = strategy[act_id]
+            elif act_id >= 2 and valid_actions[RAISE]:
+                valid_mask[act_id] = strategy[act_id]
 
-        # Fallback: pure pot odds using hand potential (no exploitation)
-        # Hand potential is our average equity across all flops against
-        # a random opponent — the GTO-correct value when we have no
-        # information about the opponent's range.
+        total = valid_mask.sum()
+        if total <= 0:
+            return None
+
+        valid_mask /= total
+        chosen = int(np.random.choice(len(valid_mask), p=valid_mask))
+
+        if chosen == 0:
+            return (FOLD, 0, 0, 0)
+        elif chosen == 1:
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            return (CHECK, 0, 0, 0)
+        elif chosen >= 2:
+            raise_to = ps['raise_levels'][chosen - 2]
+            raise_amount = raise_to - opp_bet
+            raise_amount = max(raise_amount, observation["min_raise"])
+            raise_amount = min(raise_amount, observation["max_raise"])
+            if raise_amount > 0 and valid_actions[RAISE]:
+                return (RAISE, raise_amount, 0, 0)
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+            return (CHECK, 0, 0, 0)
+
+    def _handle_preflop_fallback(self, observation, my_cards):
+        """Fallback: pure pot odds using hand potential."""
+        valid_actions = observation["valid_actions"]
+        continue_cost = observation["opp_bet"] - observation["my_bet"]
+
         potential = self._preflop_potential(my_cards)
         if potential is None:
-            potential = 0.5  # default when table unavailable
+            potential = 0.5
 
         if valid_actions[CALL]:
             if continue_cost <= 1:
-                # SB completing: pot odds = 33%, all hands have potential > 37%
                 return (CALL, 0, 0, 0)
-
-            # Pot odds comparison with raw potential (no range assumption)
             pot_size = self._get_pot_size(observation)
             required_equity = continue_cost / (continue_cost + pot_size)
             if potential >= required_equity:
