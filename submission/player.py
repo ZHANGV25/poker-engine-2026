@@ -109,7 +109,14 @@ class PlayerAgent(Agent):
         return int(frac * ps['n_buckets'])
 
     def _find_preflop_node(self, observation):
-        """Find matching node in precomputed preflop game tree."""
+        """Find matching node in precomputed preflop game tree.
+
+        Tries exact match first. If no exact match (opponent used a bet
+        size not in our abstraction), rounds to the nearest node with
+        the same player and closest bet amounts. This avoids falling
+        back to raw pot odds, which is less accurate than the precomputed
+        equilibrium strategy.
+        """
         if self._preflop_strategy is None:
             return None
         ps = self._preflop_strategy
@@ -120,12 +127,27 @@ class PlayerAgent(Agent):
         bet_sb = my_bet if my_player == 0 else opp_bet
         bet_bb = my_bet if my_player == 1 else opp_bet
 
+        # Try exact match first
         for nid in range(len(ps['node_players'])):
             if (ps['node_players'][nid] == my_player and
                     ps['node_bet_sb'][nid] == bet_sb and
                     ps['node_bet_bb'][nid] == bet_bb):
                 return nid
-        return None
+
+        # No exact match — round to nearest node with same player
+        best_nid = None
+        best_dist = float('inf')
+        for nid in range(len(ps['node_players'])):
+            if ps['node_players'][nid] != my_player:
+                continue
+            if ps['node_players'][nid] == -1:  # skip terminal nodes
+                continue
+            dist = abs(ps['node_bet_sb'][nid] - bet_sb) + abs(ps['node_bet_bb'][nid] - bet_bb)
+            if dist < best_dist:
+                best_dist = dist
+                best_nid = nid
+
+        return best_nid
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
