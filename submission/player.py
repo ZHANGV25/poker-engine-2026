@@ -331,6 +331,11 @@ class PlayerAgent(Agent):
         if strategy is None:
             return None
 
+        # Detect unconverged blueprint (uniform distribution = not converged)
+        probs = list(strategy.values())
+        if len(probs) > 2 and max(probs) - min(probs) < 0.05:
+            return None  # fall back to solver
+
         # Verify the strategy makes sense for our situation
         if facing_bet:
             has_fold = ACT_FOLD in strategy and strategy[ACT_FOLD] > 0.001
