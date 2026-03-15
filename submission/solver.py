@@ -110,19 +110,10 @@ class SubgameSolver:
         hero_strategy = self._run_cfr(tree, opp_weights, terminal_values,
                                        n_opp, iterations)
 
-        # Compute hero equity for raise sizing sanity check
-        hero_equity = np.dot(
-            np.array([terminal_values[tree.terminal_node_ids[0]][i]
-                      for i in range(n_opp)]) if tree.terminal_node_ids else np.zeros(n_opp),
-            opp_weights
-        ) if n_opp > 0 else 0.5
-        # Simpler: use precomputed equity vector average
-        equity = self.engine.compute_equity(hero_cards, board, dead_cards)
-
         # Map to concrete action
         return self._strategy_to_action(
             tree, hero_strategy, my_bet, opp_bet, min_raise, max_raise,
-            valid_actions, equity)
+            valid_actions)
 
     def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet, hero_first):
         """Build or retrieve a cached game tree."""
@@ -321,8 +312,7 @@ class SubgameSolver:
             return node_value
 
     def _strategy_to_action(self, tree, strategy, my_bet, opp_bet,
-                             min_raise, max_raise, valid_actions,
-                             equity=0.5):
+                             min_raise, max_raise, valid_actions):
         """Convert solver strategy to a concrete engine action."""
         root_children = tree.children[0]
 
@@ -338,7 +328,6 @@ class SubgameSolver:
         elif act_type == ACT_CALL:
             return (CALL, 0, 0, 0)
         elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
-            # The tree stored the new total bet; compute the raise amount
             child_hero_pot = tree.hero_pot[child_id]
             child_opp_pot = tree.opp_pot[child_id]
             new_bet = max(child_hero_pot, child_opp_pot)
@@ -353,16 +342,6 @@ class SubgameSolver:
                 if valid_actions[CHECK]:
                     return (CHECK, 0, 0, 0)
                 return (FOLD, 0, 0, 0)
-
-            # Sanity check: don't overbet with medium hands.
-            # The one-hand solver doesn't range-balance, so it overbets
-            # with hands that should check in a range-balanced strategy.
-            # Cap sizing but preserve action choice (keep bluffs intact).
-            pot_size = my_bet + opp_bet
-            if equity < 0.70 and raise_amount > pot_size * 0.5:
-                # Medium/weak hand trying to bet big — cap at 40% pot
-                raise_amount = max(int(pot_size * 0.4), min_raise)
-                raise_amount = min(raise_amount, max_raise)
 
             return (RAISE, raise_amount, 0, 0)
 

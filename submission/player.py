@@ -438,6 +438,10 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         max_raise = observation["max_raise"]
 
+        # Post-flop: BB acts first. We are BB when blind_position == 1.
+        blind_pos = self._get_blind_position(observation)
+        hero_first = (blind_pos == 1)  # BB acts first post-flop
+
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
@@ -449,7 +453,7 @@ class PlayerAgent(Agent):
             min_raise=observation["min_raise"],
             max_raise=max_raise,
             valid_actions=observation["valid_actions"],
-            hero_is_first=True,
+            hero_is_first=hero_first,
             time_remaining=observation.get("time_left", 400),
         )
 
