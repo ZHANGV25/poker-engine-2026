@@ -268,7 +268,14 @@ class PlayerAgent(Agent):
         dead_cards = my_discards + opp_discards
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        hero_is_first = (my_bet == opp_bet)
+        # Hero is always root of the solver tree — the solver is only
+        # called when it's our turn. The tree builder uses bet state
+        # (equal vs unequal) to determine actions (CHECK/BET vs FOLD/CALL/RAISE).
+        # BUG FIX: previously set hero_is_first = (my_bet == opp_bet), which
+        # made the tree root the OPPONENT when facing a bet. The solver then
+        # returned the opponent's strategy instead of ours — causing us to
+        # fold 100% equity hands to min-raises.
+        hero_is_first = True
 
         return self.solver.solve_and_act(
             hero_cards=my_cards,

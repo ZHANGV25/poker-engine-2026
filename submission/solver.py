@@ -298,9 +298,14 @@ class SubgameSolver:
                     hero_idx, opp_idx, terminal_values, n_opp, max_act, t)
                 node_value += strategy[:, a] * action_values[a]
 
-            # Update opponent regrets per hand
+            # Update opponent regrets per hand.
+            # Opponent's utility = -hero's utility (zero-sum).
+            # Regret = opp_utility(action) - opp_utility(current_strategy)
+            #        = -hero_utility(action) - (-hero_utility(current))
+            #        = hero_utility(current) - hero_utility(action)
+            #        = node_value - action_values[a]
             for a in range(n_act):
-                inst_regret = hero_reach * (action_values[a] - node_value)
+                inst_regret = hero_reach * (node_value - action_values[a])
                 opp_regrets[idx, :, a] = np.maximum(0, opp_regrets[idx, :, a] + inst_regret)
 
             return node_value
