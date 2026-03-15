@@ -323,7 +323,7 @@ class PlayerAgent(Agent):
             pot_state = (my_bet, opp_bet)
             strategy = blueprint.get_strategy(
                 hero_cards=my_cards, board=board, pot_state=pot_state,
-                dead_cards=dead_cards)
+                dead_cards=dead_cards, opp_weights=self._opp_weights)
         except Exception:
             return None
 

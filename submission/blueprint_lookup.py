@@ -104,7 +104,7 @@ class BlueprintLookup:
         return len(self.cluster_ids)
 
     def get_strategy(self, hero_cards, board, pot_state=None, action_history=None,
-                     dead_cards=None):
+                     dead_cards=None, opp_weights=None):
         """
         Look up the blueprint strategy for the current game state.
 
@@ -125,8 +125,8 @@ class BlueprintLookup:
 
         cluster_idx = self._cluster_to_idx[cluster_id]
 
-        # 2. Compute hand bucket
-        bucket = self._compute_bucket(hero_cards, board, dead_cards)
+        # 2. Compute hand bucket (using opponent range if available)
+        bucket = self._compute_bucket(hero_cards, board, dead_cards, opp_weights)
 
         # 3. Find the right hero node for current bet state
         my_bet = pot_state[0] if pot_state else 0
@@ -323,20 +323,18 @@ class BlueprintLookup:
                 best_idx = i
         return best_idx
 
-    def _compute_bucket(self, hero_cards, board, dead_cards=None):
+    def _compute_bucket(self, hero_cards, board, dead_cards=None,
+                        opp_weights=None):
         """
         Compute the equity bucket for hero's hand.
 
-        Args:
-            hero_cards: list of 2 card ints
-            board: list of 3-5 card ints
-            dead_cards: list of dead card ints (discards), or None
-
-        Returns:
-            int bucket_id
+        Uses opponent range weights from discard inference when available,
+        giving more accurate equity (and thus better bucket assignment)
+        than uniform range assumption.
         """
         equity = self.engine.compute_equity(
-            list(hero_cards), list(board), list(dead_cards or []))
+            list(hero_cards), list(board), list(dead_cards or []),
+            opp_weights)
         bucket = int(equity * self.n_buckets)
         return min(bucket, self.n_buckets - 1)
 
