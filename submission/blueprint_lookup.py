@@ -103,7 +103,8 @@ class BlueprintLookup:
     def n_solved_clusters(self):
         return len(self.cluster_ids)
 
-    def get_strategy(self, hero_cards, board, pot_state=None, action_history=None):
+    def get_strategy(self, hero_cards, board, pot_state=None, action_history=None,
+                     dead_cards=None):
         """
         Look up the blueprint strategy for the current game state.
 
@@ -125,7 +126,7 @@ class BlueprintLookup:
         cluster_idx = self._cluster_to_idx[cluster_id]
 
         # 2. Compute hand bucket
-        bucket = self._compute_bucket(hero_cards, board)
+        bucket = self._compute_bucket(hero_cards, board, dead_cards)
 
         # 3. Find the right hero node for current bet state
         my_bet = pot_state[0] if pot_state else 0
@@ -322,18 +323,20 @@ class BlueprintLookup:
                 best_idx = i
         return best_idx
 
-    def _compute_bucket(self, hero_cards, board):
+    def _compute_bucket(self, hero_cards, board, dead_cards=None):
         """
         Compute the equity bucket for hero's hand.
 
         Args:
             hero_cards: list of 2 card ints
             board: list of 3-5 card ints
+            dead_cards: list of dead card ints (discards), or None
 
         Returns:
             int bucket_id
         """
-        equity = self.engine.compute_equity(list(hero_cards), list(board), [])
+        equity = self.engine.compute_equity(
+            list(hero_cards), list(board), list(dead_cards or []))
         bucket = int(equity * self.n_buckets)
         return min(bucket, self.n_buckets - 1)
 

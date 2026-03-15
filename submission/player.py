@@ -299,7 +299,7 @@ class PlayerAgent(Agent):
     #  POST-FLOP (blueprint + CFR solver fallback)
     # ----------------------------------------------------------------
 
-    def _try_blueprint(self, observation, my_cards, board):
+    def _try_blueprint(self, observation, my_cards, board, dead_cards=None):
         """Try to get an action from the blueprint strategy.
 
         Returns a concrete (action_type, amount, 0, 0) tuple if the
@@ -315,11 +315,18 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         facing_bet = opp_bet > my_bet
 
+        # The flop blueprint was computed with (1,2) starting bets — all nodes
+        # are "facing bet". At runtime, flop always starts with equal bets.
+        # Fall back to solver for flop equal-bet decisions.
+        if street == 1 and not facing_bet:
+            return None  # solver handles flop first-action better
+
         # Get blueprint strategy (action type -> probability)
         try:
             pot_state = (my_bet, opp_bet)
             strategy = blueprint.get_strategy(
-                hero_cards=my_cards, board=board, pot_state=pot_state)
+                hero_cards=my_cards, board=board, pot_state=pot_state,
+                dead_cards=dead_cards)
         except Exception:
             return None
 
@@ -415,9 +422,10 @@ class PlayerAgent(Agent):
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
         """Post-flop decision: try blueprint first, then CFR solver."""
+        dead_cards = my_discards + opp_discards
 
         # Try blueprint strategy first
-        blueprint_action = self._try_blueprint(observation, my_cards, board)
+        blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
