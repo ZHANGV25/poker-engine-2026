@@ -25,6 +25,7 @@ from gym_env import PokerEnv
 from equity import ExactEquityEngine
 from inference import DiscardInference
 from solver import SubgameSolver
+from range_solver import RangeSolver
 
 # Try to import blueprint lookup modules (graceful fallback if unavailable)
 try:
@@ -66,6 +67,7 @@ class PlayerAgent(Agent):
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)
         self.solver = SubgameSolver(self.engine)
+        self.range_solver = RangeSolver(self.engine)
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
@@ -627,17 +629,36 @@ class PlayerAgent(Agent):
                     if valid_actions[FOLD]:
                         return (FOLD, 0, 0, 0)
 
-        # Try blueprint strategy — play it as-is.
-        # Blueprint raises are range-balanced and correct on average.
-        # Range narrowing is used ONLY for the fold decision above.
+        # For turn and river: use range-based re-solver when opponent
+        # range has been narrowed. This produces range-balanced strategies
+        # adapted to the narrowed range (what Pluribus does).
+        # Flop: too expensive for real-time, use blueprint.
+        valid_actions = observation["valid_actions"]
+        time_left = observation.get("time_left", 400)
+
+        if street == 3 and self._opp_weights is not None and time_left > 100:
+            range_action = self.range_solver.solve_and_act(
+                hero_cards=my_cards,
+                board=board,
+                opp_range=self._opp_weights,
+                dead_cards=dead_cards,
+                my_bet=my_bet,
+                opp_bet=opp_bet,
+                street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid_actions,
+                time_remaining=time_left,
+            )
+            if range_action is not None:
+                return range_action
+
+        # Flop or range solver failed: use blueprint
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
-        # Fall back to real-time CFR solver
-        max_raise = observation["max_raise"]
-        valid_actions = observation["valid_actions"]
-
+        # Fall back to one-hand solver
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
@@ -647,10 +668,10 @@ class PlayerAgent(Agent):
             opp_bet=opp_bet,
             street=street,
             min_raise=observation["min_raise"],
-            max_raise=max_raise,
+            max_raise=observation["max_raise"],
             valid_actions=valid_actions,
             hero_is_first=True,
-            time_remaining=observation.get("time_left", 400),
+            time_remaining=time_left,
         )
 
     # ----------------------------------------------------------------
