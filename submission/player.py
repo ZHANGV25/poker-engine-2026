@@ -282,6 +282,11 @@ class PlayerAgent(Agent):
                         amt = ps['raise_levels'][chosen - 2] - opp_bet
                         amt = max(amt, observation["min_raise"])
                         amt = min(amt, observation["max_raise"])
+                        # Cap large raises to premium hands (bucket 36 shoves)
+                        if amt > 20:
+                            potential = self._preflop_potential(my_cards)
+                            if potential is not None and potential < 0.88:
+                                return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
                         if amt > 0 and valid[RAISE]:
                             return (RAISE, amt, 0, 0)
                         return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)

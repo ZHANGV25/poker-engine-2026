@@ -25,7 +25,7 @@ import time
 import numpy as np
 
 N_BUCKETS = 50        # hand potential buckets
-CFR_ITERATIONS = 1000
+CFR_ITERATIONS = 5000
 MAX_BET = 100
 SB_BLIND = 1
 BB_BLIND = 2
