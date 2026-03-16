@@ -76,7 +76,6 @@ class PlayerAgent(Agent):
         # Per-hand state
         self._current_hand = -1
         self._opp_weights = None
-        self._last_seen_action = None
 
         # Match state for lead protection
         self._bankroll = 0
@@ -498,72 +497,137 @@ class PlayerAgent(Agent):
         # Unknown action type — signal fallback
         return None
 
+    def _narrow_range_from_action(self, opp_action_type, board, dead_cards,
+                                   pot_state, street):
+        """Narrow opponent range based on their betting action.
+
+        Uses the blueprint to determine which opponent hands would take
+        this action. Hands that wouldn't take this action get their
+        weight reduced. This is nested subgame solving — the opponent's
+        betting tells us about their range.
+
+        Args:
+            opp_action_type: 'bet', 'check', or 'raise'
+            board: list of community cards
+            dead_cards: list of dead cards
+            pot_state: (hero_bet, opp_bet) before opponent's action
+            street: 1-3
+        """
+        if self._opp_weights is None:
+            return
+
+        blueprint = self._blueprints.get(street)
+        if blueprint is None or not hasattr(blueprint, '_unbucketed') or not blueprint._unbucketed:
+            return
+
+        known = set(board) | set(dead_cards)
+        remaining = [c for c in range(27) if c not in known]
+
+        import itertools
+        new_weights = {}
+
+        for hand in itertools.combinations(remaining, 2):
+            hand_tuple = tuple(sorted(hand))
+            old_weight = self._opp_weights.get(hand_tuple, 0.0)
+            if old_weight < 0.001:
+                continue
+
+            # Look up what the blueprint says this opp hand would do
+            try:
+                opp_strat = blueprint.get_strategy(
+                    hero_cards=list(hand), board=board,
+                    pot_state=pot_state, dead_cards=dead_cards)
+            except Exception:
+                new_weights[hand_tuple] = old_weight
+                continue
+
+            if opp_strat is None:
+                new_weights[hand_tuple] = old_weight
+                continue
+
+            # Compute probability that this hand takes the observed action
+            if opp_action_type == 'bet':
+                # Any raise action
+                action_prob = sum(p for a, p in opp_strat.items()
+                                 if a in (ACT_RAISE_HALF, ACT_RAISE_POT,
+                                         ACT_RAISE_ALLIN, ACT_RAISE_OVERBET))
+            elif opp_action_type == 'check':
+                action_prob = opp_strat.get(ACT_CHECK, 0) + opp_strat.get(ACT_CALL, 0)
+            elif opp_action_type == 'call':
+                action_prob = opp_strat.get(ACT_CALL, 0)
+            else:
+                action_prob = 1.0
+
+            # Bayes: P(hand | action) ∝ P(action | hand) * P(hand)
+            new_weights[hand_tuple] = old_weight * max(action_prob, 0.01)
+
+        # Normalize
+        total = sum(new_weights.values())
+        if total > 0:
+            for k in new_weights:
+                new_weights[k] /= total
+            self._opp_weights = new_weights
+
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Post-flop decision: try blueprint first, then CFR solver."""
+        """Post-flop decision with range narrowing.
+
+        Uses nested subgame solving: narrows opponent range based on
+        their betting actions before looking up our own strategy.
+        """
         dead_cards = my_discards + opp_discards
 
-        # Ensure opponent range weights are computed. When we're BB
-        # (first to discard), observe() receives stale data and never
-        # fires the inference. Compute it here if needed.
+        # Ensure opponent range weights are computed
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards
             )
 
-        # Equity guard BEFORE blueprint: when facing a large bet relative
-        # to the pot, the opponent's range is polarized toward strong hands.
-        # The blueprint doesn't model opponent betting patterns — it assumes
-        # the full range. Override with equity check for extreme bet sizes.
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        if opp_bet > my_bet:
-            continue_cost = opp_bet - my_bet
-            pot_size = my_bet + opp_bet
-            bet_to_pot = continue_cost / max(my_bet * 2, 1)  # bet relative to prior pot
-            if bet_to_pot > 3.0:  # overbet > 3x pot (e.g. 98 into 4)
-                equity = self.engine.compute_equity(
-                    my_cards, board, dead_cards, self._opp_weights)
-                pot_odds = continue_cost / (continue_cost + pot_size)
-                # Large overbets mean very strong range — need high equity
-                if equity < pot_odds + 0.15:
-                    valid_actions = observation["valid_actions"]
-                    if valid_actions[FOLD]:
-                        return (FOLD, 0, 0, 0)
+        street = observation["street"]
 
-        # Try blueprint strategy first
-        blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
-        if blueprint_action is not None:
-            return blueprint_action
+        # Narrow opponent range based on bet state.
+        # If opponent bet (opp_bet > equal share), they raised — narrow to
+        # hands that would raise. If bets are equal, they checked — narrow
+        # to hands that would check.
+        if self._opp_weights is not None:
+            if opp_bet > my_bet:
+                self._narrow_range_from_action(
+                    'bet', board, dead_cards, (my_bet, my_bet), street)
+            elif my_bet == opp_bet and my_bet > 0:
+                # Equal bets could mean opponent checked (if we act second)
+                # or we're first to act. Only narrow if we know they checked.
+                blind_pos = self._get_blind_position(observation)
+                if blind_pos == 0:  # we're SB (act second postflop)
+                    # Opponent (BB) acted first — if bets equal, they checked
+                    self._narrow_range_from_action(
+                        'check', board, dead_cards, (my_bet, opp_bet), street)
 
-        # Fall back to real-time CFR solver
-        dead_cards = my_discards + opp_discards
-        my_bet = observation["my_bet"]
-        opp_bet = observation["opp_bet"]
-        max_raise = observation["max_raise"]
-        valid_actions = observation["valid_actions"]
-
-        # The one-hand solver can't range-balance: it overbets weak hands
-        # as "bluffs" because it doesn't model our full range. When facing
-        # a bet with low equity, fold/call directly based on pot odds
-        # instead of letting the solver bluff-raise.
-        if opp_bet > my_bet:
+        # When facing a bet, compute equity against the NARROWED range.
+        # If equity is below pot odds, fold regardless of what the blueprint
+        # says — the blueprint was solved against the full range, not the
+        # narrowed range that accounts for opponent's betting line.
+        if opp_bet > my_bet and self._opp_weights is not None:
             continue_cost = opp_bet - my_bet
             pot_size = my_bet + opp_bet
             equity = self.engine.compute_equity(
                 my_cards, board, dead_cards, self._opp_weights)
             pot_odds = continue_cost / (continue_cost + pot_size)
-            # Margin for opponent range narrowing when they bet
-            bet_frac = continue_cost / max(pot_size, 1)
-            margin = 0.10 + 0.10 * min(bet_frac, 1.0)
 
-            if equity < pot_odds + margin:
+            if equity < pot_odds:
+                valid_actions = observation["valid_actions"]
                 if valid_actions[FOLD]:
                     return (FOLD, 0, 0, 0)
-                if valid_actions[CALL]:
-                    return (CALL, 0, 0, 0)
 
-        # hero_is_first=True: hero is always the one deciding right now.
-        # The bets already reflect all prior actions on this street.
+        # Try blueprint strategy
+        blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
+        if blueprint_action is not None:
+            return blueprint_action
+
+        # Fall back to real-time CFR solver
+        max_raise = observation["max_raise"]
+        valid_actions = observation["valid_actions"]
+
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
@@ -571,7 +635,7 @@ class PlayerAgent(Agent):
             dead_cards=dead_cards,
             my_bet=my_bet,
             opp_bet=opp_bet,
-            street=observation["street"],
+            street=street,
             min_raise=observation["min_raise"],
             max_raise=max_raise,
             valid_actions=valid_actions,
