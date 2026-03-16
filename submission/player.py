@@ -280,34 +280,7 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         continue_cost = opp_bet - my_bet
 
-        # The preflop tree was solved with max raise=30, but the game
-        # allows bets up to 100. When facing a large bet, the tree's
-        # node matching rounds to the nearest node and produces wrong
-        # fold frequencies (nearly 0% fold). Handle large bets directly
-        # using hand potential percentile.
-        if continue_cost > 20 and valid_actions[FOLD]:
-            potential = self._preflop_potential(my_cards)
-            if potential is None:
-                potential = 0.5
-
-            # Potential distribution: median=0.84, range 0.52-0.95.
-            # Scale threshold with stack commitment to fold weak hands:
-            # cost=25: threshold≈0.81 (fold ~30%)
-            # cost=40: threshold≈0.83 (fold ~40%)
-            # cost=60: threshold≈0.84 (fold ~51%)
-            # cost=80: threshold≈0.86 (fold ~66%)
-            # cost=98: threshold≈0.88 (fold ~77%)
-            commit_frac = min(continue_cost / 100.0, 0.98)
-            threshold = 0.79 + 0.09 * commit_frac
-
-            if potential < threshold:
-                return (FOLD, 0, 0, 0)
-
-            # Strong enough to continue — call, don't re-escalate
-            if valid_actions[CALL]:
-                return (CALL, 0, 0, 0)
-
-        # Try precomputed GTO strategy (reliable for small bets ≤30)
+        # Try precomputed GTO strategy
         bucket = self._get_preflop_bucket(my_cards)
         node_id = self._find_preflop_node(observation)
 
@@ -344,23 +317,13 @@ class PlayerAgent(Agent):
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
 
-                        # Cap large raises to premium hands only.
-                        # Low-frequency bluff-shoves from 1000-iteration CFR
-                        # are likely noise, not converged equilibrium.
-                        if raise_amount > 20:
-                            potential = self._preflop_potential(my_cards)
-                            if potential is not None and potential < 0.88:
-                                if valid_actions[CALL]:
-                                    return (CALL, 0, 0, 0)
-                                return (CHECK, 0, 0, 0)
-
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:
                             return (CALL, 0, 0, 0)
                         return (CHECK, 0, 0, 0)
 
-        # Fallback: pot odds with adjusted threshold for large bets
+        # Fallback: pure pot odds (only if tree lookup fails)
         potential = self._preflop_potential(my_cards)
         if potential is None:
             potential = 0.5
@@ -369,12 +332,8 @@ class PlayerAgent(Agent):
             if continue_cost <= 1:
                 return (CALL, 0, 0, 0)
             pot_size = self._get_pot_size(observation)
-            # Raw pot odds underestimate the threshold because
-            # preflop "potential" doesn't account for opponent range
-            # narrowing when they raise. Add a margin.
             required_equity = continue_cost / (continue_cost + pot_size)
-            margin = 0.08 * min(continue_cost / 30.0, 1.0)
-            if potential >= required_equity + margin:
+            if potential >= required_equity:
                 return (CALL, 0, 0, 0)
             return (FOLD, 0, 0, 0)
 
@@ -588,103 +547,40 @@ class PlayerAgent(Agent):
         return
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Post-flop decision with range narrowing.
+        """Pure GTO postflop: play the blueprint strategy as-is.
 
-        Uses nested subgame solving: narrows opponent range based on
-        their betting actions before looking up our own strategy.
+        No range narrowing, no equity overrides, no heuristics.
+        The blueprint was solved at Nash equilibrium with full-range CFR.
+        Playing it straight is unexploitable.
         """
         dead_cards = my_discards + opp_discards
 
-        # Ensure opponent range weights are computed
+        # Ensure opponent range weights are computed (used by blueprint
+        # for equity bucketing on bucketed fallback paths)
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards
             )
 
-        my_bet = observation["my_bet"]
-        opp_bet = observation["opp_bet"]
-        street = observation["street"]
-
-        # Narrow opponent range based on bet state.
-        # If opponent bet (opp_bet > equal share), they raised — narrow to
-        # hands that would raise. If bets are equal, they checked — narrow
-        # to hands that would check.
-        if self._opp_weights is not None:
-            if opp_bet > my_bet:
-                self._narrow_range_from_action(
-                    'bet', board, dead_cards, (my_bet, my_bet), street)
-            elif my_bet == opp_bet and my_bet > 0:
-                # Equal bets could mean opponent checked (if we act second)
-                # or we're first to act. Only narrow if we know they checked.
-                blind_pos = self._get_blind_position(observation)
-                if blind_pos == 0:  # we're SB (act second postflop)
-                    # Opponent (BB) acted first — if bets equal, they checked
-                    self._narrow_range_from_action(
-                        'check', board, dead_cards, (my_bet, opp_bet), street)
-
-        # Compute equity against the NARROWED range.
-        # Use this to override blueprint decisions that don't account
-        # for opponent's betting line.
-        range_equity = None
-        if self._opp_weights is not None:
-            range_equity = self.engine.compute_equity(
-                my_cards, board, dead_cards, self._opp_weights)
-
-            # Facing a bet: fold if equity clearly below pot odds.
-            # Small buffer (5%) because range narrowing may overcorrect
-            # against opponents who bet wider than the blueprint predicts.
-            if opp_bet > my_bet:
-                continue_cost = opp_bet - my_bet
-                pot_size = my_bet + opp_bet
-                pot_odds = continue_cost / (continue_cost + pot_size)
-                if range_equity < pot_odds - 0.05:
-                    valid_actions = observation["valid_actions"]
-                    if valid_actions[FOLD]:
-                        return (FOLD, 0, 0, 0)
-
-        # For turn and river: use range-based re-solver when opponent
-        # range has been narrowed. This produces range-balanced strategies
-        # adapted to the narrowed range (what Pluribus does).
-        # Flop: too expensive for real-time, use blueprint.
-        valid_actions = observation["valid_actions"]
-        time_left = observation.get("time_left", 400)
-
-        if street == 3 and self._opp_weights is not None and time_left > 100:
-            range_action = self.range_solver.solve_and_act(
-                hero_cards=my_cards,
-                board=board,
-                opp_range=self._opp_weights,
-                dead_cards=dead_cards,
-                my_bet=my_bet,
-                opp_bet=opp_bet,
-                street=street,
-                min_raise=observation["min_raise"],
-                max_raise=observation["max_raise"],
-                valid_actions=valid_actions,
-                time_remaining=time_left,
-            )
-            if range_action is not None:
-                return range_action
-
-        # Flop or range solver failed: use blueprint
+        # Play the blueprint
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
-        # Fall back to one-hand solver
+        # Fall back to one-hand solver (only when blueprint has no coverage)
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
             opp_range=self._opp_weights,
             dead_cards=dead_cards,
-            my_bet=my_bet,
-            opp_bet=opp_bet,
-            street=street,
+            my_bet=observation["my_bet"],
+            opp_bet=observation["opp_bet"],
+            street=observation["street"],
             min_raise=observation["min_raise"],
             max_raise=observation["max_raise"],
-            valid_actions=valid_actions,
+            valid_actions=observation["valid_actions"],
             hero_is_first=True,
-            time_remaining=time_left,
+            time_remaining=observation.get("time_left", 400),
         )
 
     # ----------------------------------------------------------------
