@@ -419,7 +419,7 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
-        # 1. Multi-street blueprint (flop only -- it was trained for flop)
+        # 1. Multi-street blueprint (flop: backward induction)
         if street == 1 and self._multi_street is not None:
             try:
                 strat = self._multi_street.get_strategy(
@@ -430,7 +430,30 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Single-street blueprint
+        # 2. Multi-street turn strategies (backward induction from river)
+        if street == 2 and self._multi_street is not None:
+            try:
+                strat = self._multi_street.get_turn_strategy(
+                    my_cards, board, pot_state=pot_state)
+                action = self._try_strategy(strat, observation)
+                if action is not None:
+                    return action
+            except Exception:
+                pass
+
+        # 3. Range solver (river — adapts to narrowed opponent range)
+        if street == 3 and self._opp_weights and time_left > 100:
+            action = self.range_solver.solve_and_act(
+                hero_cards=my_cards, board=board,
+                opp_range=self._opp_weights, dead_cards=dead,
+                my_bet=my_bet, opp_bet=opp_bet, street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid, time_remaining=time_left)
+            if action is not None:
+                return action
+
+        # 4. Single-street blueprint (fallback for any street)
         bp = self._blueprints.get(street)
         if bp is not None:
             try:
@@ -443,19 +466,7 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. Range solver (river, when time permits)
-        if street == 3 and self._opp_weights and time_left > 500:
-            action = self.range_solver.solve_and_act(
-                hero_cards=my_cards, board=board,
-                opp_range=self._opp_weights, dead_cards=dead,
-                my_bet=my_bet, opp_bet=opp_bet, street=street,
-                min_raise=observation["min_raise"],
-                max_raise=observation["max_raise"],
-                valid_actions=valid, time_remaining=time_left)
-            if action is not None:
-                return action
-
-        # 4. One-hand solver (fallback)
+        # 5. One-hand solver (last resort)
         if time_left > 30:
             return self.solver.solve_and_act(
                 hero_cards=my_cards, board=board,
@@ -466,7 +477,7 @@ class PlayerAgent(Agent):
                 valid_actions=valid, hero_is_first=True,
                 time_remaining=time_left)
 
-        # 5. Emergency: check/fold
+        # 6. Emergency: check/fold
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
         return (FOLD, 0, 0, 0)

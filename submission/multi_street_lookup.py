@@ -95,6 +95,36 @@ class MultiStreetLookup:
                 features = data['board_features']
                 pot_sizes = data['pot_sizes']
 
+                # Load turn strategies if available
+                turn_data = {}
+                if 'turn_cards' in data:
+                    turn_cards = data['turn_cards']
+                    for tc in turn_cards:
+                        tc = int(tc)
+                        t_hands_key = f'turn_hands_t{tc}'
+                        if t_hands_key in data:
+                            t_hands = data[t_hands_key]
+                            # Build hand map for this turn card
+                            t_hmap = {}
+                            for hi in range(len(t_hands)):
+                                c1, c2 = int(t_hands[hi][0]), int(t_hands[hi][1])
+                                t_hmap[(min(c1, c2), max(c1, c2))] = hi
+                            turn_data[tc] = {
+                                'hands': t_hands,
+                                'hand_map': t_hmap,
+                            }
+                            # Load per-pot strategies and actions
+                            for pi in range(len(pot_sizes)):
+                                s_key = f'turn_strat_p{pi}_t{tc}'
+                                a_key = f'turn_actions_p{pi}_t{tc}'
+                                if s_key in data:
+                                    if 'pot_strategies' not in turn_data[tc]:
+                                        turn_data[tc]['pot_strategies'] = {}
+                                        turn_data[tc]['pot_actions'] = {}
+                                    turn_data[tc]['pot_strategies'][pi] = data[s_key]
+                                    if a_key in data:
+                                        turn_data[tc]['pot_actions'][pi] = data[a_key]
+
                 self._boards[board_id] = {
                     'strategies': data['flop_strategies'],
                     'action_types': data['action_types'],
@@ -102,6 +132,7 @@ class MultiStreetLookup:
                     'board': board,
                     'features': features,
                     'pot_sizes': pot_sizes,
+                    'turn_data': turn_data,
                 }
 
                 self._board_list.append((board_id, board, features))
@@ -279,6 +310,87 @@ class MultiStreetLookup:
             return None
 
         # Normalize
+        if abs(total - 1.0) > 1e-6 and total > 0:
+            for k in result:
+                result[k] /= total
+
+        return result
+
+    def get_turn_strategy(self, hero_cards, board, pot_state=None,
+                           dead_cards=None, opp_weights=None):
+        """Look up turn strategy from multi-street solve.
+
+        Args:
+            hero_cards: list of 2 card ints
+            board: list of 4+ card ints (flop + turn card)
+            pot_state: (hero_bet, opp_bet)
+
+        Returns:
+            dict {action_type_id: probability}, or None
+        """
+        if not self._loaded or len(board) < 4:
+            return None
+
+        flop = tuple(sorted(int(c) for c in board[:3]))
+        board_id = self._find_board(flop)
+        if board_id is None:
+            return None
+
+        bd = self._boards[board_id]
+        turn_data = bd.get('turn_data', {})
+        turn_card = int(board[3])
+
+        if turn_card not in turn_data:
+            return None
+
+        td = turn_data[turn_card]
+        if 'pot_strategies' not in td:
+            return None
+
+        # Find hand index in turn hand list
+        c1, c2 = int(hero_cards[0]), int(hero_cards[1])
+        key = (min(c1, c2), max(c1, c2))
+        hand_idx = td['hand_map'].get(key)
+        if hand_idx is None:
+            return None
+
+        # Find pot index
+        pot_idx = self._find_pot(pot_state, bd['pot_sizes'])
+        if pot_idx not in td['pot_strategies']:
+            pot_idx = min(td['pot_strategies'].keys()) if td['pot_strategies'] else 0
+
+        strats = td['pot_strategies'].get(pot_idx)
+        acts = td['pot_actions'].get(pot_idx)
+        if strats is None:
+            return None
+
+        # Find node for bet state
+        my_bet = pot_state[0] if pot_state else 2
+        opp_bet = pot_state[1] if pot_state else 2
+        # Use flop node matching (same tree structure)
+        node_idx = self._find_node(my_bet, opp_bet, board_id, pot_idx)
+
+        if hand_idx >= strats.shape[0] or node_idx >= strats.shape[1]:
+            return None
+
+        raw = strats[hand_idx, node_idx, :]
+        probs = raw.astype(np.float64) / 255.0
+
+        if acts is not None and node_idx < acts.shape[0]:
+            act_ids = acts[node_idx, :]
+        else:
+            return None
+
+        result = {}
+        total = 0.0
+        for a in range(len(probs)):
+            if a < len(act_ids) and act_ids[a] >= 0 and probs[a] > 0:
+                result[int(act_ids[a])] = float(probs[a])
+                total += probs[a]
+
+        if not result:
+            return None
+
         if abs(total - 1.0) > 1e-6 and total > 0:
             for k in result:
                 result[k] /= total
