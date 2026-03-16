@@ -627,22 +627,11 @@ class PlayerAgent(Agent):
                     if valid_actions[FOLD]:
                         return (FOLD, 0, 0, 0)
 
-        # Try blueprint strategy
+        # Try blueprint strategy — play it as-is.
+        # Blueprint raises are range-balanced and correct on average.
+        # Range narrowing is used ONLY for the fold decision above.
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
-            # Cap raises when equity against narrowed range is marginal.
-            # Blueprint raises are range-balanced (raises with strong AND
-            # weak hands). But if OUR specific hand has low equity against
-            # the narrowed opponent range, raising builds a pot we'll lose.
-            if range_equity is not None and blueprint_action[0] == RAISE:
-                if range_equity < 0.55:
-                    # Marginal hand — don't escalate, just call or check
-                    valid_actions = observation["valid_actions"]
-                    if opp_bet > my_bet and valid_actions[CALL]:
-                        return (CALL, 0, 0, 0)
-                    if valid_actions[CHECK]:
-                        return (CHECK, 0, 0, 0)
-                    # If we can't check or call, use the blueprint action
             return blueprint_action
 
         # Fall back to real-time CFR solver
