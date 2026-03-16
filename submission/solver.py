@@ -349,11 +349,24 @@ class SubgameSolver:
 
     def _fallback(self, hero_cards, board, dead_cards,
                   my_bet, opp_bet, valid_actions, min_raise, max_raise):
-        """Equity-threshold fallback when solver can't run."""
+        """Equity-threshold fallback when solver can't run.
+
+        Note: equity is computed against a uniform opponent range. When
+        facing a bet, the opponent's actual range is stronger (they wouldn't
+        bet with trash). We add a margin to pot odds to account for this.
+        """
         equity = self.engine.compute_equity(hero_cards, board, dead_cards)
         pot_size = my_bet + opp_bet
         continue_cost = opp_bet - my_bet
         pot_odds = continue_cost / (continue_cost + pot_size) if continue_cost > 0 else 0
+
+        # When opponent bets, their range is stronger than uniform.
+        # Margin scales with bet size: bigger bets = more polarized range.
+        if continue_cost > 0:
+            bet_fraction = continue_cost / max(pot_size, 1)
+            margin = 0.10 + 0.10 * min(bet_fraction, 1.0)
+        else:
+            margin = 0
 
         if equity > 0.92 and valid_actions[RAISE]:
             return (RAISE, max_raise, 0, 0)
@@ -361,7 +374,7 @@ class SubgameSolver:
             amt = max(int(pot_size * 0.6), min_raise)
             amt = min(amt, max_raise)
             return (RAISE, amt, 0, 0)
-        if valid_actions[CALL] and equity >= pot_odds:
+        if valid_actions[CALL] and equity >= pot_odds + margin:
             return (CALL, 0, 0, 0)
         if valid_actions[CHECK]:
             return (CHECK, 0, 0, 0)

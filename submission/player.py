@@ -26,7 +26,13 @@ from equity import ExactEquityEngine
 from inference import DiscardInference
 from solver import SubgameSolver
 
-# Try to import blueprint lookup module (graceful fallback if unavailable)
+# Try to import blueprint lookup modules (graceful fallback if unavailable)
+try:
+    from blueprint_lookup_unbucketed import BlueprintLookupUnbucketed
+    _BLUEPRINT_UNBUCKETED_AVAILABLE = True
+except Exception:
+    _BLUEPRINT_UNBUCKETED_AVAILABLE = False
+
 try:
     from blueprint_lookup import BlueprintLookup
     _BLUEPRINT_AVAILABLE = True
@@ -72,6 +78,10 @@ class PlayerAgent(Agent):
         self._opp_weights = None
         self._last_seen_action = None
 
+        # Match state for lead protection
+        self._bankroll = 0
+        self._total_hands = 1000
+
     def __name__(self):
         return "PlayerAgent"
 
@@ -110,27 +120,62 @@ class PlayerAgent(Agent):
     def _load_blueprints(self):
         """Load blueprint strategy files for each post-flop street.
 
-        Returns a dict mapping street (1,2,3) -> BlueprintLookup or None.
-        If the blueprint module isn't available or a file doesn't exist,
-        that street maps to None (will use real-time solver instead).
+        Tries unbucketed blueprints first (*_unbucketed.npz), then falls
+        back to regular bucketed blueprints. The unbucketed lookup is
+        faster at runtime (no equity computation for hand matching).
+
+        Both BlueprintLookupUnbucketed and BlueprintLookup expose the
+        same get_strategy() interface, so downstream code works unchanged.
+
+        Returns a dict mapping street (1,2,3) -> lookup instance or None.
+        If neither module is available or files don't exist, that street
+        maps to None (will use real-time solver instead).
         """
         blueprints = {}
-        if not _BLUEPRINT_AVAILABLE:
+
+        if not _BLUEPRINT_AVAILABLE and not _BLUEPRINT_UNBUCKETED_AVAILABLE:
             return blueprints
 
         data_dir = os.path.join(_dir, "data")
         for street, filename in _BLUEPRINT_FILES.items():
-            filepath = os.path.join(data_dir, filename)
-            if os.path.exists(filepath):
-                try:
-                    blueprints[street] = BlueprintLookup(
-                        filepath, equity_engine=self.engine
-                    )
-                except Exception:
-                    # File exists but failed to load — skip silently
-                    blueprints[street] = None
-            else:
-                blueprints[street] = None
+            loaded = None
+
+            # Try unbucketed first (*_unbucketed.npz)
+            if _BLUEPRINT_UNBUCKETED_AVAILABLE:
+                base, ext = os.path.splitext(filename)
+                unbucketed_path = os.path.join(data_dir, f"{base}_unbucketed{ext}")
+                if os.path.exists(unbucketed_path):
+                    try:
+                        loaded = BlueprintLookupUnbucketed(
+                            unbucketed_path, equity_engine=self.engine
+                        )
+                    except Exception:
+                        loaded = None
+
+            # Fall back to regular file (works for both bucketed and
+            # unbucketed .npz since BlueprintLookupUnbucketed auto-detects)
+            if loaded is None:
+                filepath = os.path.join(data_dir, filename)
+                if os.path.exists(filepath):
+                    # Prefer unbucketed loader (handles both formats)
+                    if _BLUEPRINT_UNBUCKETED_AVAILABLE:
+                        try:
+                            loaded = BlueprintLookupUnbucketed(
+                                filepath, equity_engine=self.engine
+                            )
+                        except Exception:
+                            loaded = None
+
+                    # Fall back to original bucketed-only loader
+                    if loaded is None and _BLUEPRINT_AVAILABLE:
+                        try:
+                            loaded = BlueprintLookup(
+                                filepath, equity_engine=self.engine
+                            )
+                        except Exception:
+                            loaded = None
+
+            blueprints[street] = loaded
 
         return blueprints
 
@@ -234,7 +279,34 @@ class PlayerAgent(Agent):
         opp_bet = observation["opp_bet"]
         continue_cost = opp_bet - my_bet
 
-        # Try precomputed GTO strategy
+        # The preflop tree was solved with max raise=30, but the game
+        # allows bets up to 100. When facing a large bet, the tree's
+        # node matching rounds to the nearest node and produces wrong
+        # fold frequencies (nearly 0% fold). Handle large bets directly
+        # using hand potential percentile.
+        if continue_cost > 20 and valid_actions[FOLD]:
+            potential = self._preflop_potential(my_cards)
+            if potential is None:
+                potential = 0.5
+
+            # Potential distribution: median=0.84, range 0.52-0.95.
+            # Scale threshold with stack commitment to fold weak hands:
+            # cost=25: threshold≈0.81 (fold ~30%)
+            # cost=40: threshold≈0.83 (fold ~40%)
+            # cost=60: threshold≈0.84 (fold ~51%)
+            # cost=80: threshold≈0.86 (fold ~66%)
+            # cost=98: threshold≈0.88 (fold ~77%)
+            commit_frac = min(continue_cost / 100.0, 0.98)
+            threshold = 0.79 + 0.09 * commit_frac
+
+            if potential < threshold:
+                return (FOLD, 0, 0, 0)
+
+            # Strong enough to continue — call, don't re-escalate
+            if valid_actions[CALL]:
+                return (CALL, 0, 0, 0)
+
+        # Try precomputed GTO strategy (reliable for small bets ≤30)
         bucket = self._get_preflop_bucket(my_cards)
         node_id = self._find_preflop_node(observation)
 
@@ -276,7 +348,7 @@ class PlayerAgent(Agent):
                             return (CALL, 0, 0, 0)
                         return (CHECK, 0, 0, 0)
 
-        # Fallback: pot odds
+        # Fallback: pot odds with adjusted threshold for large bets
         potential = self._preflop_potential(my_cards)
         if potential is None:
             potential = 0.5
@@ -285,8 +357,12 @@ class PlayerAgent(Agent):
             if continue_cost <= 1:
                 return (CALL, 0, 0, 0)
             pot_size = self._get_pot_size(observation)
+            # Raw pot odds underestimate the threshold because
+            # preflop "potential" doesn't account for opponent range
+            # narrowing when they raise. Add a margin.
             required_equity = continue_cost / (continue_cost + pot_size)
-            if potential >= required_equity:
+            margin = 0.08 * min(continue_cost / 30.0, 1.0)
+            if potential >= required_equity + margin:
                 return (CALL, 0, 0, 0)
             return (FOLD, 0, 0, 0)
 
@@ -426,6 +502,14 @@ class PlayerAgent(Agent):
         """Post-flop decision: try blueprint first, then CFR solver."""
         dead_cards = my_discards + opp_discards
 
+        # Ensure opponent range weights are computed. When we're BB
+        # (first to discard), observe() receives stale data and never
+        # fires the inference. Compute it here if needed.
+        if len(opp_discards) == 3 and self._opp_weights is None:
+            self._opp_weights = self.inference.infer_opponent_weights(
+                opp_discards, board, my_cards
+            )
+
         # Try blueprint strategy first
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
@@ -436,11 +520,30 @@ class PlayerAgent(Agent):
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
         max_raise = observation["max_raise"]
+        valid_actions = observation["valid_actions"]
 
-        # Post-flop: BB acts first. We are BB when blind_position == 1.
-        blind_pos = self._get_blind_position(observation)
-        hero_first = (blind_pos == 1)  # BB acts first post-flop
+        # The one-hand solver can't range-balance: it overbets weak hands
+        # as "bluffs" because it doesn't model our full range. When facing
+        # a bet with low equity, fold/call directly based on pot odds
+        # instead of letting the solver bluff-raise.
+        if opp_bet > my_bet:
+            continue_cost = opp_bet - my_bet
+            pot_size = my_bet + opp_bet
+            equity = self.engine.compute_equity(
+                my_cards, board, dead_cards, self._opp_weights)
+            pot_odds = continue_cost / (continue_cost + pot_size)
+            # Margin for opponent range narrowing when they bet
+            bet_frac = continue_cost / max(pot_size, 1)
+            margin = 0.10 + 0.10 * min(bet_frac, 1.0)
 
+            if equity < pot_odds + margin:
+                if valid_actions[FOLD]:
+                    return (FOLD, 0, 0, 0)
+                if valid_actions[CALL]:
+                    return (CALL, 0, 0, 0)
+
+        # hero_is_first=True: hero is always the one deciding right now.
+        # The bets already reflect all prior actions on this street.
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
@@ -451,8 +554,8 @@ class PlayerAgent(Agent):
             street=observation["street"],
             min_raise=observation["min_raise"],
             max_raise=max_raise,
-            valid_actions=observation["valid_actions"],
-            hero_is_first=hero_first,
+            valid_actions=valid_actions,
+            hero_is_first=True,
             time_remaining=observation.get("time_left", 400),
         )
 
@@ -463,6 +566,27 @@ class PlayerAgent(Agent):
     def act(self, observation, reward, terminated, truncated, info):
         hand_number = info.get("hand_number", 0)
         self._reset_hand(hand_number)
+
+        # Track bankroll for lead protection
+        if reward != 0:
+            self._bankroll += reward
+
+        # Lead protection: if we're ahead by enough to fold the rest
+        # and still win, just fold/check everything. Binary tournament
+        # format means winning by 1 chip = winning by 1000.
+        hands_remaining = self._total_hands - hand_number
+        blind_cost = hands_remaining * 1.5  # avg cost of folding every hand
+        if self._bankroll > blind_cost + 10:
+            valid_actions = observation["valid_actions"]
+            if valid_actions[CHECK]:
+                return (CHECK, 0, 0, 0)
+            if valid_actions[FOLD]:
+                return (FOLD, 0, 0, 0)
+            # Must discard — still pick the best cards
+            if valid_actions[DISCARD]:
+                my_cards, board, opp_discards, my_discards = self._parse_cards(observation)
+                return self._handle_discard(observation, my_cards, board, opp_discards)
+            return (FOLD, 0, 0, 0)
 
         my_cards, board, opp_discards, my_discards = self._parse_cards(observation)
         valid_actions = observation["valid_actions"]
@@ -478,6 +602,9 @@ class PlayerAgent(Agent):
     def observe(self, observation, reward, terminated, truncated, info):
         hand_number = info.get("hand_number", 0)
         self._reset_hand(hand_number)
+
+        if reward != 0:
+            self._bankroll += reward
 
         opp_discards = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_discards) == 3 and self._opp_weights is None:

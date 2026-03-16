@@ -30,9 +30,9 @@ MAX_BET = 100
 SB_BLIND = 1
 BB_BLIND = 2
 
-# Raise levels capped at 30. Going all-in preflop is -EV in this variant:
-# you have 5 cards, don't know the board, can't decide which 2 to keep.
-RAISE_LEVELS = [2, 4, 8, 16, 30]
+# Full raise levels up to all-in (100). Models the complete preflop game
+# so the strategy properly handles 3-bets, 4-bets, and all-in decisions.
+RAISE_LEVELS = [2, 4, 8, 16, 30, 60, 100]
 # Actions: FOLD=0, CALL=1, RAISE_0=2, RAISE_1=3, RAISE_2=4, RAISE_3=5
 N_ACTIONS = 2 + len(RAISE_LEVELS)  # fold, call, + each raise level
 ACT_FOLD = 0
