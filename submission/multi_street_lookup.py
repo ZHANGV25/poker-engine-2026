@@ -86,11 +86,12 @@ class MultiStreetLookup:
 
         # Check for compact merged file (single or split format)
         compact_path = os.path.join(dir_path, "blueprint_v7.npz")
+        split_a = os.path.join(dir_path, "bp_a.npz")
         split_flop = os.path.join(dir_path, "blueprint_v7_flop.npz")
         if os.path.isfile(compact_path):
             self._load_compact_merged(compact_path)
             return
-        if os.path.isfile(split_flop):
+        if os.path.isfile(split_a) or os.path.isfile(split_flop):
             self._load_compact_split(dir_path)
             return
 
@@ -198,20 +199,19 @@ class MultiStreetLookup:
         self._loaded = True
 
     def _load_compact_split(self, dir_path):
-        """Load from split files (blueprint_v7_flop.npz + blueprint_v7_turn.npz)."""
-        import tempfile
-        flop_data = np.load(os.path.join(dir_path, "blueprint_v7_flop.npz"), allow_pickle=True)
-        turn_path = os.path.join(dir_path, "blueprint_v7_turn.npz")
-        turn_data = np.load(turn_path, allow_pickle=True) if os.path.isfile(turn_path) else None
-
-        # Merge into one dict and delegate to compact loader
-        merged = {k: flop_data[k] for k in flop_data.files}
-        if turn_data is not None:
-            for k in turn_data.files:
-                merged[k] = turn_data[k]
-
-        # Write temp merged file and load (reuses existing loader)
-        # Actually, just call _load_compact_merged_from_dict directly
+        """Load from split files (bp_a/b/c1/c2/d.npz or blueprint_v7_flop/turn.npz)."""
+        merged = {}
+        # Load all bp_*.npz or blueprint_v7_*.npz files and merge keys
+        import glob
+        for pattern in ["bp_*.npz", "blueprint_v7_*.npz"]:
+            for fpath in sorted(glob.glob(os.path.join(dir_path, pattern))):
+                data = np.load(fpath, allow_pickle=True)
+                for k in data.files:
+                    if k in merged:
+                        # Concatenate split arrays (e.g., turn_strategies split by board)
+                        merged[k] = np.concatenate([merged[k], data[k]], axis=0)
+                    else:
+                        merged[k] = data[k]
         self._load_compact_merged_dict(merged)
 
     def _load_compact_merged(self, fpath):
