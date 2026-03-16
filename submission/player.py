@@ -1,9 +1,15 @@
 """
 Competitive poker bot for CMU DSC Poker Bot Competition 2026.
 
-Clean version: multi-street blueprint ONLY. No fallbacks.
-If the blueprint doesn't cover a situation, we fold/check.
-This gives clean signal on blueprint quality.
+Strategy hierarchy:
+    1. Lead protection (fold/check when winning by enough)
+    2. Preflop: precomputed GTO strategy tree
+    3. Discard: best keep-pair by exact equity with Bayesian inference
+    4. Postflop:
+       a. Multi-street blueprint (backward induction, flop-aware)
+       b. Single-street blueprint (unbucketed or bucketed)
+       c. Range solver (river) or one-hand solver (flop/turn) as fallback
+       d. Opponent range narrowing when facing bets
 """
 
 import os
@@ -19,17 +25,40 @@ from gym_env import PokerEnv
 
 from equity import ExactEquityEngine
 from inference import DiscardInference
-from multi_street_lookup import MultiStreetLookup
+from solver import SubgameSolver
+from range_solver import RangeSolver
 from game_tree import (
     ACT_FOLD, ACT_CHECK, ACT_CALL,
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
 )
+
+# Graceful imports for optional modules
+try:
+    from multi_street_lookup import MultiStreetLookup
+    _MULTI_STREET_AVAILABLE = True
+except Exception:
+    _MULTI_STREET_AVAILABLE = False
+
+try:
+    from blueprint_lookup_unbucketed import BlueprintLookupUnbucketed
+    _BLUEPRINT_UNBUCKETED_AVAILABLE = True
+except Exception:
+    _BLUEPRINT_UNBUCKETED_AVAILABLE = False
+
+try:
+    from blueprint_lookup import BlueprintLookup
+    _BLUEPRINT_AVAILABLE = True
+except Exception:
+    _BLUEPRINT_AVAILABLE = False
 
 FOLD = PokerEnv.ActionType.FOLD.value
 RAISE = PokerEnv.ActionType.RAISE.value
 CALL = PokerEnv.ActionType.CALL.value
 CHECK = PokerEnv.ActionType.CHECK.value
 DISCARD = PokerEnv.ActionType.DISCARD.value
+
+_BLUEPRINT_FILES = {1: "flop_blueprint.npz", 2: "turn_blueprint.npz",
+                    3: "river_blueprint.npz"}
 
 _POT_FRACTIONS = {
     ACT_RAISE_HALF: 0.40, ACT_RAISE_POT: 0.70,
@@ -43,17 +72,14 @@ class PlayerAgent(Agent):
 
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)
+        self.solver = SubgameSolver(self.engine)
+        self.range_solver = RangeSolver(self.engine)
 
-        # Preflop
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
-
-        # Multi-street blueprint (the ONLY postflop strategy)
         self._multi_street = self._load_multi_street()
-        if self._multi_street is None:
-            raise RuntimeError("Multi-street blueprint not found! Cannot run without it.")
+        self._blueprints = self._load_blueprints()
 
-        # Per-hand state
         self._current_hand = -1
         self._opp_weights = None
         self._bankroll = 0
@@ -63,7 +89,7 @@ class PlayerAgent(Agent):
         return "PlayerAgent"
 
     # ----------------------------------------------------------------
-    #  INIT
+    #  INIT HELPERS
     # ----------------------------------------------------------------
 
     def _load_preflop_table(self):
@@ -95,19 +121,53 @@ class PlayerAgent(Agent):
         }
 
     def _load_multi_street(self):
+        """Load multi-street backward-induction blueprint."""
+        if not _MULTI_STREET_AVAILABLE:
+            return None
         data_dir = os.path.join(_dir, "data", "multi_street")
-        if os.path.isdir(data_dir):
-            try:
-                return MultiStreetLookup(data_dir, equity_engine=self.engine)
-            except Exception:
-                pass
-        merged = os.path.join(_dir, "data", "multi_street_blueprint.npz")
-        if os.path.isfile(merged):
-            try:
-                return MultiStreetLookup(merged, equity_engine=self.engine)
-            except Exception:
-                pass
-        return None
+        if not os.path.isdir(data_dir):
+            # Try single merged file
+            merged = os.path.join(_dir, "data", "multi_street_blueprint.npz")
+            if os.path.isfile(merged):
+                try:
+                    return MultiStreetLookup(merged, equity_engine=self.engine)
+                except Exception:
+                    return None
+            return None
+        try:
+            return MultiStreetLookup(data_dir, equity_engine=self.engine)
+        except Exception:
+            return None
+
+    def _load_blueprints(self):
+        """Load single-street blueprint files (fallback after multi-street)."""
+        blueprints = {}
+        if not _BLUEPRINT_AVAILABLE and not _BLUEPRINT_UNBUCKETED_AVAILABLE:
+            return blueprints
+
+        data_dir = os.path.join(_dir, "data")
+        for street, filename in _BLUEPRINT_FILES.items():
+            loaded = None
+            if _BLUEPRINT_UNBUCKETED_AVAILABLE:
+                base, ext = os.path.splitext(filename)
+                for candidate in [f"{base}_unbucketed{ext}", filename]:
+                    fpath = os.path.join(data_dir, candidate)
+                    if os.path.exists(fpath):
+                        try:
+                            loaded = BlueprintLookupUnbucketed(
+                                fpath, equity_engine=self.engine)
+                            break
+                        except Exception:
+                            pass
+            if loaded is None and _BLUEPRINT_AVAILABLE:
+                fpath = os.path.join(data_dir, filename)
+                if os.path.exists(fpath):
+                    try:
+                        loaded = BlueprintLookup(fpath, equity_engine=self.engine)
+                    except Exception:
+                        pass
+            blueprints[street] = loaded
+        return blueprints
 
     # ----------------------------------------------------------------
     #  UTILITY
@@ -136,14 +196,17 @@ class PlayerAgent(Agent):
         if self._preflop_strategy is None:
             return None
         ps = self._preflop_strategy
-        my_bet, opp_bet = observation["my_bet"], observation["opp_bet"]
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
         blind_pos = observation.get("blind_position", 0)
         bet_sb = my_bet if blind_pos == 0 else opp_bet
         bet_bb = my_bet if blind_pos == 1 else opp_bet
 
         best_nid, best_dist = None, float('inf')
         for nid in range(len(ps['node_players'])):
-            if ps['node_players'][nid] != blind_pos or ps['node_players'][nid] == -1:
+            if ps['node_players'][nid] != blind_pos:
+                continue
+            if ps['node_players'][nid] == -1:
                 continue
             d = abs(ps['node_bet_sb'][nid] - bet_sb) + abs(ps['node_bet_bb'][nid] - bet_bb)
             if d == 0:
@@ -164,6 +227,9 @@ class PlayerAgent(Agent):
         opp_d = [c for c in observation["opp_discarded_cards"] if c != -1]
         my_d = [c for c in observation["my_discarded_cards"] if c != -1]
         return my, board, opp_d, my_d
+
+    def _pot_size(self, obs):
+        return obs.get("pot_size", obs["my_bet"] + obs["opp_bet"])
 
     # ----------------------------------------------------------------
     #  DISCARD
@@ -226,19 +292,20 @@ class PlayerAgent(Agent):
             cost = opp_bet - my_bet
             if cost <= 1:
                 return (CALL, 0, 0, 0)
-            pot = observation.get("pot_size", my_bet + opp_bet)
+            pot = self._pot_size(observation)
             if potential >= cost / (cost + pot):
                 return (CALL, 0, 0, 0)
             return (FOLD, 0, 0, 0)
         return (CHECK, 0, 0, 0) if valid[CHECK] else (FOLD, 0, 0, 0)
 
     # ----------------------------------------------------------------
-    #  POSTFLOP — multi-street blueprint ONLY
+    #  POSTFLOP
     # ----------------------------------------------------------------
 
     def _blueprint_to_engine(self, action_type, observation):
+        """Map abstract blueprint action to concrete engine action."""
         valid = observation["valid_actions"]
-        pot = observation.get("pot_size", observation["my_bet"] + observation["opp_bet"])
+        pot = self._pot_size(observation)
         min_r, max_r = observation["min_raise"], observation["max_raise"]
 
         if action_type == ACT_FOLD:
@@ -259,45 +326,147 @@ class PlayerAgent(Agent):
                 (CHECK, 0, 0, 0) if valid[CHECK] else None)
         return None
 
-    def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Pure multi-street blueprint. No fallbacks."""
+    def _try_strategy(self, strategy, observation):
+        """Sample from a strategy dict and return an engine action, or None."""
+        if not strategy:
+            return None
+        probs = list(strategy.values())
+        if len(probs) > 2 and max(probs) - min(probs) < 0.05:
+            return None  # unconverged
+
+        facing_bet = observation["opp_bet"] > observation["my_bet"]
+        if facing_bet and (ACT_FOLD not in strategy or strategy[ACT_FOLD] < 0.001):
+            return None  # wrong node
+
+        aids = list(strategy.keys())
+        p = np.array([strategy[a] for a in aids])
+        p /= p.sum()
+        chosen = int(np.random.choice(aids, p=p))
+        return self._blueprint_to_engine(chosen, observation)
+
+    def _narrow_range_by_bet(self, my_bet, opp_bet, board, dead_cards):
+        """Narrow opponent range based on bet-to-pot ratio."""
+        if self._opp_weights is None:
+            return
+        raise_amt = opp_bet - my_bet
+        pot_before = my_bet * 2
+        if raise_amt <= 0 or pot_before <= 0:
+            return
+
+        ratio = raise_amt / max(pot_before, 1)
+        if ratio <= 0.5:
+            keep = 0.85
+        elif ratio <= 1.0:
+            keep = 0.70
+        elif ratio <= 3.0:
+            keep = 0.50
+        else:
+            keep = 0.30
+
+        board_set = set(board)
+        strengths = {}
+        for pair in self._opp_weights:
+            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
+                continue
+            try:
+                if len(board) >= 5:
+                    r = self.engine.lookup_seven(list(pair) + list(board))
+                elif len(board) >= 3:
+                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
+                else:
+                    r = 999999
+            except Exception:
+                r = 999999
+            strengths[pair] = r
+
+        if not strengths:
+            return
+        ranked = sorted(strengths.items(), key=lambda x: x[1])
+        cutoff = int(len(ranked) * keep)
+        if cutoff < len(ranked):
+            for hand, _ in ranked[cutoff:]:
+                self._opp_weights[hand] = 0.0
+
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
+    def _handle_postflop(self, observation, my_cards, board,
+                         opp_discards, my_discards, info):
+        """Postflop decision with multi-street blueprint priority.
+
+        Priority:
+            1. Compute/narrow opponent range
+            2. Multi-street blueprint (backward induction, best quality)
+            3. Single-street blueprint
+            4. Range solver (river) or one-hand solver (flop/turn)
+        """
         dead = my_discards + opp_discards
+        my_bet, opp_bet = observation["my_bet"], observation["opp_bet"]
+        street = observation["street"]
+        valid = observation["valid_actions"]
+        time_left = observation.get("time_left", 400)
 
         # Opponent range inference
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards)
 
-        # Multi-street blueprint lookup
-        pot_state = (observation["my_bet"], observation["opp_bet"])
-        strategy = self._multi_street.get_strategy(
-            my_cards, board, pot_state=pot_state)
+        # Narrow range on bet/raise
+        if opp_bet > my_bet and self._opp_weights is not None:
+            self._narrow_range_by_bet(my_bet, opp_bet, board, dead)
 
-        if strategy:
-            # Check validity
-            probs = list(strategy.values())
-            facing_bet = observation["opp_bet"] > observation["my_bet"]
+        pot_state = (my_bet, opp_bet)
 
-            # Skip unconverged
-            if len(probs) > 2 and max(probs) - min(probs) < 0.05:
-                strategy = None
+        # 1. Multi-street blueprint (flop only -- it was trained for flop)
+        if street == 1 and self._multi_street is not None:
+            try:
+                strat = self._multi_street.get_strategy(
+                    my_cards, board, pot_state=pot_state)
+                action = self._try_strategy(strat, observation)
+                if action is not None:
+                    return action
+            except Exception:
+                pass
 
-            # Skip wrong node (facing bet but no fold)
-            if strategy and facing_bet:
-                if ACT_FOLD not in strategy or strategy[ACT_FOLD] < 0.001:
-                    strategy = None
+        # 2. Single-street blueprint
+        bp = self._blueprints.get(street)
+        if bp is not None:
+            try:
+                strat = bp.get_strategy(
+                    hero_cards=my_cards, board=board, pot_state=pot_state,
+                    dead_cards=dead, opp_weights=self._opp_weights)
+                action = self._try_strategy(strat, observation)
+                if action is not None:
+                    return action
+            except Exception:
+                pass
 
-        if strategy:
-            aids = list(strategy.keys())
-            p = np.array([strategy[a] for a in aids])
-            p /= p.sum()
-            chosen = int(np.random.choice(aids, p=p))
-            action = self._blueprint_to_engine(chosen, observation)
+        # 3. Range solver (river, when time permits)
+        if street == 3 and self._opp_weights and time_left > 500:
+            action = self.range_solver.solve_and_act(
+                hero_cards=my_cards, board=board,
+                opp_range=self._opp_weights, dead_cards=dead,
+                my_bet=my_bet, opp_bet=opp_bet, street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid, time_remaining=time_left)
             if action is not None:
                 return action
 
-        # NO FALLBACK — just check or fold
-        valid = observation["valid_actions"]
+        # 4. One-hand solver (fallback)
+        if time_left > 30:
+            return self.solver.solve_and_act(
+                hero_cards=my_cards, board=board,
+                opp_range=self._opp_weights, dead_cards=dead,
+                my_bet=my_bet, opp_bet=opp_bet, street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid, hero_is_first=True,
+                time_remaining=time_left)
+
+        # 5. Emergency: check/fold
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
         return (FOLD, 0, 0, 0)
