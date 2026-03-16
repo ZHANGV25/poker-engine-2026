@@ -630,12 +630,14 @@ class PlayerAgent(Agent):
             range_equity = self.engine.compute_equity(
                 my_cards, board, dead_cards, self._opp_weights)
 
-            # Facing a bet: fold if equity below pot odds
+            # Facing a bet: fold if equity clearly below pot odds.
+            # Small buffer (5%) because range narrowing may overcorrect
+            # against opponents who bet wider than the blueprint predicts.
             if opp_bet > my_bet:
                 continue_cost = opp_bet - my_bet
                 pot_size = my_bet + opp_bet
                 pot_odds = continue_cost / (continue_cost + pot_size)
-                if range_equity < pot_odds:
+                if range_equity < pot_odds - 0.05:
                     valid_actions = observation["valid_actions"]
                     if valid_actions[FOLD]:
                         return (FOLD, 0, 0, 0)
