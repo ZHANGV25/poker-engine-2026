@@ -342,19 +342,6 @@ class PlayerAgent(Agent):
                         raise_amount = raise_to - opp_bet
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
-
-                        # Don't allow large preflop raises with weak hands.
-                        # GTO includes small-frequency bluff-shoves, but these
-                        # are exploitable against calling stations and are likely
-                        # CFR noise at 1000 iterations.
-                        if raise_amount > 20:
-                            potential = self._preflop_potential(my_cards)
-                            if potential is not None and potential < 0.88:
-                                # Not a premium hand — just call instead
-                                if valid_actions[CALL]:
-                                    return (CALL, 0, 0, 0)
-                                return (CHECK, 0, 0, 0)
-
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:
