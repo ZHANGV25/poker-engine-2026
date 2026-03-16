@@ -510,6 +510,26 @@ class PlayerAgent(Agent):
                 opp_discards, board, my_cards
             )
 
+        # Equity guard BEFORE blueprint: when facing a large bet relative
+        # to the pot, the opponent's range is polarized toward strong hands.
+        # The blueprint doesn't model opponent betting patterns — it assumes
+        # the full range. Override with equity check for extreme bet sizes.
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        if opp_bet > my_bet:
+            continue_cost = opp_bet - my_bet
+            pot_size = my_bet + opp_bet
+            bet_to_pot = continue_cost / max(my_bet * 2, 1)  # bet relative to prior pot
+            if bet_to_pot > 3.0:  # overbet > 3x pot (e.g. 98 into 4)
+                equity = self.engine.compute_equity(
+                    my_cards, board, dead_cards, self._opp_weights)
+                pot_odds = continue_cost / (continue_cost + pot_size)
+                # Large overbets mean very strong range — need high equity
+                if equity < pot_odds + 0.15:
+                    valid_actions = observation["valid_actions"]
+                    if valid_actions[FOLD]:
+                        return (FOLD, 0, 0, 0)
+
         # Try blueprint strategy first
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
