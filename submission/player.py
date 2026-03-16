@@ -609,25 +609,40 @@ class PlayerAgent(Agent):
                     self._narrow_range_from_action(
                         'check', board, dead_cards, (my_bet, opp_bet), street)
 
-        # When facing a bet, compute equity against the NARROWED range.
-        # If equity is below pot odds, fold regardless of what the blueprint
-        # says — the blueprint was solved against the full range, not the
-        # narrowed range that accounts for opponent's betting line.
-        if opp_bet > my_bet and self._opp_weights is not None:
-            continue_cost = opp_bet - my_bet
-            pot_size = my_bet + opp_bet
-            equity = self.engine.compute_equity(
+        # Compute equity against the NARROWED range.
+        # Use this to override blueprint decisions that don't account
+        # for opponent's betting line.
+        range_equity = None
+        if self._opp_weights is not None:
+            range_equity = self.engine.compute_equity(
                 my_cards, board, dead_cards, self._opp_weights)
-            pot_odds = continue_cost / (continue_cost + pot_size)
 
-            if equity < pot_odds:
-                valid_actions = observation["valid_actions"]
-                if valid_actions[FOLD]:
-                    return (FOLD, 0, 0, 0)
+            # Facing a bet: fold if equity below pot odds
+            if opp_bet > my_bet:
+                continue_cost = opp_bet - my_bet
+                pot_size = my_bet + opp_bet
+                pot_odds = continue_cost / (continue_cost + pot_size)
+                if range_equity < pot_odds:
+                    valid_actions = observation["valid_actions"]
+                    if valid_actions[FOLD]:
+                        return (FOLD, 0, 0, 0)
 
         # Try blueprint strategy
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
+            # Cap raises when equity against narrowed range is marginal.
+            # Blueprint raises are range-balanced (raises with strong AND
+            # weak hands). But if OUR specific hand has low equity against
+            # the narrowed opponent range, raising builds a pot we'll lose.
+            if range_equity is not None and blueprint_action[0] == RAISE:
+                if range_equity < 0.55:
+                    # Marginal hand — don't escalate, just call or check
+                    valid_actions = observation["valid_actions"]
+                    if opp_bet > my_bet and valid_actions[CALL]:
+                        return (CALL, 0, 0, 0)
+                    if valid_actions[CHECK]:
+                        return (CHECK, 0, 0, 0)
+                    # If we can't check or call, use the blueprint action
             return blueprint_action
 
         # Fall back to real-time CFR solver
