@@ -343,6 +343,17 @@ class PlayerAgent(Agent):
                         raise_amount = raise_to - opp_bet
                         raise_amount = max(raise_amount, observation["min_raise"])
                         raise_amount = min(raise_amount, observation["max_raise"])
+
+                        # Cap large raises to premium hands only.
+                        # Low-frequency bluff-shoves from 1000-iteration CFR
+                        # are likely noise, not converged equilibrium.
+                        if raise_amount > 20:
+                            potential = self._preflop_potential(my_cards)
+                            if potential is not None and potential < 0.88:
+                                if valid_actions[CALL]:
+                                    return (CALL, 0, 0, 0)
+                                return (CHECK, 0, 0, 0)
+
                         if raise_amount > 0 and valid_actions[RAISE]:
                             return (RAISE, raise_amount, 0, 0)
                         if valid_actions[CALL]:
