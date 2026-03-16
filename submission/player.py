@@ -470,14 +470,93 @@ class PlayerAgent(Agent):
         return None
 
 
-    def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Postflop decision: pot-geometry fold check + blueprint + river range solver.
+    def _narrow_range_by_bet(self, my_bet, opp_bet, board, dead_cards):
+        """Narrow opponent range when they bet/raise.
 
-        Three layers:
-        1. Fold check: when facing a bet, fold if equity < pot_odds + margin.
-           Margin scales with bet size (pot geometry, no blueprint dependency).
-        2. River range solver: re-solves with full hero range for balanced play.
-        3. Blueprint: precomputed range-balanced strategy for flop/turn.
+        Uses hand-strength percentile: a large bet is only rational with
+        strong hands, so filter to the top X% of the range by hand rank.
+        Scales with bet-to-pot ratio — bigger bet = tighter range.
+
+        This is the approach from the 80% win rate GTO+ version.
+        """
+        if self._opp_weights is None:
+            return
+
+        raise_amount = opp_bet - my_bet
+        pot_before = my_bet * 2  # pot before opponent raised
+
+        if raise_amount <= 0 or pot_before <= 0:
+            return
+
+        bet_to_pot = raise_amount / max(pot_before, 1)
+
+        # Scale narrowing with bet size
+        if bet_to_pot <= 0.5:
+            keep_fraction = 0.85  # small bet: keep top 85%
+        elif bet_to_pot <= 1.0:
+            keep_fraction = 0.70  # pot-sized: keep top 70%
+        elif bet_to_pot <= 3.0:
+            keep_fraction = 0.50  # overbet: keep top 50%
+        else:
+            keep_fraction = 0.30  # massive overbet: keep top 30%
+
+        # Rank each opponent hand by strength on the current board
+        hand_strengths = {}
+        board_3 = list(board[:3]) if len(board) >= 3 else list(board)
+        for opp_pair in self._opp_weights:
+            if self._opp_weights[opp_pair] <= 0:
+                continue
+            # Use 5-card rank on flop, 7-card on turn/river
+            if len(board) <= 3:
+                cards = list(opp_pair) + board_3
+                if len(cards) == 5:
+                    rank = self.engine.lookup_five(cards)
+                else:
+                    rank = 999999
+            else:
+                cards = list(opp_pair) + list(board)
+                if len(cards) == 6:
+                    # Turn: use best 5 of 6
+                    rank = min(self.engine.lookup_five(list(opp_pair) + list(board[:3])),
+                              self.engine.lookup_five(list(opp_pair) + [board[0], board[1], board[3]]),
+                              self.engine.lookup_five(list(opp_pair) + [board[0], board[2], board[3]]),
+                              self.engine.lookup_five(list(opp_pair) + [board[1], board[2], board[3]]))
+                elif len(cards) == 7:
+                    rank = self.engine.lookup_seven(cards)
+                else:
+                    rank = 999999
+            hand_strengths[opp_pair] = rank  # lower = stronger
+
+        if not hand_strengths:
+            return
+
+        # Sort by strength, keep top fraction
+        sorted_hands = sorted(hand_strengths.items(), key=lambda x: x[1])
+        n = len(sorted_hands)
+        cutoff = int(n * keep_fraction)
+
+        if cutoff < n:
+            for hand, _ in sorted_hands[cutoff:]:
+                self._opp_weights[hand] = 0.0
+
+        # Renormalize
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
+    def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
+        """Postflop: real-time solver with narrowed opponent range.
+
+        Primary path (80% win rate architecture):
+        1. Narrow opponent range based on their bet size
+        2. River: range solver (full hero range, range-balanced)
+        3. Flop/Turn: one-hand solver with narrowed range
+        4. Fallback: blueprint (time pressure only)
+
+        The solver adapts to the narrowed range — it folds more against
+        strong ranges and bets more against weak ranges. This is what
+        gives us pot-size control that blueprints can't.
         """
         dead_cards = my_discards + opp_discards
         my_bet = observation["my_bet"]
@@ -492,33 +571,11 @@ class PlayerAgent(Agent):
                 opp_discards, board, my_cards
             )
 
-        # --- Layer 1: Pot-geometry fold check ---
-        # When facing a bet, fold if equity is below pot odds + margin.
-        # Margin scales with bet-to-pot ratio: bigger bets = stronger range.
-        # Pure math, no blueprint dependency, no overcorrection.
-        if opp_bet > my_bet and valid_actions[FOLD]:
-            continue_cost = opp_bet - my_bet
-            pot_before_bet = my_bet * 2  # pot before opponent bet
-            pot_size = my_bet + opp_bet
-            pot_odds = continue_cost / (continue_cost + pot_size)
+        # Narrow opponent range when they bet/raise
+        if opp_bet > my_bet and self._opp_weights is not None:
+            self._narrow_range_by_bet(my_bet, opp_bet, board, dead_cards)
 
-            if pot_before_bet > 0:
-                bet_ratio = continue_cost / pot_before_bet
-            else:
-                bet_ratio = continue_cost  # huge overbet into nothing
-
-            # Margin: 2.5% for half-pot bet, 5% for pot bet, 15% cap for massive overbets
-            margin = min(0.05 * bet_ratio, 0.15)
-
-            equity = self.engine.compute_equity(
-                my_cards, board, dead_cards, self._opp_weights)
-
-            if equity < pot_odds + margin:
-                return (FOLD, 0, 0, 0)
-
-        # --- Layer 2: River range solver ---
-        # Re-solves with full hero range against raw opponent weights.
-        # Produces range-balanced strategies adapted to current pot/bets.
+        # River: use range solver (range-balanced, ~111ms)
         if street == 3 and self._opp_weights is not None and time_left > 100:
             range_action = self.range_solver.solve_and_act(
                 hero_cards=my_cards,
@@ -536,16 +593,33 @@ class PlayerAgent(Agent):
             if range_action is not None:
                 return range_action
 
-        # --- Layer 3: Blueprint ---
+        # Flop/Turn: one-hand solver with narrowed range (~90ms)
+        if self._opp_weights is not None and time_left > 50:
+            return self.solver.solve_and_act(
+                hero_cards=my_cards,
+                board=board,
+                opp_range=self._opp_weights,
+                dead_cards=dead_cards,
+                my_bet=my_bet,
+                opp_bet=opp_bet,
+                street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid_actions,
+                hero_is_first=True,
+                time_remaining=time_left,
+            )
+
+        # Fallback: blueprint (only under time pressure)
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
-        # Fall back to one-hand solver
+        # Last resort: one-hand solver without range
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
-            opp_range=self._opp_weights,
+            opp_range=None,
             dead_cards=dead_cards,
             my_bet=my_bet,
             opp_bet=opp_bet,
