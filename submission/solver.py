@@ -80,14 +80,14 @@ class SubgameSolver:
         n_opp = len(opp_hands)
 
         # Choose iteration count based on time remaining.
-        # Budget: 500s for 1000 hands = 0.5s/hand. Each hand has ~4 decisions.
-        # Target: <100ms per solver call. ARM64 is ~1.5x slower than Apple Silicon.
-        if time_remaining > 300:
-            iterations = 150
-        elif time_remaining > 150:
-            iterations = 90
+        # ARM64 1-vCPU is ~5-10x slower than Apple Silicon.
+        # Target: <50ms per solver call on ARM64.
+        if time_remaining > 500:
+            iterations = 75
+        elif time_remaining > 200:
+            iterations = 50
         elif time_remaining > 50:
-            iterations = 45
+            iterations = 30
         else:
             # Critical: fall back to thresholds entirely
             return self._fallback(hero_cards, board, dead_cards,

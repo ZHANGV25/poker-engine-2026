@@ -95,13 +95,13 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Choose iterations based on time
+        # Choose iterations based on time (ARM64 is slow)
         if time_remaining > 500:
-            iterations = 200
-        elif time_remaining > 200:
             iterations = 100
-        else:
+        elif time_remaining > 200:
             iterations = 50
+        else:
+            iterations = 25
 
         # Build game tree
         max_bet = 100

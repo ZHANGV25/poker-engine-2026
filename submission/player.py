@@ -593,8 +593,10 @@ class PlayerAgent(Agent):
             if range_action is not None:
                 return range_action
 
-        # Flop/Turn: one-hand solver with narrowed range (~90ms)
-        if self._opp_weights is not None and time_left > 50:
+        # Flop/Turn facing a bet: solver with narrowed range
+        # Only use solver when facing a bet (where narrowing matters).
+        # For check/bet decisions (equal bets), blueprint is fine.
+        if opp_bet > my_bet and self._opp_weights is not None and time_left > 50:
             return self.solver.solve_and_act(
                 hero_cards=my_cards,
                 board=board,
@@ -610,16 +612,16 @@ class PlayerAgent(Agent):
                 time_remaining=time_left,
             )
 
-        # Fallback: blueprint (only under time pressure)
+        # Check/bet decisions or time pressure: use blueprint
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
-        # Last resort: one-hand solver without range
+        # Last resort: solver
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
-            opp_range=None,
+            opp_range=self._opp_weights,
             dead_cards=dead_cards,
             my_bet=my_bet,
             opp_bet=opp_bet,
