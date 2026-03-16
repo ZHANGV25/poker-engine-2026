@@ -24,6 +24,169 @@ import os
 import time
 import numpy as np
 
+try:
+    import numba
+    @numba.njit(cache=True)
+    def _cfr_walk_numba(node_id, sb_b, bb_b, sb_reach, bb_reach,
+                         player, terminal_type, bet_sb, bet_bb,
+                         children, valid_mask, equity_matrix,
+                         regrets, strat_sum, n_actions):
+        """Numba-compiled CFR tree walk. Returns SB utility."""
+        # Terminal
+        tt = terminal_type[node_id]
+        if tt > 0:
+            if tt == 1:  # fold_by_sb
+                return -bet_sb[node_id]
+            elif tt == 2:  # fold_by_bb
+                return bet_bb[node_id]
+            elif tt == 3:  # showdown
+                pot = min(bet_sb[node_id], bet_bb[node_id])
+                eq = equity_matrix[sb_b, bb_b]
+                return (2.0 * eq - 1.0) * pot
+            return 0.0
+
+        p = player[node_id]
+        bucket = sb_b if p == 0 else bb_b
+
+        # Regret matching
+        strategy = np.zeros(n_actions, dtype=np.float64)
+        pos_sum = 0.0
+        n_valid = 0
+        for a in range(n_actions):
+            if valid_mask[node_id, a]:
+                v = max(0.0, regrets[node_id, bucket, a])
+                strategy[a] = v
+                pos_sum += v
+                n_valid += 1
+
+        if pos_sum > 0:
+            for a in range(n_actions):
+                strategy[a] /= pos_sum
+        else:
+            for a in range(n_actions):
+                if valid_mask[node_id, a]:
+                    strategy[a] = 1.0 / n_valid
+
+        # Traverse children
+        node_util = 0.0
+        action_utils = np.zeros(n_actions, dtype=np.float64)
+        for a in range(n_actions):
+            if not valid_mask[node_id, a]:
+                continue
+            child = children[node_id, a]
+            if p == 0:
+                action_utils[a] = _cfr_walk_numba(
+                    child, sb_b, bb_b, sb_reach * strategy[a], bb_reach,
+                    player, terminal_type, bet_sb, bet_bb,
+                    children, valid_mask, equity_matrix,
+                    regrets, strat_sum, n_actions)
+            else:
+                action_utils[a] = _cfr_walk_numba(
+                    child, sb_b, bb_b, sb_reach, bb_reach * strategy[a],
+                    player, terminal_type, bet_sb, bet_bb,
+                    children, valid_mask, equity_matrix,
+                    regrets, strat_sum, n_actions)
+            node_util += strategy[a] * action_utils[a]
+
+        # Update regrets
+        opp_reach = bb_reach if p == 0 else sb_reach
+        sign = 1.0 if p == 0 else -1.0
+        for a in range(n_actions):
+            if valid_mask[node_id, a]:
+                r = sign * (action_utils[a] - node_util) * opp_reach
+                regrets[node_id, bucket, a] = max(0.0, regrets[node_id, bucket, a] + r)
+
+        # Update strategy sum
+        my_reach = sb_reach if p == 0 else bb_reach
+        for a in range(n_actions):
+            strat_sum[node_id, bucket, a] += my_reach * strategy[a]
+
+        return node_util
+
+    @numba.njit(cache=True)
+    def _run_preflop_cfr(root, n_nodes, n_buckets, n_actions, iterations,
+                          player, terminal_type, bet_sb, bet_bb,
+                          children, valid_mask, equity_matrix,
+                          regrets, strat_sum):
+        for t in range(iterations):
+            for sb_b in range(n_buckets):
+                for bb_b in range(n_buckets):
+                    _cfr_walk_numba(root, sb_b, bb_b, 1.0, 1.0,
+                                    player, terminal_type, bet_sb, bet_bb,
+                                    children, valid_mask, equity_matrix,
+                                    regrets, strat_sum, n_actions)
+
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+    def _run_preflop_cfr(root, n_nodes, n_buckets, n_actions, iterations,
+                          player, terminal_type, bet_sb, bet_bb,
+                          children, valid_mask, equity_matrix,
+                          regrets, strat_sum):
+        """Pure Python fallback."""
+        for t in range(iterations):
+            if t % 100 == 0:
+                print(f"  CFR iteration {t}/{iterations}", flush=True)
+            for sb_b in range(n_buckets):
+                for bb_b in range(n_buckets):
+                    _cfr_walk_python(root, sb_b, bb_b, 1.0, 1.0,
+                                     player, terminal_type, bet_sb, bet_bb,
+                                     children, valid_mask, equity_matrix,
+                                     regrets, strat_sum, n_actions)
+
+    def _cfr_walk_python(node_id, sb_b, bb_b, sb_reach, bb_reach,
+                          player, terminal_type, bet_sb, bet_bb,
+                          children, valid_mask, equity_matrix,
+                          regrets, strat_sum, n_actions):
+        tt = terminal_type[node_id]
+        if tt > 0:
+            if tt == 1: return -bet_sb[node_id]
+            elif tt == 2: return bet_bb[node_id]
+            elif tt == 3:
+                pot = min(bet_sb[node_id], bet_bb[node_id])
+                return (2.0 * equity_matrix[sb_b, bb_b] - 1.0) * pot
+            return 0.0
+
+        p = player[node_id]
+        bucket = sb_b if p == 0 else bb_b
+        strategy = np.zeros(n_actions)
+        pos_sum = 0.0
+        n_valid = 0
+        for a in range(n_actions):
+            if valid_mask[node_id, a]:
+                v = max(0.0, regrets[node_id, bucket, a])
+                strategy[a] = v
+                pos_sum += v
+                n_valid += 1
+        if pos_sum > 0:
+            strategy /= pos_sum
+        else:
+            for a in range(n_actions):
+                if valid_mask[node_id, a]:
+                    strategy[a] = 1.0 / n_valid
+
+        node_util = 0.0
+        action_utils = np.zeros(n_actions)
+        for a in range(n_actions):
+            if not valid_mask[node_id, a]: continue
+            child = children[node_id, a]
+            if p == 0:
+                action_utils[a] = _cfr_walk_python(child, sb_b, bb_b, sb_reach*strategy[a], bb_reach, player, terminal_type, bet_sb, bet_bb, children, valid_mask, equity_matrix, regrets, strat_sum, n_actions)
+            else:
+                action_utils[a] = _cfr_walk_python(child, sb_b, bb_b, sb_reach, bb_reach*strategy[a], player, terminal_type, bet_sb, bet_bb, children, valid_mask, equity_matrix, regrets, strat_sum, n_actions)
+            node_util += strategy[a] * action_utils[a]
+
+        opp_reach = bb_reach if p == 0 else sb_reach
+        sign = 1.0 if p == 0 else -1.0
+        for a in range(n_actions):
+            if valid_mask[node_id, a]:
+                regrets[node_id, bucket, a] = max(0.0, regrets[node_id, bucket, a] + sign*(action_utils[a]-node_util)*opp_reach)
+        my_reach = sb_reach if p == 0 else bb_reach
+        for a in range(n_actions):
+            strat_sum[node_id, bucket, a] += my_reach * strategy[a]
+        return node_util
+
 N_BUCKETS = 50        # hand potential buckets
 CFR_ITERATIONS = 5000
 MAX_BET = 100
@@ -219,109 +382,57 @@ def compute_equity_matrix(n_buckets, preflop_table):
     return equity
 
 
+def _flatten_preflop_tree(nodes):
+    """Flatten tree to numpy arrays for fast iteration."""
+    n = len(nodes)
+    player = np.full(n, -1, dtype=np.int8)
+    terminal_type = np.zeros(n, dtype=np.int8)  # 0=none, 1=fold_sb, 2=fold_bb, 3=showdown
+    bet_sb = np.zeros(n, dtype=np.float64)
+    bet_bb = np.zeros(n, dtype=np.float64)
+    n_actions = np.zeros(n, dtype=np.int32)
+    children = np.full((n, N_ACTIONS), -1, dtype=np.int32)
+    valid_mask = np.zeros((n, N_ACTIONS), dtype=np.bool_)
+
+    for i, node in enumerate(nodes):
+        player[i] = node['player']
+        bet_sb[i] = node['bet_sb']
+        bet_bb[i] = node['bet_bb']
+        if node['terminal'] == 'fold_by_sb':
+            terminal_type[i] = 1
+        elif node['terminal'] == 'fold_by_bb':
+            terminal_type[i] = 2
+        elif node['terminal'] == 'showdown':
+            terminal_type[i] = 3
+        na = 0
+        for a, child_id in node['children'].items():
+            children[i, a] = child_id
+            valid_mask[i, a] = True
+            na += 1
+        n_actions[i] = na
+
+    return player, terminal_type, bet_sb, bet_bb, children, valid_mask, n_actions
+
+
 def solve_cfr(nodes, root, n_buckets, equity_matrix, iterations):
-    """Run CFR over the game tree for all bucket pairs.
-
-    Hero can be SB or BB. We solve for BOTH simultaneously.
-    regrets[node_id][bucket][action] for each player.
-    """
+    """Run CFR using flattened tree for speed."""
     n_nodes = len(nodes)
+    player, terminal_type, bet_sb_arr, bet_bb_arr, children, valid_mask, n_act = \
+        _flatten_preflop_tree(nodes)
 
-    # Identify decision nodes per player
-    sb_nodes = [i for i, n in enumerate(nodes) if n['player'] == 0]
-    bb_nodes = [i for i, n in enumerate(nodes) if n['player'] == 1]
-
-    # Regrets and strategy sums
-    # Indexed by [node_id, bucket, action]
     regrets = np.zeros((n_nodes, n_buckets, N_ACTIONS), dtype=np.float64)
     strat_sum = np.zeros((n_nodes, n_buckets, N_ACTIONS), dtype=np.float64)
 
-    def get_strategy(node_id, bucket):
-        r = regrets[node_id, bucket]
-        valid = list(nodes[node_id]['children'].keys())
-        pos = np.maximum(r, 0)
-        for a in range(N_ACTIONS):
-            if a not in valid:
-                pos[a] = 0
-        total = pos.sum()
-        if total > 0:
-            return pos / total
-        s = np.zeros(N_ACTIONS)
-        for a in valid:
-            s[a] = 1.0 / len(valid)
-        return s
+    # Precompute terminal values for each (sb_bucket, bb_bucket) pair
+    # at each terminal node
+    terminal_ids = [i for i in range(n_nodes) if terminal_type[i] > 0]
 
-    def cfr_walk(node_id, sb_bucket, bb_bucket, sb_reach, bb_reach):
-        """Walk the tree, return utility for SB."""
-        node = nodes[node_id]
-
-        # Terminal
-        if node['terminal'] is not None:
-            bet_sb = node['bet_sb']
-            bet_bb = node['bet_bb']
-            pot_won = min(bet_sb, bet_bb)
-
-            if node['terminal'] == 'fold_by_sb':
-                return -bet_sb  # SB loses their bet
-            elif node['terminal'] == 'fold_by_bb':
-                return bet_bb  # SB wins BB's bet
-            elif node['terminal'] == 'showdown':
-                eq = equity_matrix[sb_bucket, bb_bucket]
-                return eq * pot_won - (1 - eq) * pot_won
-            return 0
-
-        player = node['player']
-        bucket = sb_bucket if player == 0 else bb_bucket
-        strategy = get_strategy(node_id, bucket)
-
-        valid_actions = list(node['children'].keys())
-        action_utils = {}
-        node_util = 0.0
-
-        for a in valid_actions:
-            child_id = node['children'][a]
-            if player == 0:
-                action_utils[a] = cfr_walk(child_id, sb_bucket, bb_bucket,
-                                           sb_reach * strategy[a], bb_reach)
-            else:
-                action_utils[a] = cfr_walk(child_id, sb_bucket, bb_bucket,
-                                           sb_reach, bb_reach * strategy[a])
-            node_util += strategy[a] * action_utils[a]
-
-        # Update regrets
-        opp_reach = bb_reach if player == 0 else sb_reach
-        sign = 1.0 if player == 0 else -1.0  # SB utility; BB is negative
-
-        for a in valid_actions:
-            regret = sign * (action_utils[a] - node_util) * opp_reach
-            regrets[node_id, bucket, a] = max(0, regrets[node_id, bucket, a] + regret)
-
-        # Update strategy sum
-        my_reach = sb_reach if player == 0 else bb_reach
-        strat_sum[node_id, bucket] += my_reach * strategy
-
-        return node_util
-
-    # Run CFR iterations
-    # For each iteration, sample all bucket pairs
-    # (with 30 buckets, that's 900 pairs — fast)
-    import time as _time
-    _cfr_start = _time.time()
-    for t in range(iterations):
-        if t % 100 == 0:
-            elapsed = _time.time() - _cfr_start
-            rate = (t + 1) / elapsed if elapsed > 0 else 0
-            remaining = (iterations - t) / rate if rate > 0 else 0
-            print(f"  CFR iteration {t}/{iterations} ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)", flush=True)
-
-        for sb_b in range(n_buckets):
-            for bb_b in range(n_buckets):
-                # Weight by probability of this matchup
-                # (uniform for simplicity)
-                cfr_walk(root, sb_b, bb_b, 1.0, 1.0)
+    # Run iterations
+    _run_preflop_cfr(root, n_nodes, n_buckets, N_ACTIONS, iterations,
+                     player, terminal_type, bet_sb_arr, bet_bb_arr,
+                     children, valid_mask, equity_matrix,
+                     regrets, strat_sum)
 
     # Extract average strategies
-    # For each node and bucket, normalize strategy_sum
     avg_strats = np.zeros_like(strat_sum)
     for nid in range(n_nodes):
         for b in range(n_buckets):

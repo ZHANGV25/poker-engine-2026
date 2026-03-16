@@ -85,6 +85,12 @@ class PlayerAgent(Agent):
         self._bankroll = 0
         self._total_hands = 1000
 
+        # Decision path counters (for verifying no fallbacks fire)
+        self._path_counts = {
+            'ms_flop': 0, 'ms_turn': 0, 'range_solver': 0,
+            'ss_blueprint': 0, 'one_hand_solver': 0, 'emergency': 0,
+        }
+
     def __name__(self):
         return "PlayerAgent"
 
@@ -431,6 +437,7 @@ class PlayerAgent(Agent):
                     my_cards, board, pot_state=pot_state)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
+                    self._path_counts['ms_flop'] += 1
                     return action
             except Exception:
                 pass
@@ -442,6 +449,7 @@ class PlayerAgent(Agent):
                     my_cards, board, pot_state=pot_state)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
+                    self._path_counts['ms_turn'] += 1
                     return action
             except Exception:
                 pass
@@ -456,9 +464,10 @@ class PlayerAgent(Agent):
                 max_raise=observation["max_raise"],
                 valid_actions=valid, time_remaining=time_left)
             if action is not None:
+                self._path_counts['range_solver'] += 1
                 return action
 
-        # 4. Single-street blueprint (fallback for any street)
+        # 4. Single-street blueprint (FALLBACK — should not fire if above work)
         bp = self._blueprints.get(street)
         if bp is not None:
             try:
@@ -467,12 +476,14 @@ class PlayerAgent(Agent):
                     dead_cards=dead, opp_weights=self._opp_weights)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
+                    self._path_counts['ss_blueprint'] += 1
                     return action
             except Exception:
                 pass
 
-        # 5. One-hand solver (last resort)
+        # 5. One-hand solver (FALLBACK — should not fire)
         if time_left > 30:
+            self._path_counts['one_hand_solver'] += 1
             return self.solver.solve_and_act(
                 hero_cards=my_cards, board=board,
                 opp_range=self._opp_weights, dead_cards=dead,
@@ -482,7 +493,8 @@ class PlayerAgent(Agent):
                 valid_actions=valid, hero_is_first=True,
                 time_remaining=time_left)
 
-        # 6. Emergency: check/fold
+        # 6. Emergency: check/fold (FALLBACK — should NEVER fire)
+        self._path_counts['emergency'] += 1
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
         return (FOLD, 0, 0, 0)
