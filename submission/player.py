@@ -469,118 +469,92 @@ class PlayerAgent(Agent):
         # Unknown action type — signal fallback
         return None
 
-    def _narrow_range_from_action(self, opp_action_type, board, dead_cards,
-                                   pot_state, street):
-        """Narrow opponent range based on their betting action.
-
-        Uses the blueprint to determine which opponent hands would take
-        this action. Fast path: finds cluster once, batch-reads strategies
-        for all hands from the raw array (~1ms total).
-        """
-        if self._opp_weights is None:
-            return
-
-        blueprint = self._blueprints.get(street)
-        if blueprint is None:
-            return
-
-        # Fast path for unbucketed blueprints: batch array read
-        if hasattr(blueprint, '_unbucketed') and blueprint._unbucketed:
-            try:
-                cluster_id = blueprint._find_nearest_cluster(board)
-                if cluster_id is None:
-                    return
-                cluster_idx = blueprint._cluster_to_idx[cluster_id]
-                pot_idx = blueprint._find_nearest_pot(pot_state)
-                my_bet, opp_bet = pot_state
-                node_idx = blueprint._find_node_for_state(my_bet, opp_bet, pot_idx)
-
-                # Read ALL hand strategies at this node in one array slice
-                strats = blueprint.strategies[cluster_idx, pot_idx, :, node_idx, :]
-                acts = blueprint.action_types[cluster_idx, pot_idx, node_idx, :]
-                hand_list = blueprint.hand_lists[cluster_idx]
-
-                # Identify which action indices correspond to the observed action
-                bet_action_ids = set()
-                check_action_ids = set()
-                for ai, act in enumerate(acts):
-                    if act in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
-                        bet_action_ids.add(ai)
-                    elif act in (ACT_CHECK, ACT_CALL):
-                        check_action_ids.add(ai)
-
-                new_weights = {}
-                for hi in range(len(hand_list)):
-                    hand_tuple = tuple(sorted(hand_list[hi].tolist()))
-                    old_weight = self._opp_weights.get(hand_tuple, 0.0)
-                    if old_weight < 0.001:
-                        continue
-
-                    s = strats[hi].astype(float)
-                    total_s = s.sum()
-                    if total_s <= 0:
-                        new_weights[hand_tuple] = old_weight
-                        continue
-                    s /= total_s
-
-                    if opp_action_type == 'bet':
-                        action_prob = sum(s[ai] for ai in bet_action_ids)
-                    elif opp_action_type == 'check':
-                        action_prob = sum(s[ai] for ai in check_action_ids)
-                    elif opp_action_type == 'call':
-                        action_prob = sum(s[ai] for ai in check_action_ids)
-                    else:
-                        action_prob = 1.0
-
-                    new_weights[hand_tuple] = old_weight * max(action_prob, 0.01)
-
-                total = sum(new_weights.values())
-                if total > 0:
-                    for k in new_weights:
-                        new_weights[k] /= total
-                    self._opp_weights = new_weights
-            except Exception:
-                pass
-            return
-
-        # Bucketed blueprints: skip range narrowing (too imprecise)
-        return
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
-        """Pure GTO postflop: play the blueprint strategy as-is.
+        """Postflop decision: pot-geometry fold check + blueprint + river range solver.
 
-        No range narrowing, no equity overrides, no heuristics.
-        The blueprint was solved at Nash equilibrium with full-range CFR.
-        Playing it straight is unexploitable.
+        Three layers:
+        1. Fold check: when facing a bet, fold if equity < pot_odds + margin.
+           Margin scales with bet size (pot geometry, no blueprint dependency).
+        2. River range solver: re-solves with full hero range for balanced play.
+        3. Blueprint: precomputed range-balanced strategy for flop/turn.
         """
         dead_cards = my_discards + opp_discards
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        street = observation["street"]
+        valid_actions = observation["valid_actions"]
+        time_left = observation.get("time_left", 400)
 
-        # Ensure opponent range weights are computed (used by blueprint
-        # for equity bucketing on bucketed fallback paths)
+        # Ensure opponent range weights are computed
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards
             )
 
-        # Play the blueprint
+        # --- Layer 1: Pot-geometry fold check ---
+        # When facing a bet, fold if equity is below pot odds + margin.
+        # Margin scales with bet-to-pot ratio: bigger bets = stronger range.
+        # Pure math, no blueprint dependency, no overcorrection.
+        if opp_bet > my_bet and valid_actions[FOLD]:
+            continue_cost = opp_bet - my_bet
+            pot_before_bet = my_bet * 2  # pot before opponent bet
+            pot_size = my_bet + opp_bet
+            pot_odds = continue_cost / (continue_cost + pot_size)
+
+            if pot_before_bet > 0:
+                bet_ratio = continue_cost / pot_before_bet
+            else:
+                bet_ratio = continue_cost  # huge overbet into nothing
+
+            # Margin: 2.5% for half-pot bet, 5% for pot bet, 15% cap for massive overbets
+            margin = min(0.05 * bet_ratio, 0.15)
+
+            equity = self.engine.compute_equity(
+                my_cards, board, dead_cards, self._opp_weights)
+
+            if equity < pot_odds + margin:
+                return (FOLD, 0, 0, 0)
+
+        # --- Layer 2: River range solver ---
+        # Re-solves with full hero range against raw opponent weights.
+        # Produces range-balanced strategies adapted to current pot/bets.
+        if street == 3 and self._opp_weights is not None and time_left > 100:
+            range_action = self.range_solver.solve_and_act(
+                hero_cards=my_cards,
+                board=board,
+                opp_range=self._opp_weights,
+                dead_cards=dead_cards,
+                my_bet=my_bet,
+                opp_bet=opp_bet,
+                street=street,
+                min_raise=observation["min_raise"],
+                max_raise=observation["max_raise"],
+                valid_actions=valid_actions,
+                time_remaining=time_left,
+            )
+            if range_action is not None:
+                return range_action
+
+        # --- Layer 3: Blueprint ---
         blueprint_action = self._try_blueprint(observation, my_cards, board, dead_cards)
         if blueprint_action is not None:
             return blueprint_action
 
-        # Fall back to one-hand solver (only when blueprint has no coverage)
+        # Fall back to one-hand solver
         return self.solver.solve_and_act(
             hero_cards=my_cards,
             board=board,
             opp_range=self._opp_weights,
             dead_cards=dead_cards,
-            my_bet=observation["my_bet"],
-            opp_bet=observation["opp_bet"],
-            street=observation["street"],
+            my_bet=my_bet,
+            opp_bet=opp_bet,
+            street=street,
             min_raise=observation["min_raise"],
             max_raise=observation["max_raise"],
-            valid_actions=observation["valid_actions"],
+            valid_actions=valid_actions,
             hero_is_first=True,
-            time_remaining=observation.get("time_left", 400),
+            time_remaining=time_left,
         )
 
     # ----------------------------------------------------------------
