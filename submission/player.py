@@ -500,31 +500,24 @@ class PlayerAgent(Agent):
         else:
             keep_fraction = 0.30  # massive overbet: keep top 30%
 
-        # Rank each opponent hand by strength on the current board
+        # Rank each opponent hand by equity against us (fast, uses existing engine)
         hand_strengths = {}
-        board_3 = list(board[:3]) if len(board) >= 3 else list(board)
+        board_set = set(board)
         for opp_pair in self._opp_weights:
             if self._opp_weights[opp_pair] <= 0:
                 continue
-            # Use 5-card rank on flop, 7-card on turn/river
-            if len(board) <= 3:
-                cards = list(opp_pair) + board_3
-                if len(cards) == 5:
-                    rank = self.engine.lookup_five(cards)
+            # Skip hands that overlap with the board
+            if set(opp_pair) & board_set:
+                continue
+            try:
+                if len(board) >= 5:
+                    rank = self.engine.lookup_seven(list(opp_pair) + list(board))
+                elif len(board) >= 3:
+                    rank = self.engine.lookup_five(list(opp_pair) + list(board[:3]))
                 else:
                     rank = 999999
-            else:
-                cards = list(opp_pair) + list(board)
-                if len(cards) == 6:
-                    # Turn: use best 5 of 6
-                    rank = min(self.engine.lookup_five(list(opp_pair) + list(board[:3])),
-                              self.engine.lookup_five(list(opp_pair) + [board[0], board[1], board[3]]),
-                              self.engine.lookup_five(list(opp_pair) + [board[0], board[2], board[3]]),
-                              self.engine.lookup_five(list(opp_pair) + [board[1], board[2], board[3]]))
-                elif len(cards) == 7:
-                    rank = self.engine.lookup_seven(cards)
-                else:
-                    rank = 999999
+            except (KeyError, Exception):
+                rank = 999999
             hand_strengths[opp_pair] = rank  # lower = stronger
 
         if not hand_strengths:
@@ -575,8 +568,8 @@ class PlayerAgent(Agent):
         if opp_bet > my_bet and self._opp_weights is not None:
             self._narrow_range_by_bet(my_bet, opp_bet, board, dead_cards)
 
-        # River: use range solver (range-balanced, ~111ms)
-        if street == 3 and self._opp_weights is not None and time_left > 100:
+        # River: use range solver (range-balanced) — only if plenty of time
+        if street == 3 and self._opp_weights is not None and time_left > 500:
             range_action = self.range_solver.solve_and_act(
                 hero_cards=my_cards,
                 board=board,
@@ -593,10 +586,13 @@ class PlayerAgent(Agent):
             if range_action is not None:
                 return range_action
 
-        # Flop/Turn facing a bet: solver with narrowed range
-        # Only use solver when facing a bet (where narrowing matters).
-        # For check/bet decisions (equal bets), blueprint is fine.
-        if opp_bet > my_bet and self._opp_weights is not None and time_left > 50:
+        # Flop/Turn facing a SIGNIFICANT bet: solver with narrowed range.
+        # Only worth the compute cost for bets > 25% pot (small probes
+        # don't narrow the range enough to justify solver time).
+        continue_cost = opp_bet - my_bet
+        pot_size = my_bet + opp_bet
+        significant_bet = continue_cost > 0 and continue_cost > pot_size * 0.15
+        if significant_bet and self._opp_weights is not None and time_left > 50:
             return self.solver.solve_and_act(
                 hero_cards=my_cards,
                 board=board,

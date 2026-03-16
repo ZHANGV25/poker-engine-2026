@@ -83,11 +83,11 @@ class SubgameSolver:
         # ARM64 1-vCPU is ~5-10x slower than Apple Silicon.
         # Target: <50ms per solver call on ARM64.
         if time_remaining > 500:
-            iterations = 75
+            iterations = 25
         elif time_remaining > 200:
-            iterations = 50
+            iterations = 15
         elif time_remaining > 50:
-            iterations = 30
+            iterations = 10
         else:
             # Critical: fall back to thresholds entirely
             return self._fallback(hero_cards, board, dead_cards,
