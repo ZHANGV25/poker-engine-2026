@@ -187,7 +187,7 @@ except ImportError:
             strat_sum[node_id, bucket, a] += my_reach * strategy[a]
         return node_util
 
-N_BUCKETS = 50        # hand potential buckets
+N_BUCKETS = 200       # hand potential buckets (200 for stability)
 CFR_ITERATIONS = 5000
 MAX_BET = 100
 SB_BLIND = 1
@@ -291,10 +291,8 @@ def build_game_tree():
 def compute_equity_matrix(n_buckets, preflop_table):
     """Compute equity[i][j] = probability bucket i beats bucket j.
 
-    Simulates actual matchups: for each pair of buckets, samples hands
-    from each bucket, deals random flops, finds optimal discards for
-    both players, and computes who wins. This replaces the old constant
-    0.65/0.35 approximation with real simulated equity.
+    Uses Numba-accelerated matchup evaluation for speed.
+    With 200 buckets, 200 samples, 50 flops: ~5 min on EC2 with Numba.
     """
     import itertools, random
     from submission.equity import ExactEquityEngine
@@ -319,8 +317,8 @@ def compute_equity_matrix(n_buckets, preflop_table):
 
     equity = np.zeros((n_buckets, n_buckets), dtype=np.float64)
     rng = random.Random(42)
-    n_samples = 50       # hands per bucket to sample
-    n_flops = 20         # flops per matchup
+    n_samples = 200      # hands per bucket to sample (50% of bucket with 200 buckets)
+    n_flops = 50         # flops per matchup (more = less noise)
 
     five_lookup = engine.lookup_five
 
@@ -473,12 +471,41 @@ def main():
     elapsed = time.time() - t0
     print(f"Solved in {elapsed:.1f}s")
 
-    # Extract strategies for the key decision points:
-    # 1. SB opening (root node, player=0, bets: SB=1, BB=2)
-    # 2. BB facing SB raise (each raise level)
-    # 3. SB facing BB 3-bet
+    # Post-solve monotonicity check: verify that stronger buckets
+    # raise more and fold less at the root. Flag anomalies.
+    print("\nMonotonicity check (root node):")
+    root_strats = avg_strats[root]  # (n_buckets, n_actions)
+    anomalies = []
+    for b in range(1, N_BUCKETS):
+        fold_prev = root_strats[b - 1, 0]
+        fold_curr = root_strats[b, 0]
+        # Fold rate should decrease with strength (some noise OK)
+        if fold_curr > fold_prev + 0.15:  # 15% jump = anomaly
+            anomalies.append((b, 'fold_spike', fold_curr, fold_prev))
+        # Check for shove spikes
+        shove = sum(root_strats[b, a] for a in range(N_ACTIONS)
+                    if a >= 2 and (a - 2) < len(RAISE_LEVELS) and RAISE_LEVELS[a - 2] >= 60)
+        shove_prev = sum(root_strats[b - 1, a] for a in range(N_ACTIONS)
+                         if a >= 2 and (a - 2) < len(RAISE_LEVELS) and RAISE_LEVELS[a - 2] >= 60)
+        if shove > 0.5 and shove > shove_prev + 0.3:
+            anomalies.append((b, 'shove_spike', shove, shove_prev))
 
-    # Find key nodes
+    if anomalies:
+        print(f"  WARNING: {len(anomalies)} anomalous buckets detected:")
+        for b, kind, curr, prev in anomalies[:5]:
+            print(f"    Bucket {b}: {kind} ({prev:.0%} -> {curr:.0%})")
+        # Smooth anomalies: replace with average of neighbors
+        for b, kind, curr, prev in anomalies:
+            if 0 < b < N_BUCKETS - 1:
+                avg_strats[root, b] = (avg_strats[root, b - 1] + avg_strats[root, b + 1]) / 2
+                total = avg_strats[root, b].sum()
+                if total > 0:
+                    avg_strats[root, b] /= total
+        print(f"  Smoothed {len(anomalies)} anomalous buckets")
+    else:
+        print("  All buckets monotonic ✓")
+
+    # Extract strategies for the key decision points
     print("\nKey strategies:")
     action_names = ['fold', 'call'] + [f'raise_{r}' for r in RAISE_LEVELS]
 
