@@ -502,71 +502,77 @@ class PlayerAgent(Agent):
         """Narrow opponent range based on their betting action.
 
         Uses the blueprint to determine which opponent hands would take
-        this action. Hands that wouldn't take this action get their
-        weight reduced. This is nested subgame solving — the opponent's
-        betting tells us about their range.
-
-        Args:
-            opp_action_type: 'bet', 'check', or 'raise'
-            board: list of community cards
-            dead_cards: list of dead cards
-            pot_state: (hero_bet, opp_bet) before opponent's action
-            street: 1-3
+        this action. Fast path: finds cluster once, batch-reads strategies
+        for all hands from the raw array (~1ms total).
         """
         if self._opp_weights is None:
             return
 
         blueprint = self._blueprints.get(street)
-        if blueprint is None or not hasattr(blueprint, '_unbucketed') or not blueprint._unbucketed:
+        if blueprint is None:
             return
 
-        known = set(board) | set(dead_cards)
-        remaining = [c for c in range(27) if c not in known]
-
-        import itertools
-        new_weights = {}
-
-        for hand in itertools.combinations(remaining, 2):
-            hand_tuple = tuple(sorted(hand))
-            old_weight = self._opp_weights.get(hand_tuple, 0.0)
-            if old_weight < 0.001:
-                continue
-
-            # Look up what the blueprint says this opp hand would do
+        # Fast path for unbucketed blueprints: batch array read
+        if hasattr(blueprint, '_unbucketed') and blueprint._unbucketed:
             try:
-                opp_strat = blueprint.get_strategy(
-                    hero_cards=list(hand), board=board,
-                    pot_state=pot_state, dead_cards=dead_cards)
+                cluster_id = blueprint._find_nearest_cluster(board)
+                if cluster_id is None:
+                    return
+                cluster_idx = blueprint._cluster_to_idx[cluster_id]
+                pot_idx = blueprint._find_nearest_pot(pot_state)
+                my_bet, opp_bet = pot_state
+                node_idx = blueprint._find_node_for_state(my_bet, opp_bet, pot_idx)
+
+                # Read ALL hand strategies at this node in one array slice
+                strats = blueprint.strategies[cluster_idx, pot_idx, :, node_idx, :]
+                acts = blueprint.action_types[cluster_idx, pot_idx, node_idx, :]
+                hand_list = blueprint.hand_lists[cluster_idx]
+
+                # Identify which action indices correspond to the observed action
+                bet_action_ids = set()
+                check_action_ids = set()
+                for ai, act in enumerate(acts):
+                    if act in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
+                        bet_action_ids.add(ai)
+                    elif act in (ACT_CHECK, ACT_CALL):
+                        check_action_ids.add(ai)
+
+                new_weights = {}
+                for hi in range(len(hand_list)):
+                    hand_tuple = tuple(sorted(hand_list[hi].tolist()))
+                    old_weight = self._opp_weights.get(hand_tuple, 0.0)
+                    if old_weight < 0.001:
+                        continue
+
+                    s = strats[hi].astype(float)
+                    total_s = s.sum()
+                    if total_s <= 0:
+                        new_weights[hand_tuple] = old_weight
+                        continue
+                    s /= total_s
+
+                    if opp_action_type == 'bet':
+                        action_prob = sum(s[ai] for ai in bet_action_ids)
+                    elif opp_action_type == 'check':
+                        action_prob = sum(s[ai] for ai in check_action_ids)
+                    elif opp_action_type == 'call':
+                        action_prob = sum(s[ai] for ai in check_action_ids)
+                    else:
+                        action_prob = 1.0
+
+                    new_weights[hand_tuple] = old_weight * max(action_prob, 0.01)
+
+                total = sum(new_weights.values())
+                if total > 0:
+                    for k in new_weights:
+                        new_weights[k] /= total
+                    self._opp_weights = new_weights
             except Exception:
-                new_weights[hand_tuple] = old_weight
-                continue
+                pass
+            return
 
-            if opp_strat is None:
-                new_weights[hand_tuple] = old_weight
-                continue
-
-            # Compute probability that this hand takes the observed action
-            if opp_action_type == 'bet':
-                # Any raise action
-                action_prob = sum(p for a, p in opp_strat.items()
-                                 if a in (ACT_RAISE_HALF, ACT_RAISE_POT,
-                                         ACT_RAISE_ALLIN, ACT_RAISE_OVERBET))
-            elif opp_action_type == 'check':
-                action_prob = opp_strat.get(ACT_CHECK, 0) + opp_strat.get(ACT_CALL, 0)
-            elif opp_action_type == 'call':
-                action_prob = opp_strat.get(ACT_CALL, 0)
-            else:
-                action_prob = 1.0
-
-            # Bayes: P(hand | action) ∝ P(action | hand) * P(hand)
-            new_weights[hand_tuple] = old_weight * max(action_prob, 0.01)
-
-        # Normalize
-        total = sum(new_weights.values())
-        if total > 0:
-            for k in new_weights:
-                new_weights[k] /= total
-            self._opp_weights = new_weights
+        # Bucketed blueprints: skip range narrowing (too imprecise)
+        return
 
     def _handle_postflop(self, observation, my_cards, board, opp_discards, my_discards, info):
         """Post-flop decision with range narrowing.
