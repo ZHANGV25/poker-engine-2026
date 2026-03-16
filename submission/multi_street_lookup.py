@@ -84,10 +84,14 @@ class MultiStreetLookup:
         """
         import glob
 
-        # Check for compact merged file first (single file, fast upload)
+        # Check for compact merged file (single or split format)
         compact_path = os.path.join(dir_path, "blueprint_v7.npz")
+        split_flop = os.path.join(dir_path, "blueprint_v7_flop.npz")
         if os.path.isfile(compact_path):
             self._load_compact_merged(compact_path)
+            return
+        if os.path.isfile(split_flop):
+            self._load_compact_split(dir_path)
             return
 
         files = sorted(glob.glob(os.path.join(dir_path, "board_*.npz")))
@@ -193,13 +197,30 @@ class MultiStreetLookup:
         self._build_all_node_maps()
         self._loaded = True
 
-    def _load_compact_merged(self, fpath):
-        """Load all boards from a compact stacked .npz file.
+    def _load_compact_split(self, dir_path):
+        """Load from split files (blueprint_v7_flop.npz + blueprint_v7_turn.npz)."""
+        import tempfile
+        flop_data = np.load(os.path.join(dir_path, "blueprint_v7_flop.npz"), allow_pickle=True)
+        turn_path = os.path.join(dir_path, "blueprint_v7_turn.npz")
+        turn_data = np.load(turn_path, allow_pickle=True) if os.path.isfile(turn_path) else None
 
-        Arrays are stacked: (n_boards, ...) instead of per-board files.
-        Much faster to load and fewer files to upload.
-        """
+        # Merge into one dict and delegate to compact loader
+        merged = {k: flop_data[k] for k in flop_data.files}
+        if turn_data is not None:
+            for k in turn_data.files:
+                merged[k] = turn_data[k]
+
+        # Write temp merged file and load (reuses existing loader)
+        # Actually, just call _load_compact_merged_from_dict directly
+        self._load_compact_merged_dict(merged)
+
+    def _load_compact_merged(self, fpath):
+        """Load all boards from a compact stacked .npz file."""
         data = np.load(fpath, allow_pickle=True)
+        self._load_compact_merged_dict(data)
+
+    def _load_compact_merged_dict(self, data):
+        """Load all boards from a dict-like object with stacked arrays."""
         board_ids = data['board_ids']
         boards_arr = data['boards']
         features_arr = data['board_features']

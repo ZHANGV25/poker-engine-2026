@@ -183,6 +183,3 @@ blueprint/output_v2/
 fleet_instances.txt
 
 # Large data files (uploaded separately to competition)
-submission/data/*.npz
-submission/data/*.pkl
-submission/data/multi_street/
