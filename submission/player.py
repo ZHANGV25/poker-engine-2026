@@ -422,9 +422,8 @@ class PlayerAgent(Agent):
             3. Single-street blueprint
             4. Range solver (river) or one-hand solver (flop/turn)
         """
-        # Wait for background load if still running
-        if not self._multi_street_loaded and self._load_thread.is_alive():
-            self._load_thread.join()
+        # If background load hasn't finished, skip blueprint (use fallback solvers)
+        # Don't block — the 5s per-action timeout would kill us
 
         dead = my_discards + opp_discards
         my_bet, opp_bet = observation["my_bet"], observation["opp_bet"]
@@ -475,7 +474,8 @@ class PlayerAgent(Agent):
                 pass
 
         # 3. Range solver (river — adapts to narrowed opponent range)
-        if street == 3 and self._opp_weights and time_left > 100:
+        # Only use if enough time (ARM64 is ~10-20x slower than x86)
+        if street == 3 and self._opp_weights and time_left > 200:
             action = self.range_solver.solve_and_act(
                 hero_cards=my_cards, board=board,
                 opp_range=self._opp_weights, dead_cards=dead,

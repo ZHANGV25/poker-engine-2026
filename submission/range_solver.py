@@ -95,13 +95,14 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Choose iterations based on time (ARM64 is slow)
-        if time_remaining > 500:
-            iterations = 100
-        elif time_remaining > 200:
-            iterations = 50
+        # ARM64 (Graviton2) is ~10-20x slower than x86 for Python loops.
+        # Keep iterations low to stay under the 5s per-action timeout.
+        if time_remaining > 800:
+            iterations = 30
+        elif time_remaining > 400:
+            iterations = 15
         else:
-            iterations = 25
+            iterations = 10
 
         # Build game tree
         max_bet = 100
