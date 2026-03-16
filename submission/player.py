@@ -83,6 +83,7 @@ class PlayerAgent(Agent):
         self._current_hand = -1
         self._opp_weights = None
         self._bankroll = 0
+        self._hand_reward = 0  # accumulates within a hand
         self._total_hands = 1000
 
         # Decision path counters (for verifying no fallbacks fire)
@@ -224,6 +225,9 @@ class PlayerAgent(Agent):
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
+            # Apply accumulated reward from previous hand
+            self._bankroll += self._hand_reward
+            self._hand_reward = 0
             self._current_hand = hand_number
             self._opp_weights = None
 
@@ -341,13 +345,6 @@ class PlayerAgent(Agent):
         """Sample from a strategy dict and return an engine action, or None."""
         if not strategy:
             return None
-        probs = list(strategy.values())
-        if len(probs) > 2 and max(probs) - min(probs) < 0.05:
-            return None  # unconverged
-
-        facing_bet = observation["opp_bet"] > observation["my_bet"]
-        if facing_bet and (ACT_FOLD not in strategy or strategy[ACT_FOLD] < 0.001):
-            return None  # wrong node
 
         aids = list(strategy.keys())
         p = np.array([strategy[a] for a in aids])
@@ -430,11 +427,17 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
+        # Determine hero's position: BB acts first postflop, SB acts second
+        # blind_position=0 means SB, blind_position=1 means BB
+        blind_pos = observation.get("blind_position", 0)
+        hero_position = 1 if blind_pos == 0 else 0  # SB=second(1), BB=first(0)
+
         # 1. Multi-street blueprint (flop: backward induction)
         if street == 1 and self._multi_street is not None:
             try:
                 strat = self._multi_street.get_strategy(
-                    my_cards, board, pot_state=pot_state)
+                    my_cards, board, pot_state=pot_state,
+                    hero_position=hero_position)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
                     self._path_counts['ms_flop'] += 1
@@ -446,7 +449,8 @@ class PlayerAgent(Agent):
         if street == 2 and self._multi_street is not None:
             try:
                 strat = self._multi_street.get_turn_strategy(
-                    my_cards, board, pot_state=pot_state)
+                    my_cards, board, pot_state=pot_state,
+                    hero_position=hero_position)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
                     self._path_counts['ms_turn'] += 1
@@ -508,12 +512,14 @@ class PlayerAgent(Agent):
         self._reset_hand(hand_number)
 
         if reward != 0:
-            self._bankroll += reward
+            self._hand_reward += reward
 
-        # Lead protection
+        # Lead protection — if we can survive on blinds alone, fold everything
+        # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
+        actual_bankroll = self._bankroll
         hands_remaining = self._total_hands - hand_number
         blind_cost = hands_remaining * 1.5
-        if self._bankroll > blind_cost + 10:
+        if actual_bankroll > blind_cost + 10:
             valid = observation["valid_actions"]
             if valid[CHECK]:
                 return (CHECK, 0, 0, 0)
@@ -538,7 +544,7 @@ class PlayerAgent(Agent):
         hand_number = info.get("hand_number", 0)
         self._reset_hand(hand_number)
         if reward != 0:
-            self._bankroll += reward
+            self._hand_reward += reward
 
         opp_d = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_d) == 3 and self._opp_weights is None:

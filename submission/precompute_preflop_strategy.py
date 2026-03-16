@@ -288,19 +288,97 @@ def build_game_tree():
     return nodes, 0
 
 
+@numba.njit(cache=True)
+def _equity_matrix_inner(hands_i_arr, hands_j_arr, n_hi, n_hj,
+                         flops_arr, n_flops, five_lookup_arr,
+                         keep_a, keep_b, n_keeps):
+    """Numba-compiled inner loop for equity matrix computation.
+
+    hands_i_arr: (n_hi, 5) int64 — sampled hands from bucket i
+    hands_j_arr: (n_hj, 5) int64 — sampled hands from bucket j
+    flops_arr: (n_flops, 3) int64 — presampled flops
+    five_lookup_arr: flat array indexed by bitmask -> rank
+    keep_a, keep_b: (10,) int64 — keep pair indices
+    """
+    wins = 0.0
+    total = 0.0
+
+    for hi_idx in range(n_hi):
+        hi_mask = 0
+        for c in range(5):
+            hi_mask |= 1 << hands_i_arr[hi_idx, c]
+
+        for hj_idx in range(n_hj):
+            # Check card overlap using bitmasks
+            hj_mask = 0
+            for c in range(5):
+                hj_mask |= 1 << hands_j_arr[hj_idx, c]
+            if hi_mask & hj_mask:
+                continue
+
+            used_mask = hi_mask | hj_mask
+
+            for fi in range(n_flops):
+                # Check flop doesn't overlap with hands
+                f0 = flops_arr[fi, 0]
+                f1 = flops_arr[fi, 1]
+                f2 = flops_arr[fi, 2]
+                flop_mask = (1 << f0) | (1 << f1) | (1 << f2)
+                if flop_mask & used_mask:
+                    continue
+
+                # Best keep for player i
+                best_i = 999999
+                for k in range(n_keeps):
+                    a = keep_a[k]
+                    b = keep_b[k]
+                    m = (1 << hands_i_arr[hi_idx, a]) | (1 << hands_i_arr[hi_idx, b]) | flop_mask
+                    r = five_lookup_arr[m]
+                    if r < best_i:
+                        best_i = r
+
+                # Best keep for player j
+                best_j = 999999
+                for k in range(n_keeps):
+                    a = keep_a[k]
+                    b = keep_b[k]
+                    m = (1 << hands_j_arr[hj_idx, a]) | (1 << hands_j_arr[hj_idx, b]) | flop_mask
+                    r = five_lookup_arr[m]
+                    if r < best_j:
+                        best_j = r
+
+                if best_i < best_j:
+                    wins += 1.0
+                elif best_i == best_j:
+                    wins += 0.5
+                total += 1.0
+
+    return wins, total
+
+
 def compute_equity_matrix(n_buckets, preflop_table):
     """Compute equity[i][j] = probability bucket i beats bucket j.
 
-    Uses Numba-accelerated matchup evaluation for speed.
-    With 200 buckets, 200 samples, 50 flops: ~5 min on EC2 with Numba.
+    Numba-accelerated: ~50-100x faster than pure Python.
+    Symmetric: only computes upper triangle, mirrors to lower.
     """
-    import itertools, random
+    import random
     from submission.equity import ExactEquityEngine
     engine = ExactEquityEngine()
-    KEEP_PAIRS = [(a, b) for a in range(5) for b in range(a + 1, 5)]
+
+    # Build flat five-card lookup array for Numba (indexed by bitmask)
+    max_mask = 1 << 27
+    five_lookup_arr = np.zeros(max_mask, dtype=np.int32)
+    for mask_val, rank in engine._five.items():
+        five_lookup_arr[mask_val] = rank
+
+    # Keep pair indices
+    keep_pairs = [(a, b) for a in range(5) for b in range(a + 1, 5)]
+    keep_a = np.array([k[0] for k in keep_pairs], dtype=np.int64)
+    keep_b = np.array([k[1] for k in keep_pairs], dtype=np.int64)
+    n_keeps = len(keep_pairs)
 
     # Group all hands by bucket
-    all_cards = list(range(27))
     pot_min = min(preflop_table.values())
     pot_max = max(preflop_table.values())
 
@@ -315,12 +393,25 @@ def compute_equity_matrix(n_buckets, preflop_table):
     print(f"  Bucket sizes: min={min(len(b) for b in buckets)}, max={max(len(b) for b in buckets)}, "
           f"avg={sum(len(b) for b in buckets)/n_buckets:.0f}")
 
-    equity = np.zeros((n_buckets, n_buckets), dtype=np.float64)
+    # Presample flops (reused across all bucket pairs)
     rng = random.Random(42)
-    n_samples = 200      # hands per bucket to sample (50% of bucket with 200 buckets)
-    n_flops = 50         # flops per matchup (more = less noise)
+    n_samples = 200
+    n_flops = 200  # more flops since they're cheap with Numba
+    all_cards = list(range(27))
+    flops_arr = np.array([rng.sample(all_cards, 3) for _ in range(n_flops)],
+                         dtype=np.int64)
 
-    five_lookup = engine.lookup_five
+    # Warmup Numba
+    print("  Warming up Numba equity kernel...", end="", flush=True)
+    dummy_h = np.zeros((1, 5), dtype=np.int64)
+    dummy_h[0] = [0, 1, 2, 3, 4]
+    dummy_h2 = np.zeros((1, 5), dtype=np.int64)
+    dummy_h2[0] = [5, 6, 7, 8, 9]
+    _equity_matrix_inner(dummy_h, dummy_h2, 1, 1, flops_arr[:1], 1,
+                         five_lookup_arr, keep_a, keep_b, n_keeps)
+    print(" done", flush=True)
+
+    equity = np.zeros((n_buckets, n_buckets), dtype=np.float64)
 
     import time as _time
     _eq_start = _time.time()
@@ -329,53 +420,35 @@ def compute_equity_matrix(n_buckets, preflop_table):
         rate = (i + 1) / elapsed if elapsed > 0 else 0
         remaining = (n_buckets - i) / rate if rate > 0 else 0
         print(f"  Equity matrix row {i}/{n_buckets} ({elapsed:.0f}s elapsed, ~{remaining:.0f}s remaining)", flush=True)
-        for j in range(n_buckets):
-            if i == j:
-                equity[i][j] = 0.50
+
+        if len(buckets[i]) == 0:
+            equity[i, :] = 0.5
+            equity[:, i] = 0.5
+            continue
+
+        hands_i = rng.sample(buckets[i], min(n_samples, len(buckets[i])))
+        hi_arr = np.array(hands_i, dtype=np.int64).reshape(-1, 5)
+
+        # Only compute upper triangle (j > i), mirror for lower
+        for j in range(i + 1, n_buckets):
+            if len(buckets[j]) == 0:
+                equity[i][j] = 0.5
+                equity[j][i] = 0.5
                 continue
 
-            # Sample hands from each bucket
-            hands_i = rng.sample(buckets[i], min(n_samples, len(buckets[i])))
             hands_j = rng.sample(buckets[j], min(n_samples, len(buckets[j])))
+            hj_arr = np.array(hands_j, dtype=np.int64).reshape(-1, 5)
 
-            wins = 0.0
-            total = 0.0
+            wins, total = _equity_matrix_inner(
+                hi_arr, hj_arr, len(hands_i), len(hands_j),
+                flops_arr, n_flops, five_lookup_arr,
+                keep_a, keep_b, n_keeps)
 
-            for hi in hands_i:
-                hi_set = set(hi)
-                for hj in hands_j:
-                    # Skip if hands share cards
-                    if hi_set & set(hj):
-                        continue
+            eq = wins / total if total > 0 else 0.5
+            equity[i][j] = eq
+            equity[j][i] = 1.0 - eq
 
-                    # Available cards for flop
-                    used = hi_set | set(hj)
-                    available = [c for c in all_cards if c not in used]
-
-                    for _ in range(n_flops):
-                        flop = rng.sample(available, 3)
-
-                        # Best keep for player i
-                        best_i = float('inf')
-                        for a, b in KEEP_PAIRS:
-                            r = five_lookup([hi[a], hi[b]] + flop)
-                            if r < best_i:
-                                best_i = r
-
-                        # Best keep for player j
-                        best_j = float('inf')
-                        for a, b in KEEP_PAIRS:
-                            r = five_lookup([hj[a], hj[b]] + flop)
-                            if r < best_j:
-                                best_j = r
-
-                        if best_i < best_j:
-                            wins += 1.0
-                        elif best_i == best_j:
-                            wins += 0.5
-                        total += 1.0
-
-            equity[i][j] = wins / total if total > 0 else 0.5
+        equity[i][i] = 0.5
 
     return equity
 

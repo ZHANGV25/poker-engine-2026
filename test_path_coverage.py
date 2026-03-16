@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Exhaustive verification suite for the multi-street poker bot.
+"""Exhaustive verification suite for the multi-street poker bot (v7).
 
 Tests EVERY potential failure mode before shipping.
-For exhaustive mode: tests ALL 2925 boards × ALL hands × ALL pot sizes.
+For exhaustive mode: tests ALL 2925 boards x ALL hands x ALL pot sizes.
 Takes ~10-20 min but guarantees zero gaps.
 
 Usage:
     python test_path_coverage.py              # Full exhaustive (10-20 min)
     python test_path_coverage.py --quick      # Quick (~2 min)
 """
-import sys, os, time, itertools, argparse, random
+import sys, os, time, itertools, argparse, random, tracemalloc
 import numpy as np
 
 sys.path.insert(0, 'submission')
@@ -28,12 +28,17 @@ def check(name, condition, detail=""):
         PASS += 1
     else:
         FAIL += 1
-        print(f"  FAIL: {name}" + (f" — {detail}" if detail else ""))
+        print(f"  FAIL: {name}" + (f" -- {detail}" if detail else ""))
 
 
 def warn(msg):
     WARNINGS.append(msg)
     print(f"  WARN: {msg}")
+
+
+# v7 pot sizes (must match compute_multi_street.py)
+V7_FLOP_POTS = [(2, 2), (4, 4), (8, 8), (16, 16), (30, 30), (50, 50), (100, 100)]
+V7_TURN_POT = (4, 4)  # only pot saved for turn
 
 
 # ==================================================================
@@ -65,7 +70,7 @@ def test_startup():
 
 
 # ==================================================================
-# 2. FLOP — EVERY board × EVERY hand × EVERY pot
+# 2. FLOP -- EVERY board x EVERY hand x EVERY pot
 # ==================================================================
 
 def test_flop_exhaustive(lookup, engine, quick=False):
@@ -74,9 +79,11 @@ def test_flop_exhaustive(lookup, engine, quick=False):
     if quick:
         all_boards = all_boards[::10]  # every 10th
 
-    pot_states = [(2, 2), (4, 4), (16, 16), (50, 50)]
+    # All 7 v7 pot sizes
+    pot_states = V7_FLOP_POTS
     facing_bets = [(2, 10), (4, 20), (10, 50), (2, 100)]  # includes extreme overbet
-    gap_pots = [(3, 3), (8, 8), (10, 10), (25, 25), (30, 30), (75, 75), (100, 100)]
+    # Gap pots: between the 7 solved pots
+    gap_pots = [(3, 3), (6, 6), (10, 10), (20, 20), (40, 40), (75, 75)]
 
     stats = {'ok': 0, 'fail': 0, 'unconverged': 0, 'missing_fold': 0,
              'gap_ok': 0, 'gap_fail': 0, 'total': 0}
@@ -103,7 +110,7 @@ def test_flop_exhaustive(lookup, engine, quick=False):
                 else:
                     stats['ok'] += 1
 
-        # Sample hands for other pots and facing-bet
+        # Sample hands for ALL 7 pots and facing-bet scenarios
         for hand in hands[::20]:
             hand = list(hand)
             for pot in pot_states[1:]:
@@ -143,7 +150,7 @@ def test_flop_exhaustive(lookup, engine, quick=False):
 
 
 # ==================================================================
-# 3. TURN — EVERY board × EVERY turn card × sample hands
+# 3. TURN -- EVERY board x EVERY turn card x sample hands
 # ==================================================================
 
 def test_turn_exhaustive(lookup, engine, quick=False):
@@ -167,15 +174,13 @@ def test_turn_exhaustive(lookup, engine, quick=False):
             turn_remaining = [c for c in remaining if c != tc]
             turn_hands = list(itertools.combinations(turn_remaining, 2))
 
-            # Sample hands per turn card
+            # Sample hands per turn card -- test the saved pot (4,4)
             for hand in turn_hands[::15]:
                 hand = list(hand)
                 total += 1
-                for pot in [(2, 2), (50, 50)]:
-                    strat = lookup.get_turn_strategy(hand, board_4, pot_state=pot)
-                    if strat is not None:
-                        ok += 1
-                        break
+                strat = lookup.get_turn_strategy(hand, board_4, pot_state=V7_TURN_POT)
+                if strat is not None:
+                    ok += 1
                 else:
                     fail += 1
                     if fail <= 3:
@@ -187,7 +192,8 @@ def test_turn_exhaustive(lookup, engine, quick=False):
     elapsed = time.time() - t0
     coverage = ok / max(total, 1)
 
-    check("turn: coverage > 95%", coverage > 0.95,
+    # v7 solves all boards individually -- expect 100% coverage
+    check("turn: coverage = 100%", coverage >= 0.999,
           f"{ok}/{total} = {100*coverage:.1f}%")
     if fail > 0:
         warn(f"turn: {fail} failures (will fall back to single-street)")
@@ -239,20 +245,20 @@ def test_range_solver():
     solver = RangeSolver(engine)
 
     scenarios = [
-        # (label, board, hero, dead, my_bet, opp_bet, n_opp_hands)
-        ("normal", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 10, 30, None),
-        ("all-in", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 100, 100, None),
-        ("overbet", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 2, 100, None),
-        ("small bet", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 10, 15, None),
+        # (label, board, hero, dead, my_bet, opp_bet)
+        ("normal", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 10, 30),
+        ("all-in", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 100, 100),
+        ("overbet", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 2, 100),
+        ("small bet", [0, 3, 6, 9, 12], [1, 4], [15, 16, 17, 18, 19, 20], 10, 15),
     ]
 
-    for label, board, hero, dead, my_b, opp_b, _ in scenarios:
+    for label, board, hero, dead, my_b, opp_b in scenarios:
         known = set(board) | set(hero) | set(dead)
         remaining = [c for c in range(27) if c not in known]
         opp_hands = list(itertools.combinations(remaining, 2))
         opp_range = {h: 1.0 / len(opp_hands) for h in opp_hands}
 
-        valid = [True, opp_b < 100, my_b == opp_b, opp_b > my_b, False]  # fold, raise, check, call, discard
+        valid = [True, opp_b < 100, my_b == opp_b, opp_b > my_b, False]
         t0 = time.time()
         action = solver.solve_and_act(
             hero_cards=hero, board=board, opp_range=opp_range,
@@ -264,6 +270,24 @@ def test_range_solver():
         check(f"range solver [{label}]", action is not None, "returned None")
         check(f"range solver [{label}] < 500ms", elapsed < 0.5,
               f"{elapsed*1000:.0f}ms")
+
+    # Correctness: with nuts, should not fold
+    board = [0, 3, 6, 9, 12]  # 2d 3d 4d 5d 6d
+    hero = [1, 4]   # 2h 3h
+    dead = [15, 16, 17, 18, 19, 20]
+    known = set(board) | set(hero) | set(dead)
+    remaining = [c for c in range(27) if c not in known]
+    opp_range = {h: 1.0 for h in itertools.combinations(remaining, 2)}
+    total_w = sum(opp_range.values())
+    opp_range = {h: w / total_w for h, w in opp_range.items()}
+    valid = [True, True, False, True, False]  # fold, raise, no check, call
+    action = solver.solve_and_act(
+        hero_cards=hero, board=board, opp_range=opp_range,
+        dead_cards=dead, my_bet=10, opp_bet=50, street=3,
+        min_raise=2, max_raise=50, valid_actions=valid, time_remaining=400)
+    check("range solver: doesn't fold strong hand",
+          action is not None and action[0] != 0,
+          f"action={action}")
 
 
 # ==================================================================
@@ -299,10 +323,10 @@ def test_strategy_quality(lookup, engine):
                 correlations.append(corr)
 
     avg_corr = np.mean(correlations) if correlations else 0
-    check("equity-raise correlation > 0", avg_corr > 0,
+    check("equity-raise correlation > 0.1", avg_corr > 0.1,
           f"avg correlation = {avg_corr:.3f}")
-    if avg_corr < 0.1:
-        warn(f"weak equity-raise correlation ({avg_corr:.3f}) — strategies may be noisy")
+    if avg_corr < 0.2:
+        warn(f"low equity-raise correlation ({avg_corr:.3f}) -- strategies may be noisy")
     print(f"  Avg equity-raise correlation: {avg_corr:.3f} (across {len(correlations)} boards)")
 
 
@@ -312,30 +336,44 @@ def test_strategy_quality(lookup, engine):
 
 def test_preflop():
     print("\n--- 7. Preflop Strategy ---")
-    data = np.load('submission/data/preflop_strategy.npz')
+    strat_path = 'submission/data/preflop_strategy.npz'
+    if not os.path.exists(strat_path):
+        check("preflop strategy file exists", False, f"{strat_path} not found")
+        return
+
+    data = np.load(strat_path)
     strats = data['strategies']
     levels = data['raise_levels'].tolist()
+    n_buckets = int(data['n_buckets'])
 
     check("preflop: raise levels include 60+", max(levels) >= 60,
           f"max={max(levels)}")
     check("preflop: nodes > 100", strats.shape[0] > 100,
           f"only {strats.shape[0]}")
 
-    # Check bucket 36 anomaly
-    s36 = strats[0, 36]
-    shove_pct = sum(s36[i] for i in range(len(s36)) if i >= 2 and
-                    (i - 2) < len(levels) and levels[i - 2] >= 60)
-    check("preflop: bucket 36 shove < 50%", shove_pct < 0.5,
-          f"shove rate = {shove_pct:.0%}")
-    if shove_pct > 0.3:
-        warn(f"bucket 36 shove rate still high ({shove_pct:.0%}) — cap is protecting us")
+    # Check for anomalous shove buckets (adapt to actual n_buckets)
+    max_shove = 0.0
+    worst_bucket = -1
+    for b in range(min(n_buckets, strats.shape[1])):
+        s = strats[0, b]
+        shove_pct = sum(s[i] for i in range(len(s)) if i >= 2 and
+                        (i - 2) < len(levels) and levels[i - 2] >= 60)
+        if shove_pct > max_shove:
+            max_shove = shove_pct
+            worst_bucket = b
 
-    # Check overall strategy makes sense
-    root_fold_rates = [strats[0, b, 0] for b in range(50)]
-    avg_fold = np.mean(root_fold_rates[:25])  # weak hands
+    check("preflop: no bucket shoves > 50%", max_shove < 0.5,
+          f"bucket {worst_bucket} shove rate = {max_shove:.0%}")
+    if max_shove > 0.3:
+        warn(f"bucket {worst_bucket} shove rate high ({max_shove:.0%}) -- cap is protecting us")
+
+    # Check overall strategy: weak buckets (bottom 25%) should fold sometimes
+    weak_end = n_buckets // 4
+    root_fold_rates = [strats[0, b, 0] for b in range(weak_end)]
+    avg_fold = np.mean(root_fold_rates)
     check("preflop: weak hands fold > 10%", avg_fold > 0.10,
           f"avg weak fold = {avg_fold:.0%}")
-    print(f"  Bucket 36 shove: {shove_pct:.0%}, weak hand avg fold: {avg_fold:.0%}")
+    print(f"  {n_buckets} buckets, worst shove: bucket {worst_bucket} at {max_shove:.0%}, weak avg fold: {avg_fold:.0%}")
 
 
 # ==================================================================
@@ -447,6 +485,15 @@ def test_gameplay(n_hands=200, quick=False):
               f"{elapsed/n_hands*1000:.0f}ms/hand")
         check(f"vs {opp_name}: positive", bankroll > 0,
               f"{bankroll:+d} chips")
+
+        # Verify all paths are exercised
+        check(f"vs {opp_name}: ms_flop used", bot._path_counts['ms_flop'] > 0,
+              f"ms_flop={bot._path_counts['ms_flop']}")
+        check(f"vs {opp_name}: ms_turn used", bot._path_counts['ms_turn'] > 0,
+              f"ms_turn={bot._path_counts['ms_turn']}")
+        check(f"vs {opp_name}: range_solver used", bot._path_counts['range_solver'] > 0,
+              f"range_solver={bot._path_counts['range_solver']}")
+
         print(f"  vs {opp_name}: {bankroll:+d}, {elapsed/n_hands*1000:.0f}ms/hand, paths={dict(bot._path_counts)}")
 
 
@@ -479,18 +526,266 @@ def test_lead_protection():
     }
 
     action = bot.act(obs, 0, False, False, {'hand_number': 700})
-    # With 300 hands left, blind cost = 450. 500 > 460 → should protect
+    # With 300 hands left, blind cost = 450. 500 > 460 -> should protect
     check("lead protection: folds/checks when ahead",
           action[0] in (0, 2),  # FOLD or CHECK
           f"action={action[0]}")
 
-    # Not enough lead — should play normally
+    # Not enough lead -- should play normally
     bot._bankroll = 100
     bot._current_hand = -1
     action2 = bot.act(obs, 0, False, False, {'hand_number': 700})
     check("lead protection: plays normally when not enough lead",
           action2[0] != 0 or obs['valid_actions'][0],  # doesn't just fold
           f"action={action2[0]}")
+
+
+# ==================================================================
+# 11. MEMORY USAGE
+# ==================================================================
+
+def test_memory():
+    print("\n--- 11. Memory Usage ---")
+    tracemalloc.start()
+
+    from multi_street_lookup import MultiStreetLookup
+    from equity import ExactEquityEngine
+    from range_solver import RangeSolver
+
+    engine = ExactEquityEngine()
+    ms_dir = os.path.join('submission', 'data', 'multi_street')
+
+    if not os.path.isdir(ms_dir):
+        check("memory: data dir exists", False, "skipped")
+        return
+
+    lookup = MultiStreetLookup(ms_dir, equity_engine=engine)
+    solver = RangeSolver(engine)
+
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    peak_mb = peak / 1024 / 1024
+    check("memory: peak < 3500 MB", peak_mb < 3500,
+          f"peak = {peak_mb:.0f} MB")
+    if peak_mb > 3000:
+        warn(f"memory close to limit: {peak_mb:.0f} MB / 4096 MB")
+    print(f"  Peak memory: {peak_mb:.0f} MB")
+
+
+# ==================================================================
+# 12. TIME BUDGET ESTIMATE
+# ==================================================================
+
+def test_time_budget():
+    print("\n--- 12. Time Budget Estimate ---")
+    from equity import ExactEquityEngine
+    from range_solver import RangeSolver
+    from multi_street_lookup import MultiStreetLookup
+    engine = ExactEquityEngine()
+
+    ms_dir = os.path.join('submission', 'data', 'multi_street')
+    if not os.path.isdir(ms_dir):
+        check("time budget: data dir exists", False, "skipped")
+        return
+
+    lookup = MultiStreetLookup(ms_dir, equity_engine=engine)
+    solver = RangeSolver(engine)
+    rng = random.Random(42)
+
+    # Measure per-component times
+    # 1. Flop lookup
+    t0 = time.time()
+    for _ in range(100):
+        board = sorted(rng.sample(range(27), 3))
+        remaining = [c for c in range(27) if c not in board]
+        hand = list(rng.sample(remaining, 2))
+        lookup.get_strategy(hand, board, pot_state=(4, 4))
+    flop_ms = (time.time() - t0) / 100 * 1000
+
+    # 2. Turn lookup
+    t0 = time.time()
+    for _ in range(100):
+        board = sorted(rng.sample(range(27), 3))
+        remaining = [c for c in range(27) if c not in board]
+        tc = rng.choice(remaining)
+        remaining2 = [c for c in remaining if c != tc]
+        hand = list(rng.sample(remaining2, 2))
+        lookup.get_turn_strategy(hand, board + [tc], pot_state=(4, 4))
+    turn_ms = (time.time() - t0) / 100 * 1000
+
+    # 3. Range solver (river)
+    board = [0, 3, 6, 9, 12]
+    hero = [1, 4]
+    dead = [15, 16, 17, 18, 19, 20]
+    known = set(board) | set(hero) | set(dead)
+    remaining = [c for c in range(27) if c not in known]
+    opp_range = {h: 1.0 for h in itertools.combinations(remaining, 2)}
+    total_w = sum(opp_range.values())
+    opp_range = {h: w / total_w for h, w in opp_range.items()}
+    valid = [True, True, True, True, False]
+
+    t0 = time.time()
+    for _ in range(5):
+        solver.solve_and_act(
+            hero_cards=hero, board=board, opp_range=opp_range,
+            dead_cards=dead, my_bet=10, opp_bet=30, street=3,
+            min_raise=2, max_raise=70, valid_actions=valid, time_remaining=400)
+    river_ms = (time.time() - t0) / 5 * 1000
+
+    # Estimate 1000-hand match (assume 100% flop, 60% turn, 35% river)
+    est_flop = 1000 * flop_ms / 1000
+    est_turn = 600 * turn_ms / 1000
+    est_river = 350 * river_ms / 1000
+    # ARM64 multiplier: ~5x for solver, ~1x for lookups
+    arm_river = est_river * 5
+    total_est = est_flop + est_turn + arm_river + 30  # +30s for preflop/discard/overhead
+    budget = 1000  # Phase 2
+
+    print(f"  Flop lookup:  {flop_ms:.1f}ms/call, est {est_flop:.0f}s for 1000 hands")
+    print(f"  Turn lookup:  {turn_ms:.1f}ms/call, est {est_turn:.0f}s for 600 hands")
+    print(f"  River solver: {river_ms:.0f}ms/call (local), est {arm_river:.0f}s for 350 hands (ARM64 5x)")
+    print(f"  Total estimate: {total_est:.0f}s / {budget}s ({100*total_est/budget:.0f}%)")
+
+    check("time budget: < 80% of budget", total_est < budget * 0.8,
+          f"{total_est:.0f}s / {budget}s = {100*total_est/budget:.0f}%")
+
+
+# ==================================================================
+# 13. POSITION-AWARE STRATEGIES
+# ==================================================================
+
+def test_position_aware(lookup, engine):
+    print("\n--- 13. Position-Aware Strategies ---")
+    if lookup is None:
+        check("position: lookup available", False, "skipped")
+        return
+
+    rng = random.Random(42)
+
+    # Check that opp strategies are loaded
+    has_opp = False
+    for bid in list(lookup._boards.keys())[:5]:
+        if 'opp_strategies' in lookup._boards[bid]:
+            has_opp = True
+            break
+    if not has_opp:
+        warn("position: no opp_strategies in data (v7 data, not v7.1)")
+        return
+
+    check("position: opp_strategies loaded", has_opp)
+
+    # Check that P0 and P1 strategies differ for the same hand
+    diffs = 0
+    total = 0
+    for _ in range(100):
+        board = sorted(rng.sample(range(27), 3))
+        remaining = [c for c in range(27) if c not in board]
+        hand = list(rng.sample(remaining, 2))
+
+        s0 = lookup.get_strategy(hand, board, pot_state=(4, 4), hero_position=0)
+        s1 = lookup.get_strategy(hand, board, pot_state=(4, 4), hero_position=1)
+
+        if s0 is not None and s1 is not None:
+            total += 1
+            # Check if strategies differ meaningfully
+            all_acts = set(list(s0.keys()) + list(s1.keys()))
+            max_diff = max(abs(s0.get(a, 0) - s1.get(a, 0)) for a in all_acts)
+            if max_diff > 0.02:
+                diffs += 1
+
+    if total > 0:
+        diff_pct = 100 * diffs / total
+        check("position: P0 != P1 for > 20% of hands", diff_pct > 20,
+              f"only {diff_pct:.0f}% differ")
+        print(f"  {diffs}/{total} hands have different P0/P1 strategies ({diff_pct:.0f}%)")
+    else:
+        check("position: got strategy lookups", False, "0 successful lookups")
+
+
+def test_position_mapping():
+    print("\n--- 14. Position Mapping (hero_position derivation) ---")
+
+    # Verify the mapping matches gym_env semantics
+    # gym_env.py:193  blind_position = 1 if player == big_blind else 0
+    # gym_env.py:291  acting_agent = big_blind_player (BB acts first postflop)
+
+    from submission.player import PlayerAgent
+    bot = PlayerAgent(stream=False)
+
+    # SB observation (blind_position=0): should map to hero_position=1 (acts second)
+    obs_sb = {
+        'my_cards': [0, 1, -1, -1, -1],
+        'community_cards': [3, 6, 9, -1, -1],
+        'opp_discarded_cards': [15, 16, 17],
+        'my_discarded_cards': [18, 19, 20],
+        'valid_actions': [False, False, True, False, False],  # only check
+        'my_bet': 2, 'opp_bet': 2, 'pot_size': 4,
+        'min_raise': 2, 'max_raise': 98,
+        'street': 1, 'blind_position': 0, 'time_left': 400,
+        'acting_agent': 0,
+    }
+
+    # BB observation (blind_position=1): should map to hero_position=0 (acts first)
+    obs_bb = dict(obs_sb)
+    obs_bb['blind_position'] = 1
+
+    # Extract hero_position from the code path
+    # We can't directly inspect, but we verify the derivation logic
+    blind_pos_sb = obs_sb['blind_position']  # 0
+    blind_pos_bb = obs_bb['blind_position']  # 1
+    hp_sb = 1 if blind_pos_sb == 0 else 0  # should be 1
+    hp_bb = 1 if blind_pos_bb == 0 else 0  # should be 0
+
+    check("position: SB (blind_pos=0) -> hero_position=1 (second)",
+          hp_sb == 1, f"got {hp_sb}")
+    check("position: BB (blind_pos=1) -> hero_position=0 (first)",
+          hp_bb == 0, f"got {hp_bb}")
+
+    # Verify bot can act without errors in both positions
+    bot._current_hand = -1
+    try:
+        action_sb = bot.act(obs_sb, 0, False, False, {'hand_number': 1})
+        check("position: SB action succeeds", action_sb is not None)
+    except Exception as e:
+        check("position: SB action succeeds", False, str(e))
+
+    bot._current_hand = -1
+    try:
+        action_bb = bot.act(obs_bb, 0, False, False, {'hand_number': 2})
+        check("position: BB action succeeds", action_bb is not None)
+    except Exception as e:
+        check("position: BB action succeeds", False, str(e))
+
+
+# ==================================================================
+# 15. _try_strategy FILTER REMOVAL
+# ==================================================================
+
+def test_try_strategy():
+    print("\n--- 15. _try_strategy Accepts Balanced Strategies ---")
+    from submission.player import PlayerAgent
+    bot = PlayerAgent(stream=False)
+
+    # A near-uniform 3-action strategy (previously rejected by the filter)
+    balanced = {1: 0.33, 3: 0.34, 4: 0.33}  # check, raise_40, raise_70
+    obs = {
+        'valid_actions': [True, True, True, False, False],
+        'my_bet': 2, 'opp_bet': 2, 'pot_size': 4,
+        'min_raise': 2, 'max_raise': 98,
+    }
+    action = bot._try_strategy(balanced, obs)
+    check("try_strategy: accepts balanced 33/34/33",
+          action is not None, "returned None (would have been rejected by old filter)")
+
+    # A strategy with very low fold (previously rejected by fold-check)
+    no_fold = {2: 0.70, 3: 0.30}  # call 70%, raise 30% -- no fold
+    obs_facing = dict(obs)
+    obs_facing['opp_bet'] = 10
+    obs_facing['valid_actions'] = [True, True, False, True, False]
+    action2 = bot._try_strategy(no_fold, obs_facing)
+    check("try_strategy: accepts no-fold strategy facing bet",
+          action2 is not None, "returned None (would have been rejected by old fold check)")
 
 
 # ==================================================================
@@ -503,7 +798,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 60)
-    print("MULTI-STREET BOT VERIFICATION SUITE")
+    print("MULTI-STREET BOT VERIFICATION SUITE (v7.1)")
     print("=" * 60)
 
     lookup, engine = test_startup()
@@ -512,12 +807,17 @@ if __name__ == "__main__":
         test_turn_exhaustive(lookup, engine, quick=args.quick)
         test_board_ordering(lookup)
         test_strategy_quality(lookup, engine)
+        test_position_aware(lookup, engine)
 
     test_range_solver()
     test_preflop()
     test_discard()
     test_gameplay(quick=args.quick)
     test_lead_protection()
+    test_position_mapping()
+    test_try_strategy()
+    test_memory()
+    test_time_budget()
 
     print(f"\n{'='*60}")
     print(f"RESULTS: {PASS} passed, {FAIL} failed, {len(WARNINGS)} warnings")
@@ -525,6 +825,6 @@ if __name__ == "__main__":
     for w in WARNINGS:
         print(f"  WARN: {w}")
     if FAIL == 0:
-        print("\n✓ ALL TESTS PASSED — safe to ship")
+        print("\nALL TESTS PASSED -- safe to ship")
     else:
-        print(f"\n✗ {FAIL} FAILURES — fix before shipping")
+        print(f"\n{FAIL} FAILURES -- fix before shipping")

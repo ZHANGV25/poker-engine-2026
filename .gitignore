@@ -169,3 +169,20 @@ cython_debug/
 # Poker engine logs
 logs/
 agent_logs/
+
+# Match outputs
+match.csv
+agent_logs/
+
+# Blueprint computation outputs (generated, not tracked)
+blueprint/output/
+blueprint/output_v2/
+
+# Temporary files
+/tmp/
+fleet_instances.txt
+
+# Large data files (uploaded separately to competition)
+submission/data/*.npz
+submission/data/*.pkl
+submission/data/multi_street/

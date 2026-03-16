@@ -66,8 +66,13 @@ DEFAULT_N_ITERATIONS = 500
 DEFAULT_N_WORKERS = 4
 
 POT_SIZES = [
-    (2, 2), (4, 4), (8, 8), (16, 16), (30, 30), (50, 50), (100, 100),
+    (2, 2), (50, 50),
 ]
+
+# Which pot index to save turn strategies for (to limit disk/RAM usage).
+# Index 1 = (4,4). Turn strategies for other pots are discarded; at runtime,
+# all turn lookups round to this pot.
+TURN_SAVE_POT_IDX = 1
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +93,8 @@ def solve_single_board(args):
     board = list(board)
     n_iterations = config['n_iterations']
     pot_sizes = config.get('pot_sizes', POT_SIZES)
+    turn_save_pot_idx = config.get('turn_save_pot_idx', TURN_SAVE_POT_IDX)
+    position_aware = config.get('position_aware', False)
     output_dir = config.get('output_dir')
 
     # Resume support: skip if already solved
@@ -118,6 +125,8 @@ def solve_single_board(args):
             board, engine,
             n_iterations=n_iterations,
             pot_sizes=pot_sizes,
+            turn_save_pot_idx=turn_save_pot_idx,
+            position_aware=position_aware,
         )
     except Exception as e:
         logger.error("Board %d (%s) failed: %s", board_id, board, e)
@@ -151,17 +160,69 @@ def _save_board_result(board_id, result, n_iterations, output_dir):
 
     hands_arr = np.array(result['hands'], dtype=np.int8)
 
-    np.savez_compressed(
-        out_path,
-        flop_strategies=result['flop_strategies'],
-        action_types=result['action_types'],
-        hands=hands_arr,
-        board=np.array(result['board'], dtype=np.int8),
-        pot_sizes=np.array(result['pot_sizes'], dtype=np.int32),
-        board_features=result['board_features'],
-        board_id=board_id,
-        n_iterations=n_iterations,
-    )
+    # Build turn strategy arrays
+    # For each pot_size × turn_card: strategy array + hands
+    save_dict = {
+        'flop_strategies': result['flop_strategies'],
+        'action_types': result['action_types'],
+        'hands': hands_arr,
+        'board': np.array(result['board'], dtype=np.int8),
+        'pot_sizes': np.array(result['pot_sizes'], dtype=np.int32),
+        'board_features': result['board_features'],
+        'board_id': board_id,
+        'n_iterations': n_iterations,
+    }
+
+    # Save position-aware opp strategies if available
+    if 'flop_opp_strategies' in result:
+        save_dict['flop_opp_strategies'] = result['flop_opp_strategies']
+        save_dict['opp_action_types'] = result['opp_action_types']
+
+    # Save turn strategies if available
+    turn_strats = result.get('turn_strategies', {})
+    turn_cards_saved = []
+    for (pot_idx, turn_card), td in turn_strats.items():
+        strat = td['strategy']  # (n_hands, n_nodes, n_actions)
+        t_hands = np.array(td['hands'], dtype=np.int8)
+        # Quantize to uint8
+        q = np.clip(np.round(strat * 255.0), 0, 255).astype(np.uint8)
+        key = f'turn_strat_p{pot_idx}_t{turn_card}'
+        save_dict[key] = q
+        save_dict[f'turn_hands_t{turn_card}'] = t_hands
+
+        # Save turn action types
+        tree = td['tree']
+        max_hn = len(tree.hero_node_ids)
+        max_a = max((tree.num_actions[nid] for nid in tree.hero_node_ids), default=1)
+        t_act = np.full((max_hn, max_a), -1, dtype=np.int8)
+        for i, nid in enumerate(tree.hero_node_ids):
+            for a, (act_id, _) in enumerate(tree.children[nid]):
+                if a < max_a:
+                    t_act[i, a] = act_id
+        save_dict[f'turn_actions_p{pot_idx}_t{turn_card}'] = t_act
+
+        # Save opp turn strategy if position-aware
+        opp_strat = td.get('opp_strategy')
+        if opp_strat is not None:
+            oq = np.clip(np.round(opp_strat * 255.0), 0, 255).astype(np.uint8)
+            save_dict[f'turn_opp_strat_p{pot_idx}_t{turn_card}'] = oq
+            # Opp action types
+            max_on = len(tree.opp_node_ids)
+            max_oa = max((tree.num_actions[nid] for nid in tree.opp_node_ids), default=1)
+            t_opp_act = np.full((max_on, max_oa), -1, dtype=np.int8)
+            for i, nid in enumerate(tree.opp_node_ids):
+                for a, (act_id, _) in enumerate(tree.children[nid]):
+                    if a < max_oa:
+                        t_opp_act[i, a] = act_id
+            save_dict[f'turn_opp_actions_p{pot_idx}_t{turn_card}'] = t_opp_act
+
+        if turn_card not in turn_cards_saved:
+            turn_cards_saved.append(turn_card)
+
+    if turn_cards_saved:
+        save_dict['turn_cards'] = np.array(sorted(set(turn_cards_saved)), dtype=np.int8)
+
+    np.savez_compressed(out_path, **save_dict)
 
     size_kb = os.path.getsize(out_path) / 1024
     logger.debug("Saved board %d: %s (%.1f KB)", board_id, out_path, size_kb)
@@ -234,9 +295,12 @@ def run_computation(config):
     print(f" done ({time.time() - t0:.2f}s)")
 
     # Prepare work items
+    turn_save_pot_idx = config.get('turn_save_pot_idx', TURN_SAVE_POT_IDX)
     work_config = {
         'n_iterations': n_iterations,
         'pot_sizes': pot_sizes,
+        'turn_save_pot_idx': turn_save_pot_idx,
+        'position_aware': config.get('position_aware', False),
         'output_dir': output_dir,
     }
     work_items = [(bid, board, work_config) for bid, board in filtered]
@@ -384,6 +448,9 @@ def main():
     parser.add_argument(
         '--n_clusters', type=int, default=DEFAULT_N_CLUSTERS,
         help=f'Number of board clusters (default: {DEFAULT_N_CLUSTERS})')
+    parser.add_argument(
+        '--position_aware', action='store_true',
+        help='Save both P0 (first-to-act) and P1 (second-to-act) strategies')
 
     args = parser.parse_args()
 
@@ -400,6 +467,8 @@ def main():
         'cluster_start': args.cluster_start,
         'cluster_end': args.cluster_end,
         'pot_sizes': POT_SIZES,
+        'turn_save_pot_idx': TURN_SAVE_POT_IDX,
+        'position_aware': args.position_aware,
         'all_boards': args.all_boards,
         'n_clusters': args.n_clusters,
     }

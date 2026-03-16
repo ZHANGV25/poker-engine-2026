@@ -78,8 +78,18 @@ class MultiStreetLookup:
             raise FileNotFoundError(f"Data path not found: {data_path}")
 
     def _load_directory(self, dir_path):
-        """Load per-board .npz files from a directory."""
+        """Load per-board .npz files from a directory.
+
+        Also checks for merged_blueprint.npz (single file with all boards).
+        """
         import glob
+
+        # Check for compact merged file first (single file, fast upload)
+        compact_path = os.path.join(dir_path, "blueprint_v7.npz")
+        if os.path.isfile(compact_path):
+            self._load_compact_merged(compact_path)
+            return
+
         files = sorted(glob.glob(os.path.join(dir_path, "board_*.npz")))
 
         if not files:
@@ -125,7 +135,7 @@ class MultiStreetLookup:
                                     if a_key in data:
                                         turn_data[tc]['pot_actions'][pi] = data[a_key]
 
-                self._boards[board_id] = {
+                board_data = {
                     'strategies': data['flop_strategies'],
                     'action_types': data['action_types'],
                     'hands': hands,
@@ -134,6 +144,29 @@ class MultiStreetLookup:
                     'pot_sizes': pot_sizes,
                     'turn_data': turn_data,
                 }
+
+                # Load position-aware opp strategies if available
+                if 'flop_opp_strategies' in data:
+                    board_data['opp_strategies'] = data['flop_opp_strategies']
+                    board_data['opp_action_types'] = data['opp_action_types']
+
+                    # Also load turn opp strategies
+                    if 'turn_cards' in data:
+                        for tc in data['turn_cards']:
+                            tc = int(tc)
+                            if tc in turn_data:
+                                for pi in range(len(pot_sizes)):
+                                    os_key = f'turn_opp_strat_p{pi}_t{tc}'
+                                    oa_key = f'turn_opp_actions_p{pi}_t{tc}'
+                                    if os_key in data:
+                                        if 'opp_pot_strategies' not in turn_data[tc]:
+                                            turn_data[tc]['opp_pot_strategies'] = {}
+                                            turn_data[tc]['opp_pot_actions'] = {}
+                                        turn_data[tc]['opp_pot_strategies'][pi] = data[os_key]
+                                        if oa_key in data:
+                                            turn_data[tc]['opp_pot_actions'][pi] = data[oa_key]
+
+                self._boards[board_id] = board_data
 
                 self._board_list.append((board_id, board, features))
 
@@ -157,6 +190,188 @@ class MultiStreetLookup:
             self._board_to_id[board] = bid
 
         # Build node maps for each (board, pot_idx)
+        self._build_all_node_maps()
+        self._loaded = True
+
+    def _load_compact_merged(self, fpath):
+        """Load all boards from a compact stacked .npz file.
+
+        Arrays are stacked: (n_boards, ...) instead of per-board files.
+        Much faster to load and fewer files to upload.
+        """
+        data = np.load(fpath, allow_pickle=True)
+        board_ids = data['board_ids']
+        boards_arr = data['boards']
+        features_arr = data['board_features']
+        hands_arr = data['hands']
+        pot_sizes = data['pot_sizes']
+        flop_strats = data['flop_strategies']
+        act_types = data['action_types']
+
+        has_opp = 'flop_opp_strategies' in data
+        has_turn = 'turn_strategies' in data
+        turn_pot_idx = int(data['turn_pot_idx']) if 'turn_pot_idx' in data else 0
+
+        if has_opp:
+            opp_strats = data['flop_opp_strategies']
+            opp_acts = data['opp_action_types']
+        if has_turn:
+            turn_cards_arr = data['turn_cards']
+            turn_strats = data['turn_strategies']
+            turn_acts = data['turn_action_types']
+            turn_hands_arr = data['turn_hands']
+
+        for i in range(len(board_ids)):
+            bid = int(board_ids[i])
+            board = tuple(int(c) for c in boards_arr[i])
+            hands = hands_arr[i]
+
+            # Build hand map
+            hmap = {}
+            for hi in range(len(hands)):
+                c1, c2 = int(hands[hi][0]), int(hands[hi][1])
+                hmap[(min(c1, c2), max(c1, c2))] = hi
+            self._hand_maps[bid] = hmap
+
+            # Turn data
+            turn_data = {}
+            if has_turn:
+                for ti in range(len(turn_cards_arr[i])):
+                    tc = int(turn_cards_arr[i][ti])
+                    t_hands = turn_hands_arr[i, ti]
+                    t_hmap = {}
+                    for hi in range(len(t_hands)):
+                        c1, c2 = int(t_hands[hi][0]), int(t_hands[hi][1])
+                        if c1 == 0 and c2 == 0 and hi > 0:
+                            break  # past valid entries
+                        t_hmap[(min(c1, c2), max(c1, c2))] = hi
+                    turn_data[tc] = {
+                        'hands': t_hands,
+                        'hand_map': t_hmap,
+                        'pot_strategies': {turn_pot_idx: turn_strats[i, ti]},
+                        'pot_actions': {turn_pot_idx: turn_acts[i, ti]},
+                    }
+
+            board_data = {
+                'strategies': flop_strats[i],
+                'action_types': act_types[i],
+                'hands': hands,
+                'board': board,
+                'features': features_arr[i],
+                'pot_sizes': pot_sizes,
+                'turn_data': turn_data,
+            }
+            if has_opp:
+                board_data['opp_strategies'] = opp_strats[i]
+                board_data['opp_action_types'] = opp_acts[i]
+
+            self._boards[bid] = board_data
+            self._board_list.append((bid, board, features_arr[i]))
+
+            if self._pot_sizes is None:
+                self._pot_sizes = pot_sizes
+
+        self._board_to_id = {}
+        for bid, board, _ in self._board_list:
+            self._board_to_id[board] = bid
+
+        self._build_all_node_maps()
+        self._loaded = True
+
+    def _load_merged_boards(self, fpath):
+        """Load all boards from a single merged .npz file.
+
+        The merged file has keys like 'b{id}_{field}' for each board,
+        plus 'board_id_list' listing all board IDs.
+        """
+        data = np.load(fpath, allow_pickle=True)
+        board_ids = data['board_id_list']
+
+        for bid in board_ids:
+            bid = int(bid)
+            prefix = f'b{bid}_'
+
+            board = tuple(int(c) for c in data[f'{prefix}board'])
+            hands = data[f'{prefix}hands']
+            features = data[f'{prefix}board_features']
+            pot_sizes = data[f'{prefix}pot_sizes']
+
+            # Load turn data
+            turn_data = {}
+            tc_key = f'{prefix}turn_cards'
+            if tc_key in data:
+                turn_cards = data[tc_key]
+                for tc in turn_cards:
+                    tc = int(tc)
+                    t_hands_key = f'{prefix}turn_hands_t{tc}'
+                    if t_hands_key in data:
+                        t_hands = data[t_hands_key]
+                        t_hmap = {}
+                        for hi in range(len(t_hands)):
+                            c1, c2 = int(t_hands[hi][0]), int(t_hands[hi][1])
+                            t_hmap[(min(c1, c2), max(c1, c2))] = hi
+                        turn_data[tc] = {
+                            'hands': t_hands,
+                            'hand_map': t_hmap,
+                        }
+                        for pi in range(len(pot_sizes)):
+                            s_key = f'{prefix}turn_strat_p{pi}_t{tc}'
+                            a_key = f'{prefix}turn_actions_p{pi}_t{tc}'
+                            if s_key in data:
+                                if 'pot_strategies' not in turn_data[tc]:
+                                    turn_data[tc]['pot_strategies'] = {}
+                                    turn_data[tc]['pot_actions'] = {}
+                                turn_data[tc]['pot_strategies'][pi] = data[s_key]
+                                if a_key in data:
+                                    turn_data[tc]['pot_actions'][pi] = data[a_key]
+
+            board_data = {
+                'strategies': data[f'{prefix}flop_strategies'],
+                'action_types': data[f'{prefix}action_types'],
+                'hands': hands,
+                'board': board,
+                'features': features,
+                'pot_sizes': pot_sizes,
+                'turn_data': turn_data,
+            }
+
+            # Position-aware opp strategies
+            opp_key = f'{prefix}flop_opp_strategies'
+            if opp_key in data:
+                board_data['opp_strategies'] = data[opp_key]
+                board_data['opp_action_types'] = data[f'{prefix}opp_action_types']
+
+                if tc_key in data:
+                    for tc in data[tc_key]:
+                        tc = int(tc)
+                        if tc in turn_data:
+                            for pi in range(len(pot_sizes)):
+                                os_key = f'{prefix}turn_opp_strat_p{pi}_t{tc}'
+                                oa_key = f'{prefix}turn_opp_actions_p{pi}_t{tc}'
+                                if os_key in data:
+                                    if 'opp_pot_strategies' not in turn_data[tc]:
+                                        turn_data[tc]['opp_pot_strategies'] = {}
+                                        turn_data[tc]['opp_pot_actions'] = {}
+                                    turn_data[tc]['opp_pot_strategies'][pi] = data[os_key]
+                                    if oa_key in data:
+                                        turn_data[tc]['opp_pot_actions'][pi] = data[oa_key]
+
+            self._boards[bid] = board_data
+            self._board_list.append((bid, board, features))
+
+            hmap = {}
+            for hi in range(len(hands)):
+                c1, c2 = int(hands[hi][0]), int(hands[hi][1])
+                hmap[(min(c1, c2), max(c1, c2))] = hi
+            self._hand_maps[bid] = hmap
+
+            if self._pot_sizes is None:
+                self._pot_sizes = pot_sizes
+
+        self._board_to_id = {}
+        for bid, board, _ in self._board_list:
+            self._board_to_id[board] = bid
+
         self._build_all_node_maps()
         self._loaded = True
 
@@ -214,10 +429,12 @@ class MultiStreetLookup:
         for bid in self._boards:
             bd = self._boards[bid]
             ps = bd['pot_sizes']
+            has_opp = 'opp_strategies' in bd
             for pi in range(len(ps)):
                 hb, ob = int(ps[pi][0]), int(ps[pi][1])
                 try:
                     tree = GameTree(hb, ob, 2, 100, True)
+                    # Hero (P0) node map
                     node_info = []
                     for i, nid in enumerate(tree.hero_node_ids):
                         acts = [a for a, _ in tree.children[nid]]
@@ -228,6 +445,19 @@ class MultiStreetLookup:
                             ACT_FOLD in acts,
                         ))
                     self._node_maps[(bid, pi)] = node_info
+
+                    # Opp (P1) node map — for position-aware play
+                    if has_opp:
+                        opp_info = []
+                        for i, nid in enumerate(tree.opp_node_ids):
+                            acts = [a for a, _ in tree.children[nid]]
+                            opp_info.append((
+                                i,
+                                tree.hero_pot[nid],
+                                tree.opp_pot[nid],
+                                ACT_FOLD in acts,
+                            ))
+                        self._node_maps[(bid, pi, 'opp')] = opp_info
                 except Exception:
                     self._node_maps[(bid, pi)] = [(0, hb, ob, False)]
 
@@ -244,7 +474,7 @@ class MultiStreetLookup:
     # ------------------------------------------------------------------
 
     def get_strategy(self, hero_cards, board, pot_state=None,
-                     dead_cards=None, opp_weights=None):
+                     dead_cards=None, opp_weights=None, hero_position=0):
         """
         Look up the blueprint strategy for the current game state.
 
@@ -254,6 +484,7 @@ class MultiStreetLookup:
             pot_state: (hero_bet, opp_bet) tuple
             dead_cards: optional dead cards
             opp_weights: unused (kept for API compatibility)
+            hero_position: 0 = hero acts first (P0), 1 = hero acts second (P1)
 
         Returns:
             dict {action_type_id: probability}, or None if unavailable
@@ -280,11 +511,18 @@ class MultiStreetLookup:
         # Find node index for current bet state
         my_bet = pot_state[0] if pot_state else 2
         opp_bet = pot_state[1] if pot_state else 2
-        node_idx = self._find_node(my_bet, opp_bet, board_id, pot_idx)
 
-        # Read strategy
-        strats = bd['strategies']
-        acts = bd['action_types']
+        # Position-aware: use opp strategies when hero is P1 (acting second)
+        use_opp = (hero_position == 1 and 'opp_strategies' in bd)
+
+        if use_opp:
+            strats = bd['opp_strategies']
+            acts = bd['opp_action_types']
+            node_idx = self._find_opp_node(my_bet, opp_bet, board_id, pot_idx)
+        else:
+            strats = bd['strategies']
+            acts = bd['action_types']
+            node_idx = self._find_node(my_bet, opp_bet, board_id, pot_idx)
 
         if pot_idx >= strats.shape[0]:
             pot_idx = 0
@@ -317,13 +555,14 @@ class MultiStreetLookup:
         return result
 
     def get_turn_strategy(self, hero_cards, board, pot_state=None,
-                           dead_cards=None, opp_weights=None):
+                           dead_cards=None, opp_weights=None, hero_position=0):
         """Look up turn strategy from multi-street solve.
 
         Args:
             hero_cards: list of 2 card ints
             board: list of 4+ card ints (flop + turn card)
             pot_state: (hero_bet, opp_bet)
+            hero_position: 0 = first to act, 1 = second to act
 
         Returns:
             dict {action_type_id: probability}, or None
@@ -344,7 +583,19 @@ class MultiStreetLookup:
             return None
 
         td = turn_data[turn_card]
-        if 'pot_strategies' not in td:
+
+        # Position-aware: use opp strategies when hero is P1
+        use_opp = (hero_position == 1 and 'opp_pot_strategies' in td)
+        strat_key = 'opp_pot_strategies' if use_opp else 'pot_strategies'
+        act_key = 'opp_pot_actions' if use_opp else 'pot_actions'
+
+        if strat_key not in td:
+            # Fall back to hero strategies
+            strat_key = 'pot_strategies'
+            act_key = 'pot_actions'
+            use_opp = False
+
+        if strat_key not in td:
             return None
 
         # Find hand index in turn hand list
@@ -356,19 +607,21 @@ class MultiStreetLookup:
 
         # Find pot index
         pot_idx = self._find_pot(pot_state, bd['pot_sizes'])
-        if pot_idx not in td['pot_strategies']:
-            pot_idx = min(td['pot_strategies'].keys()) if td['pot_strategies'] else 0
+        if pot_idx not in td[strat_key]:
+            pot_idx = min(td[strat_key].keys()) if td[strat_key] else 0
 
-        strats = td['pot_strategies'].get(pot_idx)
-        acts = td['pot_actions'].get(pot_idx)
+        strats = td[strat_key].get(pot_idx)
+        acts = td[act_key].get(pot_idx)
         if strats is None:
             return None
 
         # Find node for bet state
         my_bet = pot_state[0] if pot_state else 2
         opp_bet = pot_state[1] if pot_state else 2
-        # Use flop node matching (same tree structure)
-        node_idx = self._find_node(my_bet, opp_bet, board_id, pot_idx)
+        if use_opp:
+            node_idx = self._find_opp_node(my_bet, opp_bet, board_id, pot_idx)
+        else:
+            node_idx = self._find_node(my_bet, opp_bet, board_id, pot_idx)
 
         if hand_idx >= strats.shape[0] or node_idx >= strats.shape[1]:
             return None
@@ -543,6 +796,53 @@ class MultiStreetLookup:
                 continue
 
             node_ratio = (op - hp) / node_pot if node_facing else 0.0
+            dist = abs(bet_ratio - node_ratio)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = strat_idx
+
+        return best_idx
+
+    def _find_opp_node(self, my_bet, opp_bet, board_id, pot_idx):
+        """Find opp (P1) node index for current bet state.
+
+        When hero is P1, hero's bet state maps to opp nodes in the
+        solved tree (where P1 = opp). Note: from hero-P1's perspective,
+        'my_bet' is what P1 has bet, 'opp_bet' is what P0 has bet.
+        In the tree, P1 nodes have hero_pot=P0's bet, opp_pot=P1's bet.
+        So we swap: match hp against opp_bet, op against my_bet.
+        """
+        node_info = self._node_maps.get((board_id, pot_idx, 'opp'))
+        if not node_info:
+            # Fall back to hero node matching
+            return self._find_node(my_bet, opp_bet, board_id, pot_idx)
+
+        # From P1's view: facing_bet means P0 bet more than P1
+        facing_bet = opp_bet > my_bet
+        pot = my_bet + opp_bet
+        if pot <= 0:
+            return 0
+
+        bet_ratio = (opp_bet - my_bet) / pot if facing_bet else 0.0
+
+        best_idx = 0
+        best_dist = float('inf')
+
+        for strat_idx, hp, op, has_fold in node_info:
+            # hp = hero_pot (P0's bet), op = opp_pot (P1's bet) in tree
+            # For P1 hero: P0's bet = opp_bet, P1's bet = my_bet
+            # node "facing bet" from P1 view: hp > op (P0 bet more)
+            node_pot = hp + op
+            if node_pot <= 0:
+                continue
+
+            node_facing = hp > op  # P0 bet more than P1
+            if facing_bet and not node_facing:
+                continue
+            if not facing_bet and node_facing:
+                continue
+
+            node_ratio = (hp - op) / node_pot if node_facing else 0.0
             dist = abs(bet_ratio - node_ratio)
             if dist < best_dist:
                 best_dist = dist
