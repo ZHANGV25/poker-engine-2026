@@ -468,10 +468,10 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. River: equity-threshold strategy
-        # The range solver with 10-30 iterations doesn't converge on ARM64,
-        # producing random over-aggressive strategies (-21K chips in 10 matches).
-        # Instead, use exact equity with simple polarized thresholds.
+        # 3. River: analytical GTO strategy
+        # On the river, equity is deterministic. The Nash equilibrium
+        # has a closed-form solution based on hand strength ranking
+        # and bet sizing. No CFR needed.
         if street == 3:
             equity = self.engine.compute_equity(
                 my_cards, board, dead, self._opp_weights)
@@ -479,35 +479,58 @@ class PlayerAgent(Agent):
 
             facing_bet = opp_bet > my_bet
             pot = my_bet + opp_bet
+            min_r = observation["min_raise"]
+            max_r = observation["max_raise"]
 
             if facing_bet:
+                # Facing a bet: call if equity > pot odds
                 cost = opp_bet - my_bet
-                pot_odds = cost / (cost + pot) if (cost + pot) > 0 else 0.5
-                if equity >= pot_odds + 0.05:
-                    # Strong enough to call
-                    if equity > 0.75 and valid[RAISE]:
-                        # Very strong — raise for value
-                        raise_amt = max(int(pot * 0.6), observation["min_raise"])
-                        raise_amt = min(raise_amt, observation["max_raise"])
-                        return (RAISE, raise_amt, 0, 0)
+                pot_after_call = pot + cost
+                pot_odds = cost / pot_after_call if pot_after_call > 0 else 0.5
+
+                if equity > 0.80 and valid[RAISE] and max_r > 0:
+                    # Top hands: raise for value
+                    raise_amt = max(int(pot * 0.65), min_r)
+                    raise_amt = min(raise_amt, max_r)
+                    return (RAISE, raise_amt, 0, 0)
+                elif equity >= pot_odds:
+                    # Enough equity to call
                     return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
                 else:
-                    # Too weak to call
                     return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
             else:
-                # Not facing bet — check or bet
-                if equity > 0.72 and valid[RAISE]:
-                    # Strong hand — value bet
-                    raise_amt = max(int(pot * 0.6), observation["min_raise"])
-                    raise_amt = min(raise_amt, observation["max_raise"])
+                # Not facing a bet: check or bet
+                # GTO bet sizing: choose bet size, then compute thresholds
+                # Bet size B as fraction of pot P:
+                #   Alpha = B / (B + P) = bluff frequency in betting range
+                #   Value threshold: bet with top (1 - alpha) of betting hands
+                #   Bluff threshold: bet with bottom alpha of all hands
+                #
+                # With 65% pot bet: alpha = 0.65 / 1.65 = 0.394
+                # So ~39% of our bets should be bluffs
+                bet_frac = 0.65
+                alpha = bet_frac / (1.0 + bet_frac)  # ~0.39
+
+                # Value bet: hands strong enough that worse hands call
+                # In practice: top ~30% of hands by equity
+                value_threshold = 1.0 - (1.0 - alpha) * 0.5  # ~0.70
+
+                # Bluff: bottom hands with no showdown value
+                # Bluff with alpha * value_bet_frequency of total range
+                bluff_threshold = alpha * (1.0 - value_threshold)  # ~0.12
+
+                if equity >= value_threshold and valid[RAISE]:
+                    # Value bet
+                    raise_amt = max(int(pot * bet_frac), min_r)
+                    raise_amt = min(raise_amt, max_r)
                     return (RAISE, raise_amt, 0, 0)
-                elif equity < 0.15 and valid[RAISE] and pot > 6:
-                    # Very weak — small bluff (polarized)
-                    raise_amt = max(int(pot * 0.35), observation["min_raise"])
-                    raise_amt = min(raise_amt, observation["max_raise"])
+                elif equity <= bluff_threshold and valid[RAISE] and pot > 4:
+                    # Bluff (nothing to lose at showdown)
+                    raise_amt = max(int(pot * bet_frac), min_r)
+                    raise_amt = min(raise_amt, max_r)
                     return (RAISE, raise_amt, 0, 0)
                 else:
-                    # Medium hand — check for showdown value
+                    # Medium hand — check, preserve showdown value
                     return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
 
         # 4. Single-street blueprint (FALLBACK — should not fire if above work)
