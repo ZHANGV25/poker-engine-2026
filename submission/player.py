@@ -32,25 +32,19 @@ from game_tree import (
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
 )
 
-# Start loading heavy data at module import time (before __init__).
-# This gives a head start while the server framework initializes.
-import threading
-_PRELOAD = {'engine': None, 'multi_street': None, 'blueprints': {}, 'done': False}
-
-def _preload_data():
-    _PRELOAD['engine'] = ExactEquityEngine()
-    try:
-        from multi_street_lookup import MultiStreetLookup
-        data_dir = os.path.join(_dir, "data", "multi_street")
-        if os.path.isdir(data_dir):
-            _PRELOAD['multi_street'] = MultiStreetLookup(
-                data_dir, equity_engine=_PRELOAD['engine'])
-    except Exception:
-        pass
+# Preload at module import time. No threading — numpy holds GIL
+# during large file reads, blocking the API server from responding.
+_PRELOAD = {'multi_street': None, 'done': False}
+try:
+    _pre_engine = ExactEquityEngine()
+    from multi_street_lookup import MultiStreetLookup
+    _data_dir = os.path.join(_dir, "data", "multi_street")
+    if os.path.isdir(_data_dir):
+        _PRELOAD['multi_street'] = MultiStreetLookup(
+            _data_dir, equity_engine=_pre_engine)
     _PRELOAD['done'] = True
-
-_preload_thread = threading.Thread(target=_preload_data, daemon=True)
-_preload_thread.start()
+except Exception:
+    _PRELOAD['done'] = True
 
 # Graceful imports for optional modules
 try:
@@ -97,12 +91,10 @@ class PlayerAgent(Agent):
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
-        # Use preloaded data from module-level background thread.
-        # If not ready yet, fold until it is (costs 1-2 chips/hand blinds,
-        # better than playing blind with one-hand solver).
+        # Use preloaded data from module-level (loaded before server starts).
         self._multi_street = _PRELOAD.get('multi_street')
         self._multi_street_loaded = _PRELOAD.get('done', False)
-        self._blueprints = _PRELOAD.get('blueprints', {})
+        self._blueprints = self._load_blueprints() if self._multi_street_loaded else {}
 
         self._current_hand = -1
         self._opp_weights = None
@@ -632,24 +624,6 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
-        # If blueprint not loaded yet, wait briefly for it.
-        if not self._multi_street_loaded:
-            _preload_thread.join(timeout=0.5)  # quick check
-            if _PRELOAD.get('done'):
-                self._multi_street = _PRELOAD.get('multi_street')
-                self._multi_street_loaded = True
-                # Fall through to normal play below
-            else:
-                # Still loading — fold/check this hand
-                valid = observation["valid_actions"]
-                if valid[DISCARD]:
-                    my, board, opp_d, _ = self._parse_cards(observation)
-                    return self._handle_discard(observation, my, board, opp_d)
-                if valid[CHECK]:
-                    return (CHECK, 0, 0, 0)
-                if valid[FOLD]:
-                    return (FOLD, 0, 0, 0)
-                return (CALL, 0, 0, 0)
 
         # Lead protection — if we can survive on blinds alone, fold everything
         # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
