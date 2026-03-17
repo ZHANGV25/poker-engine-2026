@@ -759,8 +759,65 @@ def _phase1_river_cfr_all(
 
 
 @numba.njit(cache=True)
+def _vectorized_river_ev(hand_ranks, valid_pairs, pot_won, n):
+    """Compute river continuation values accounting for betting.
+
+    Models a one-round betting game where:
+    - Winners bet for value and extract more from strong opponents
+    - Losers face bets and fold (weak) or call (strong)
+    All in Numba for speed.
+    """
+    bet_size = pot_won * 0.7
+
+    ev = np.zeros((n, n), dtype=np.float64)
+
+    # Compute strength (fraction of valid opponents this hand beats)
+    strength = np.zeros(n, dtype=np.float64)
+    valid_count = np.zeros(n, dtype=np.float64)
+    for hi in range(n):
+        w = 0.0
+        vc = 0.0
+        for oi in range(n):
+            if not valid_pairs[hi, oi]:
+                continue
+            vc += 1.0
+            if hand_ranks[hi] < hand_ranks[oi]:
+                w += 1.0
+            elif hand_ranks[hi] == hand_ranks[oi]:
+                w += 0.5
+        if vc > 0:
+            strength[hi] = w / vc
+        valid_count[hi] = vc
+
+    # Compute adjusted EVs
+    for hi in range(n):
+        ri = hand_ranks[hi]
+        sh = strength[hi]
+        for oi in range(n):
+            if not valid_pairs[hi, oi]:
+                continue
+            ro = hand_ranks[oi]
+            so = strength[oi]
+
+            if ri < ro:
+                # Hero wins. Opp folds if weak, calls if strong.
+                if so < 0.35:
+                    ev[hi, oi] = pot_won
+                else:
+                    ev[hi, oi] = pot_won + bet_size * 0.5
+            elif ri > ro:
+                # Hero loses. Hero folds if weak, calls if strong.
+                if sh < 0.35:
+                    ev[hi, oi] = -pot_won
+                else:
+                    ev[hi, oi] = -(pot_won + bet_size * 0.5)
+
+    return ev
+
+
+@numba.njit(cache=True)
 def _fill_analytical_ev(ev, hand_ranks, valid_pairs, pot_won, n):
-    """Analytical river EV: winner gets pot_won, loser loses pot_won, tie splits."""
+    """Analytical river EV: winner gets pot_won, loser loses pot_won."""
     for hi in range(n):
         ri = hand_ranks[hi]
         for oi in range(n):
@@ -771,6 +828,144 @@ def _fill_analytical_ev(ev, hand_ranks, valid_pairs, pot_won, n):
                 ev[hi, oi] = pot_won
             elif ri > ro:
                 ev[hi, oi] = -pot_won
+
+
+@numba.njit(cache=True)
+def _simplified_river_cfr(hand_ranks, valid_pairs, pot_won, n, n_iters):
+    """Simplified river CFR with check/bet, fold/call tree.
+
+    Tree (7 nodes):
+      Node 0 (hero): CHECK→1, BET→4
+      Node 1 (opp):  CHECK→2(sd), BET→3
+      Node 3 (hero): FOLD→(fold_hero), CALL→(sd at bet_pot)
+      Node 4 (opp):  FOLD→(fold_opp), CALL→(sd at bet_pot)
+
+    This captures the key dynamic that analytical EVs miss:
+    weak hands face bets and fold, getting lower EV than raw equity.
+    """
+    bet_frac = 0.7  # bet 70% of pot
+    bet_size = pot_won * bet_frac  # each player's additional bet
+    pot_after_bet = pot_won + bet_size  # pot won at showdown after bet-call
+
+    # Regrets and strategy sums for hero (2 decision nodes × n hands × 2 actions)
+    # Node 0: hero root (check/bet)
+    # Node 1: hero facing opp bet after check (fold/call)
+    hero_regrets = np.zeros((2, n, 2), dtype=np.float64)
+    hero_strat_sum = np.zeros((2, n, 2), dtype=np.float64)
+    opp_regrets = np.zeros((1, n, 2), dtype=np.float64)   # opp after hero check
+    opp_strat_sum = np.zeros((1, n, 2), dtype=np.float64)
+
+    root_ev = np.zeros((n, n), dtype=np.float64)
+
+    for _ in range(n_iters):
+        for hi in range(n):
+            for oi in range(n):
+                if not valid_pairs[hi, oi]:
+                    continue
+
+                # Showdown result
+                ri = hand_ranks[hi]
+                ro = hand_ranks[oi]
+                if ri < ro:
+                    sd_val = pot_won       # hero wins at check-check
+                    sd_val_bet = pot_after_bet  # hero wins at bet-call
+                elif ri > ro:
+                    sd_val = -pot_won
+                    sd_val_bet = -pot_after_bet
+                else:
+                    sd_val = 0.0
+                    sd_val_bet = 0.0
+
+                # Hero root strategy (check/bet)
+                h0 = hero_regrets[0, hi]
+                s0_check = max(0.0, h0[0])
+                s0_bet = max(0.0, h0[1])
+                t0 = s0_check + s0_bet
+                if t0 > 0:
+                    s0_check /= t0
+                    s0_bet /= t0
+                else:
+                    s0_check = 0.5
+                    s0_bet = 0.5
+
+                # Opp strategy after hero check (check/bet)
+                o0 = opp_regrets[0, oi]
+                so_check = max(0.0, o0[0])
+                so_bet = max(0.0, o0[1])
+                to = so_check + so_bet
+                if to > 0:
+                    so_check /= to
+                    so_bet /= to
+                else:
+                    so_check = 0.5
+                    so_bet = 0.5
+
+                # Hero strategy facing opp bet (fold/call)
+                h1 = hero_regrets[1, hi]
+                s1_fold = max(0.0, h1[0])
+                s1_call = max(0.0, h1[1])
+                t1 = s1_fold + s1_call
+                if t1 > 0:
+                    s1_fold /= t1
+                    s1_call /= t1
+                else:
+                    s1_fold = 0.5
+                    s1_call = 0.5
+
+                # Compute values for each path
+                # Path: hero checks → opp checks → showdown
+                v_check_check = sd_val
+                # Path: hero checks → opp bets → hero folds
+                v_check_bet_fold = -pot_won
+                # Path: hero checks → opp bets → hero calls
+                v_check_bet_call = sd_val_bet
+                # Path: hero bets → opp folds
+                v_bet_fold = pot_won
+                # Path: hero bets → opp calls
+                v_bet_call = sd_val_bet
+
+                # Hero facing opp bet: value
+                v_facing_bet = s1_fold * v_check_bet_fold + s1_call * v_check_bet_call
+
+                # After hero check: opp decides
+                v_after_check = so_check * v_check_check + so_bet * v_facing_bet
+
+                # After hero bet: opp decides (opp fold/call - use simple response)
+                # Opp folds if hand is weak enough. For simplicity, use fixed frequencies
+                # based on pot odds: need 41% equity to call a 70% pot bet
+                # Just use the actual showdown value
+                opp_call_val = -sd_val_bet  # opp's value of calling (negative of hero's)
+                if opp_call_val >= -pot_after_bet * 0.5:  # rough threshold
+                    v_after_bet = v_bet_call
+                else:
+                    v_after_bet = v_bet_fold
+
+                # Root value
+                node_val = s0_check * v_after_check + s0_bet * v_after_bet
+                root_ev[hi, oi] = node_val
+
+                # Update hero root regrets
+                r_check = v_after_check - node_val
+                r_bet = v_after_bet - node_val
+                hero_regrets[0, hi, 0] = max(0.0, hero_regrets[0, hi, 0] + r_check)
+                hero_regrets[0, hi, 1] = max(0.0, hero_regrets[0, hi, 1] + r_bet)
+                hero_strat_sum[0, hi, 0] += s0_check
+                hero_strat_sum[0, hi, 1] += s0_bet
+
+                # Update hero facing-bet regrets
+                r_fold = v_check_bet_fold - v_facing_bet
+                r_call = v_check_bet_call - v_facing_bet
+                hero_regrets[1, hi, 0] = max(0.0, hero_regrets[1, hi, 0] + r_fold)
+                hero_regrets[1, hi, 1] = max(0.0, hero_regrets[1, hi, 1] + r_call)
+
+                # Update opp regrets (after hero check)
+                # Opp utility = -hero utility
+                opp_r_check = -(v_check_check - v_after_check)
+                opp_r_bet = -(v_facing_bet - v_after_check)
+                opp_regrets[0, oi, 0] = max(0.0, opp_regrets[0, oi, 0] + opp_r_check)
+                opp_regrets[0, oi, 1] = max(0.0, opp_regrets[0, oi, 1] + opp_r_bet)
+
+    return root_ev
 
 
 @numba.njit(cache=True)
@@ -952,20 +1147,17 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
                     pot_idx + 1, len(pot_sizes), hero_bet, opp_bet)
 
         # -------------------------------------------------------
-        # Phase 1: Analytical river EVs for continuation values
+        # Phase 1: Scaled analytical river EVs
         # -------------------------------------------------------
-        # Uses (2*equity - 1) * pot for river continuation values.
-        # This is an approximation (slightly overvalues weak hands
-        # since it doesn't model that weak hands fold to river bets),
-        # but is ~100x faster than river CFR and still produces good
-        # backward induction strategies for flop and turn.
-        # The runtime river solver (range_solver.py) handles the
-        # actual river play with full CFR at game time.
+        # River betting amplifies outcomes: winners win more (bet, get
+        # called), losers lose more (face bets, fold or call and lose).
+        # Scale by 1.3x to approximate this effect. This makes the
+        # flop/turn solver correctly fold weak hands facing bets.
         turn_data = {}
 
         seven_lookup = engine._seven
-        pot = hero_bet + opp_bet
         pot_won = min(hero_bet, opp_bet)
+        scaled_pot_won = pot_won * 1.3  # river betting amplification
 
         for turn_card in remaining:
             board_4 = board_3 + [turn_card]
@@ -990,17 +1182,14 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
                 n_river = len(r_hands)
                 r_valid = _build_valid_pairs(r_hands)
 
-                # Compute hand ranks for this river board
                 hand_ranks = np.zeros(n_river, dtype=np.int64)
                 for i, hand in enumerate(r_hands):
                     mask = (1 << hand[0]) | (1 << hand[1]) | board_mask
                     hand_ranks[i] = seven_lookup[mask]
 
-                # Analytical EV: (2*equity - 1) * pot_won
                 r_ev = np.zeros((n_river, n_river), dtype=np.float64)
-                _fill_analytical_ev(r_ev, hand_ranks, r_valid, pot_won, n_river)
+                _fill_analytical_ev(r_ev, hand_ranks, r_valid, scaled_pot_won, n_river)
 
-                # Map river EVs to turn hand indices
                 r_to_t = np.full(n_river, -1, dtype=np.int32)
                 for ri, rh in enumerate(r_hands):
                     ti = turn_idx.get(rh)
@@ -1009,14 +1198,13 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
                 _map_ev_to_parent(ev_sum, ev_count, r_ev, r_valid,
                                   r_to_t, n_river)
 
-            # Average to get turn continuation values
             cont_ev = np.zeros((n_turn, n_turn), dtype=np.float64)
             mask = ev_count > 0
             cont_ev[mask] = ev_sum[mask] / ev_count[mask]
 
             turn_data[turn_card] = (turn_hands, turn_idx, turn_valid, cont_ev)
 
-        logger.info("    Phase 1 (analytical river) done: %.1fs", time.time() - t_pot)
+        logger.info("    Phase 1 (scaled river) done: %.1fs", time.time() - t_pot)
 
         # -------------------------------------------------------
         # Phase 2: Solve all turns, aggregate into flop EVs

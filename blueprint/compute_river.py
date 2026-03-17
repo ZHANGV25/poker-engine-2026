@@ -31,7 +31,7 @@ def main():
 
     # Simplified tree: check/bet 65%, fold/call
     # Use small starting pot to get a compact tree
-    tree = GameTree(90, 90, 2, 100, True)
+    tree = GameTree(20, 20, 2, 100, True)
     flat = _flatten_tree(tree)
     n_hero_nodes = flat['n_hero_nodes']
     n_opp_nodes = flat['n_opp_nodes']
