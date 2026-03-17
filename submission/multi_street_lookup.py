@@ -84,6 +84,12 @@ class MultiStreetLookup:
         """
         import glob
 
+        # Check for LZMA-compressed file (best compression, ~5% of raw size)
+        lzma_path = os.path.join(dir_path, "blueprint.pkl.lzma")
+        if os.path.isfile(lzma_path):
+            self._load_lzma(lzma_path)
+            return
+
         # Check for compact merged file (single or split format)
         compact_path = os.path.join(dir_path, "blueprint_v7.npz")
         split_a = os.path.join(dir_path, "bp_a.npz")
@@ -197,6 +203,34 @@ class MultiStreetLookup:
         # Build node maps for each (board, pot_idx)
         self._build_all_node_maps()
         self._loaded = True
+
+    def _load_lzma(self, fpath):
+        """Load from LZMA-compressed pickle (best compression ratio)."""
+        import lzma, pickle
+        with open(fpath, 'rb') as f:
+            data = pickle.loads(lzma.decompress(f.read()))
+        self._load_compact_merged_dict(data)
+
+        # Load turn data
+        if 'turn_strategies' in data:
+            turn_pot_idx = data.get('turn_pot_idx', 0)
+            turn_strats = data['turn_strategies']
+            turn_cards = data['turn_cards']
+            turn_acts = data.get('turn_action_types')
+            turn_hands = data.get('turn_hands')
+            t_board_ids = data.get('turn_board_ids', data.get('board_ids'))
+
+            for si in range(len(t_board_ids)):
+                bid = int(t_board_ids[si])
+                if bid not in self._boards:
+                    continue
+                self._boards[bid]['_turn_raw'] = {
+                    'strats': turn_strats[si],
+                    'acts': turn_acts[si] if turn_acts is not None else None,
+                    'hands': turn_hands[si] if turn_hands is not None else None,
+                    'cards': turn_cards[si],
+                    'pot_idx': turn_pot_idx,
+                }
 
     def _load_compact_split(self, dir_path):
         """Load from split files (bp_a.npz for flop, bp_b.npz for turn, etc.)."""
