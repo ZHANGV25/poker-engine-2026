@@ -77,14 +77,12 @@ class PlayerAgent(Agent):
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
-        # Load multi-street blueprint in background thread
-        # (avoids blocking __init__ while still being ready for postflop)
-        self._multi_street = None
-        self._multi_street_loaded = False
-        self._blueprints = {}
-        import threading
-        self._load_thread = threading.Thread(target=self._background_load, daemon=True)
-        self._load_thread.start()
+        # Load multi-street blueprint synchronously in __init__.
+        # Server startup isn't time-limited — only individual actions are (5s).
+        # Loading 750MB takes ~30s on ARM64 but happens before any actions.
+        self._multi_street = self._load_multi_street()
+        self._blueprints = self._load_blueprints()
+        self._multi_street_loaded = True
 
         self._current_hand = -1
         self._opp_weights = None
@@ -104,12 +102,6 @@ class PlayerAgent(Agent):
     # ----------------------------------------------------------------
     #  INIT HELPERS
     # ----------------------------------------------------------------
-
-    def _background_load(self):
-        """Load heavy data in background thread."""
-        self._multi_street = self._load_multi_street()
-        self._blueprints = self._load_blueprints()
-        self._multi_street_loaded = True
 
     def _load_preflop_table(self):
         path = os.path.join(_dir, "data", "preflop_potential.npz")
@@ -422,11 +414,6 @@ class PlayerAgent(Agent):
             3. Single-street blueprint
             4. Range solver (river) or one-hand solver (flop/turn)
         """
-        # Wait for background blueprint load on first postflop call.
-        # This may take 10-20s on ARM64 but uses the time bank, not
-        # the per-action timeout (which only applies to the API response).
-        if not self._multi_street_loaded and hasattr(self, '_load_thread'):
-            self._load_thread.join(timeout=30)
 
         dead = my_discards + opp_discards
         my_bet, opp_bet = observation["my_bet"], observation["opp_bet"]
