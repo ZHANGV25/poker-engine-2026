@@ -199,20 +199,69 @@ class MultiStreetLookup:
         self._loaded = True
 
     def _load_compact_split(self, dir_path):
-        """Load from split files (bp_a/b/c1/c2/d.npz or blueprint_v7_flop/turn.npz)."""
-        merged = {}
-        # Load all bp_*.npz or blueprint_v7_*.npz files and merge keys
+        """Load from split files (bp_a.npz for flop, bp_b.npz for turn, etc.)."""
         import glob
-        for pattern in ["bp_*.npz", "blueprint_v7_*.npz"]:
-            for fpath in sorted(glob.glob(os.path.join(dir_path, pattern))):
-                data = np.load(fpath, allow_pickle=True)
-                for k in data.files:
-                    if k in merged:
-                        # Concatenate split arrays (e.g., turn_strategies split by board)
-                        merged[k] = np.concatenate([merged[k], data[k]], axis=0)
-                    else:
-                        merged[k] = data[k]
+
+        # Load flop data first
+        merged = {}
+        for fpath in sorted(glob.glob(os.path.join(dir_path, "bp_a*.npz"))):
+            data = np.load(fpath, allow_pickle=True)
+            for k in data.files:
+                merged[k] = data[k]
+        for fpath in sorted(glob.glob(os.path.join(dir_path, "blueprint_v7_flop*.npz"))):
+            data = np.load(fpath, allow_pickle=True)
+            for k in data.files:
+                merged[k] = data[k]
+
+        # Load flop boards
         self._load_compact_merged_dict(merged)
+
+        # Now load turn data separately (may cover partial boards)
+        turn_pot_idx = int(merged.get('turn_pot_idx', 0))
+        for pattern in ["bp_b*.npz", "bp_c*.npz", "bp_d*.npz", "blueprint_v7_turn*.npz"]:
+            for fpath in sorted(glob.glob(os.path.join(dir_path, pattern))):
+                td = np.load(fpath, allow_pickle=True)
+                if 'turn_strategies' not in td:
+                    continue
+
+                turn_strats = td['turn_strategies']
+                turn_cards = td['turn_cards']
+                turn_acts = td.get('turn_action_types')
+                turn_hands = td.get('turn_hands')
+
+                # Determine which boards this file covers
+                if 'turn_board_ids' in td:
+                    # Partial: explicit board ID mapping
+                    t_board_ids = td['turn_board_ids']
+                else:
+                    # Full: same order as flop board_ids
+                    t_board_ids = merged.get('board_ids',
+                        np.arange(turn_strats.shape[0], dtype=np.int32))
+
+                for si in range(len(t_board_ids)):
+                    bid = int(t_board_ids[si])
+                    if bid not in self._boards:
+                        continue
+
+                    turn_data = {}
+                    for ti in range(turn_cards.shape[1]):
+                        tc = int(turn_cards[si, ti])
+                        t_h = turn_hands[si, ti] if turn_hands is not None else None
+                        t_hmap = {}
+                        if t_h is not None:
+                            for hi in range(len(t_h)):
+                                c1, c2 = int(t_h[hi][0]), int(t_h[hi][1])
+                                if c1 == 0 and c2 == 0 and hi > 0:
+                                    break
+                                t_hmap[(min(c1, c2), max(c1, c2))] = hi
+                        turn_data[tc] = {
+                            'hands': t_h,
+                            'hand_map': t_hmap,
+                            'pot_strategies': {turn_pot_idx: turn_strats[si, ti]},
+                            'pot_actions': {turn_pot_idx: turn_acts[si, ti]} if turn_acts is not None else {},
+                        }
+
+                    self._boards[bid]['turn_data'] = turn_data
 
     def _load_compact_merged(self, fpath):
         """Load all boards from a compact stacked .npz file."""
