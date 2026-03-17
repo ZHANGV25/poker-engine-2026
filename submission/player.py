@@ -304,6 +304,11 @@ class PlayerAgent(Agent):
                         amt = ps['raise_levels'][chosen - 2] - opp_bet
                         amt = max(amt, observation["min_raise"])
                         amt = min(amt, observation["max_raise"])
+                        # Cap raise size: limits damage from raise-then-fold-to-3bet
+                        # pattern caused by preflop bucketing abstraction error.
+                        # Passive opponents fold to any raise size (same value).
+                        # Aggressive opponents 3-bet us: lose 8 instead of 60.
+                        amt = min(amt, 8)
                         if amt > 0 and valid[RAISE]:
                             return (RAISE, amt, 0, 0)
                         return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
