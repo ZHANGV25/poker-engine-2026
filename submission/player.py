@@ -49,11 +49,33 @@ except Exception:
     _PRELOAD['done'] = True
 
 def _deferred_load():
-    """Load LZMA turn+opp data in background after server starts."""
+    """Load LZMA turn+opp+river data in background after server starts."""
+    import lzma, pickle
     try:
         if _PRELOAD['multi_street'] and os.path.isdir(_data_dir):
             _PRELOAD['multi_street']._load_lzma_deferred(_data_dir)
             _PRELOAD['multi_street']._build_all_node_maps()
+    except Exception:
+        pass
+    # Load river GTO strategies
+    try:
+        river_path = os.path.join(_dir, "data", "river_gto.pkl.lzma")
+        if os.path.isfile(river_path):
+            with open(river_path, 'rb') as f:
+                river_data = pickle.loads(lzma.decompress(f.read()))
+            # Build board -> index mapping
+            boards = river_data['boards']
+            river_lookup = {}
+            for i in range(len(boards)):
+                key = tuple(sorted(int(c) for c in boards[i]))
+                river_lookup[key] = i
+            _PRELOAD['river'] = {
+                'strategies': river_data['strategies'],
+                'hands': river_data['hands'],
+                'n_hands': river_data['n_hands'],
+                'action_types': river_data['action_types'],
+                'lookup': river_lookup,
+            }
     except Exception:
         pass
     _PRELOAD['deferred_done'] = True
@@ -489,70 +511,69 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. River: analytical GTO from first principles
-        # On the river, equity is deterministic. The Nash equilibrium
-        # is derived from pot odds and minimum defense frequency.
-        # No lookup tables — just math on the actual pot/bet/equity.
+        # 3. River: precomputed range-balanced CFR strategies
+        # Same approach as flop/turn: per-board, per-hand, range-balanced.
+        # Falls back to pot-odds if river data not loaded yet.
         if street == 3:
+            self._path_counts['range_solver'] += 1
+            river = _PRELOAD.get('river')
+
+            if river and len(board) == 5:
+                board_key = tuple(sorted(int(c) for c in board))
+                board_idx = river['lookup'].get(board_key)
+
+                if board_idx is not None:
+                    # Find our hand in the hand list
+                    c1, c2 = min(int(my_cards[0]), int(my_cards[1])), max(int(my_cards[0]), int(my_cards[1]))
+                    hands = river['hands'][board_idx]
+                    n_h = int(river['n_hands'][board_idx])
+                    hand_idx = None
+                    for hi in range(n_h):
+                        if int(hands[hi][0]) == c1 and int(hands[hi][1]) == c2:
+                            hand_idx = hi
+                            break
+
+                    if hand_idx is not None:
+                        strats = river['strategies'][board_idx]  # (231, n_hero, n_act)
+                        acts = river['action_types']  # (n_hero, n_act)
+
+                        # Find correct node (root if not facing bet, facing-bet node otherwise)
+                        facing_bet = opp_bet > my_bet
+                        node_idx = 0
+                        if facing_bet and strats.shape[1] > 1:
+                            node_idx = 1  # second hero node = facing bet
+
+                        raw = strats[hand_idx, node_idx, :]
+                        act_ids = acts[node_idx, :]
+                        probs = raw.astype(np.float64) / 255.0
+
+                        # Sample from strategy
+                        result = {}
+                        total = 0.0
+                        for a in range(len(probs)):
+                            if act_ids[a] >= 0 and probs[a] > 0:
+                                result[int(act_ids[a])] = float(probs[a])
+                                total += probs[a]
+                        if result and total > 0:
+                            for k in result:
+                                result[k] /= total
+                            action = self._try_strategy(result, observation)
+                            if action is not None:
+                                return action
+
+            # Fallback: pot-odds (if river data not loaded or lookup fails)
             equity = self.engine.compute_equity(
                 my_cards, board, dead, self._opp_weights)
-            self._path_counts['range_solver'] += 1
-
             facing_bet = opp_bet > my_bet
             pot = my_bet + opp_bet
-            min_r = observation["min_raise"]
-            max_r = observation["max_raise"]
-
             if facing_bet:
-                # Facing a bet of size B into pot P.
-                # GTO call threshold: equity > B / (P + B)
-                # (pot odds — we risk B to win P+B)
                 bet_size = opp_bet - my_bet
-                call_threshold = bet_size / (pot + bet_size) if (pot + bet_size) > 0 else 0.5
-
-                if equity >= 0.85 and valid[RAISE] and max_r > 0:
-                    # Very strong: raise for value
-                    raise_amt = max(int(pot * 0.65), min_r)
-                    raise_amt = min(raise_amt, max_r)
-                    return (RAISE, raise_amt, 0, 0)
-                elif equity >= call_threshold:
-                    # Equity justifies calling
+                threshold = bet_size / (pot + bet_size) if (pot + bet_size) > 0 else 0.5
+                if equity >= threshold:
                     return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
-                else:
-                    # Below pot odds — fold
-                    return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
+                return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
             else:
-                # Not facing a bet. GTO polarized betting:
-                # Choose a bet size B. Then:
-                #   alpha = B / (B + P) — bluff ratio
-                #   Value bet with top hands (equity > 1 - alpha/2)
-                #   Bluff with bottom hands (equity < alpha * 0.4)
-                #   Check everything in between
-                bet_frac = 0.65
-                B = max(int(pot * bet_frac), 1)
-                alpha = B / (B + pot) if (B + pot) > 0 else 0.4
-
-                # Value threshold: bet when we're strong enough that
-                # worse hands in opponent's range will call
-                value_threshold = 1.0 - alpha * 0.5
-
-                # Bluff threshold: bet with worst hands (nothing to lose)
-                # Bluff frequency should make opponent indifferent
-                bluff_threshold = alpha * 0.3
-
-                rng = np.random.random()
-
-                if equity >= value_threshold and valid[RAISE] and max_r > 0:
-                    raise_amt = max(B, min_r)
-                    raise_amt = min(raise_amt, max_r)
-                    return (RAISE, raise_amt, 0, 0)
-                elif equity <= bluff_threshold and valid[RAISE] and pot > 4 and rng < 0.5:
-                    # Bluff with 50% frequency (mixing)
-                    raise_amt = max(B, min_r)
-                    raise_amt = min(raise_amt, max_r)
-                    return (RAISE, raise_amt, 0, 0)
-                else:
-                    return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
+                return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
 
         # 4. Single-street blueprint (FALLBACK — should not fire if above work)
         bp = self._blueprints.get(street)
