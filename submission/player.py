@@ -32,19 +32,33 @@ from game_tree import (
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
 )
 
-# Preload at module import time. No threading — numpy holds GIL
-# during large file reads, blocking the API server from responding.
-_PRELOAD = {'multi_street': None, 'done': False}
+# Preload at module import time.
+# Phase 1 (synchronous): load flop from npz (fast, ~4s)
+# Phase 2 (background): decompress turn+opp from LZMA (slow, ~10s)
+import threading
+_PRELOAD = {'multi_street': None, 'done': False, 'deferred_done': False}
+_data_dir = os.path.join(_dir, "data", "multi_street")
 try:
     _pre_engine = ExactEquityEngine()
     from multi_street_lookup import MultiStreetLookup
-    _data_dir = os.path.join(_dir, "data", "multi_street")
     if os.path.isdir(_data_dir):
         _PRELOAD['multi_street'] = MultiStreetLookup(
             _data_dir, equity_engine=_pre_engine)
     _PRELOAD['done'] = True
 except Exception:
     _PRELOAD['done'] = True
+
+def _deferred_load():
+    """Load LZMA turn+opp data in background after server starts."""
+    try:
+        if _PRELOAD['multi_street'] and os.path.isdir(_data_dir):
+            _PRELOAD['multi_street']._load_lzma_deferred(_data_dir)
+            _PRELOAD['multi_street']._build_all_node_maps()
+    except Exception:
+        pass
+    _PRELOAD['deferred_done'] = True
+
+threading.Thread(target=_deferred_load, daemon=True).start()
 
 # Graceful imports for optional modules
 try:

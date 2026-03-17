@@ -210,27 +210,50 @@ class MultiStreetLookup:
         with open(fpath, 'rb') as f:
             data = pickle.loads(lzma.decompress(f.read()))
         self._load_compact_merged_dict(data)
+        self._load_turn_from_dict(data)
 
-        # Load turn data
-        if 'turn_strategies' in data:
-            turn_pot_idx = data.get('turn_pot_idx', 0)
-            turn_strats = data['turn_strategies']
-            turn_cards = data['turn_cards']
-            turn_acts = data.get('turn_action_types')
-            turn_hands = data.get('turn_hands')
-            t_board_ids = data.get('turn_board_ids', data.get('board_ids'))
+    def _load_turn_from_dict(self, data):
+        """Load turn data from a dict into existing boards."""
+        if 'turn_strategies' not in data:
+            return
+        turn_pot_idx = data.get('turn_pot_idx', 0)
+        turn_strats = data['turn_strategies']
+        turn_cards = data['turn_cards']
+        turn_acts = data.get('turn_action_types')
+        turn_hands = data.get('turn_hands')
+        t_board_ids = data.get('turn_board_ids', data.get('board_ids'))
 
-            for si in range(len(t_board_ids)):
-                bid = int(t_board_ids[si])
-                if bid not in self._boards:
-                    continue
-                self._boards[bid]['_turn_raw'] = {
-                    'strats': turn_strats[si],
-                    'acts': turn_acts[si] if turn_acts is not None else None,
-                    'hands': turn_hands[si] if turn_hands is not None else None,
-                    'cards': turn_cards[si],
-                    'pot_idx': turn_pot_idx,
-                }
+        for si in range(len(t_board_ids)):
+            bid = int(t_board_ids[si])
+            if bid not in self._boards:
+                continue
+            self._boards[bid]['_turn_raw'] = {
+                'strats': turn_strats[si],
+                'acts': turn_acts[si] if turn_acts is not None else None,
+                'hands': turn_hands[si] if turn_hands is not None else None,
+                'cards': turn_cards[si],
+                'pot_idx': turn_pot_idx,
+            }
+
+    def _load_lzma_deferred(self, dir_path):
+        """Load turn and opp data from LZMA files (called after init)."""
+        import lzma, pickle, os
+        for fname in ['turn.pkl.lzma', 'opp.pkl.lzma']:
+            fpath = os.path.join(dir_path, fname)
+            if not os.path.isfile(fpath):
+                continue
+            with open(fpath, 'rb') as f:
+                data = pickle.loads(lzma.decompress(f.read()))
+            if 'turn_strategies' in data:
+                self._load_turn_from_dict(data)
+            if 'flop_opp_strategies' in data:
+                opp_strats = data['flop_opp_strategies']
+                opp_acts = data['opp_action_types']
+                board_ids = list(self._boards.keys())
+                for i, bid in enumerate(sorted(board_ids)):
+                    if i < len(opp_strats):
+                        self._boards[bid]['opp_strategies'] = opp_strats[i]
+                        self._boards[bid]['opp_action_types'] = opp_acts[i]
 
     def _load_compact_split(self, dir_path):
         """Load from split files (bp_a.npz for flop, bp_b.npz for turn, etc.)."""
