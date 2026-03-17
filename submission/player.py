@@ -304,10 +304,15 @@ class PlayerAgent(Agent):
                         amt = ps['raise_levels'][chosen - 2] - opp_bet
                         amt = max(amt, observation["min_raise"])
                         amt = min(amt, observation["max_raise"])
-                        # Cap preflop raises — in this 27-card deck, equities
-                        # are compressed so large raises are high variance for
-                        # tiny edge. Keep pots small, win postflop.
-                        amt = min(amt, 16)
+                        # Cap total preflop bet to 16. In this 27-card deck,
+                        # equities are compressed — big preflop pots are
+                        # coinflips. Win postflop where we have real edges.
+                        max_total_bet = 16
+                        if my_bet + amt > max_total_bet:
+                            # Don't raise above cap — call or fold instead
+                            if valid[CALL]:
+                                return (CALL, 0, 0, 0)
+                            return (CHECK, 0, 0, 0) if valid[CHECK] else (FOLD, 0, 0, 0)
                         if amt > 0 and valid[RAISE]:
                             return (RAISE, amt, 0, 0)
                         return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
