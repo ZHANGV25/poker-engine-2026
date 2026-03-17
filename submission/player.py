@@ -489,11 +489,10 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. River: CFR-derived GTO strategy lookup table
-        # Extracted from 500-iteration CFR across 10 boards.
-        # Strategy is a function of equity percentile (deterministic on river).
-        # Each row: [check%, bet_40%, bet_100%, bet_150%] for root node
-        #           [fold%, call%, r40%, r70%, r100%, r150%] for facing bet
+        # 3. River: analytical GTO from first principles
+        # On the river, equity is deterministic. The Nash equilibrium
+        # is derived from pot odds and minimum defense frequency.
+        # No lookup tables — just math on the actual pot/bet/equity.
         if street == 3:
             equity = self.engine.compute_equity(
                 my_cards, board, dead, self._opp_weights)
@@ -504,91 +503,56 @@ class PlayerAgent(Agent):
             min_r = observation["min_raise"]
             max_r = observation["max_raise"]
 
-            # Equity bin (5% increments)
-            eq_bin = min(int(equity * 20), 19)  # 0-19
-
             if facing_bet:
-                # CFR facing-bet table: [fold, call, r40, r70, r100, r150]
-                FB = [
-                    [0.95, 0.00, 0.01, 0.01, 0.00, 0.03],  # 0-5%
-                    [0.94, 0.00, 0.01, 0.01, 0.00, 0.03],  # 5-10%
-                    [0.95, 0.00, 0.01, 0.01, 0.00, 0.03],  # 10-15%
-                    [0.95, 0.00, 0.01, 0.01, 0.00, 0.03],  # 15-20%
-                    [0.87, 0.00, 0.03, 0.01, 0.02, 0.06],  # 20-25%
-                    [0.83, 0.08, 0.03, 0.01, 0.01, 0.04],  # 25-30%
-                    [0.70, 0.20, 0.03, 0.01, 0.01, 0.04],  # 30-35%
-                    [0.55, 0.40, 0.02, 0.01, 0.00, 0.03],  # 35-40%
-                    [0.30, 0.64, 0.01, 0.01, 0.00, 0.03],  # 40-45%
-                    [0.29, 0.68, 0.01, 0.01, 0.00, 0.02],  # 45-50%
-                    [0.55, 0.42, 0.01, 0.01, 0.00, 0.02],  # 50-55%
-                    [0.18, 0.81, 0.01, 0.00, 0.00, 0.01],  # 55-60%
-                    [0.25, 0.61, 0.01, 0.02, 0.01, 0.09],  # 60-65%
-                    [0.07, 0.85, 0.01, 0.02, 0.00, 0.05],  # 65-70%
-                    [0.01, 0.91, 0.02, 0.01, 0.00, 0.04],  # 70-75%
-                    [0.01, 0.86, 0.03, 0.03, 0.02, 0.04],  # 75-80%
-                    [0.00, 0.93, 0.02, 0.02, 0.01, 0.02],  # 80-85%
-                    [0.00, 0.00, 0.53, 0.29, 0.06, 0.12],  # 85-90%
-                    [0.00, 0.00, 0.32, 0.52, 0.11, 0.05],  # 90-95%
-                    [0.00, 0.00, 0.00, 0.01, 0.09, 0.89],  # 95-100%
-                ]
-                probs = FB[eq_bin]
-                r = np.random.random()
-                cum = 0.0
-                for i, p in enumerate(probs):
-                    cum += p
-                    if r < cum:
-                        if i == 0:
-                            return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
-                        elif i == 1:
-                            return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
-                        elif valid[RAISE] and max_r > 0:
-                            frac = [0.40, 0.70, 1.00, 1.50][i - 2]
-                            amt = max(int(pot * frac), min_r)
-                            amt = min(amt, max_r)
-                            return (RAISE, amt, 0, 0)
-                        else:
-                            return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
-                return (CHECK, 0, 0, 0) if valid[CHECK] else (FOLD, 0, 0, 0)
+                # Facing a bet of size B into pot P.
+                # GTO call threshold: equity > B / (P + B)
+                # (pot odds — we risk B to win P+B)
+                bet_size = opp_bet - my_bet
+                call_threshold = bet_size / (pot + bet_size) if (pot + bet_size) > 0 else 0.5
+
+                if equity >= 0.85 and valid[RAISE] and max_r > 0:
+                    # Very strong: raise for value
+                    raise_amt = max(int(pot * 0.65), min_r)
+                    raise_amt = min(raise_amt, max_r)
+                    return (RAISE, raise_amt, 0, 0)
+                elif equity >= call_threshold:
+                    # Equity justifies calling
+                    return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
+                else:
+                    # Below pot odds — fold
+                    return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
             else:
-                # CFR root table: [check, bet_40%, bet_100%, bet_150%]
-                RT = [
-                    [0.59, 0.24, 0.09, 0.09],  # 0-5%
-                    [0.74, 0.17, 0.04, 0.06],  # 5-10%
-                    [0.71, 0.16, 0.09, 0.04],  # 10-15%
-                    [0.88, 0.06, 0.03, 0.02],  # 15-20%
-                    [0.96, 0.02, 0.01, 0.01],  # 20-25%
-                    [0.91, 0.07, 0.01, 0.01],  # 25-30%
-                    [0.99, 0.01, 0.00, 0.00],  # 30-35%
-                    [0.99, 0.01, 0.00, 0.00],  # 35-40%
-                    [0.89, 0.01, 0.05, 0.05],  # 40-45%
-                    [0.99, 0.01, 0.00, 0.00],  # 45-50%
-                    [0.98, 0.01, 0.00, 0.00],  # 50-55%
-                    [0.97, 0.02, 0.01, 0.00],  # 55-60%
-                    [0.94, 0.04, 0.01, 0.01],  # 60-65%
-                    [0.85, 0.13, 0.01, 0.01],  # 65-70%
-                    [0.70, 0.28, 0.02, 0.01],  # 70-75%
-                    [0.50, 0.46, 0.04, 0.01],  # 75-80%
-                    [0.65, 0.29, 0.05, 0.01],  # 80-85%
-                    [0.56, 0.31, 0.10, 0.04],  # 85-90%
-                    [0.42, 0.28, 0.17, 0.13],  # 90-95%
-                    [0.48, 0.22, 0.14, 0.16],  # 95-100%
-                ]
-                probs = RT[eq_bin]
-                r = np.random.random()
-                cum = 0.0
-                for i, p in enumerate(probs):
-                    cum += p
-                    if r < cum:
-                        if i == 0:
-                            return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
-                        elif valid[RAISE] and max_r > 0:
-                            frac = [0.40, 1.00, 1.50][i - 1]
-                            amt = max(int(pot * frac), min_r)
-                            amt = min(amt, max_r)
-                            return (RAISE, amt, 0, 0)
-                        else:
-                            return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
-                return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
+                # Not facing a bet. GTO polarized betting:
+                # Choose a bet size B. Then:
+                #   alpha = B / (B + P) — bluff ratio
+                #   Value bet with top hands (equity > 1 - alpha/2)
+                #   Bluff with bottom hands (equity < alpha * 0.4)
+                #   Check everything in between
+                bet_frac = 0.65
+                B = max(int(pot * bet_frac), 1)
+                alpha = B / (B + pot) if (B + pot) > 0 else 0.4
+
+                # Value threshold: bet when we're strong enough that
+                # worse hands in opponent's range will call
+                value_threshold = 1.0 - alpha * 0.5
+
+                # Bluff threshold: bet with worst hands (nothing to lose)
+                # Bluff frequency should make opponent indifferent
+                bluff_threshold = alpha * 0.3
+
+                rng = np.random.random()
+
+                if equity >= value_threshold and valid[RAISE] and max_r > 0:
+                    raise_amt = max(B, min_r)
+                    raise_amt = min(raise_amt, max_r)
+                    return (RAISE, raise_amt, 0, 0)
+                elif equity <= bluff_threshold and valid[RAISE] and pot > 4 and rng < 0.5:
+                    # Bluff with 50% frequency (mixing)
+                    raise_amt = max(B, min_r)
+                    raise_amt = min(raise_amt, max_r)
+                    return (RAISE, raise_amt, 0, 0)
+                else:
+                    return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
 
         # 4. Single-street blueprint (FALLBACK — should not fire if above work)
         bp = self._blueprints.get(street)
