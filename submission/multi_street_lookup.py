@@ -238,30 +238,19 @@ class MultiStreetLookup:
                     t_board_ids = merged.get('board_ids',
                         np.arange(turn_strats.shape[0], dtype=np.int32))
 
+                # Store raw turn arrays — build hand maps lazily on first access
                 for si in range(len(t_board_ids)):
                     bid = int(t_board_ids[si])
                     if bid not in self._boards:
                         continue
 
-                    turn_data = {}
-                    for ti in range(turn_cards.shape[1]):
-                        tc = int(turn_cards[si, ti])
-                        t_h = turn_hands[si, ti] if turn_hands is not None else None
-                        t_hmap = {}
-                        if t_h is not None:
-                            for hi in range(len(t_h)):
-                                c1, c2 = int(t_h[hi][0]), int(t_h[hi][1])
-                                if c1 == 0 and c2 == 0 and hi > 0:
-                                    break
-                                t_hmap[(min(c1, c2), max(c1, c2))] = hi
-                        turn_data[tc] = {
-                            'hands': t_h,
-                            'hand_map': t_hmap,
-                            'pot_strategies': {turn_pot_idx: turn_strats[si, ti]},
-                            'pot_actions': {turn_pot_idx: turn_acts[si, ti]} if turn_acts is not None else {},
-                        }
-
-                    self._boards[bid]['turn_data'] = turn_data
+                    self._boards[bid]['_turn_raw'] = {
+                        'strats': turn_strats[si],
+                        'acts': turn_acts[si] if turn_acts is not None else None,
+                        'hands': turn_hands[si] if turn_hands is not None else None,
+                        'cards': turn_cards[si],
+                        'pot_idx': turn_pot_idx,
+                    }
 
     def _load_compact_merged(self, fpath):
         """Load all boards from a compact stacked .npz file."""
@@ -492,44 +481,37 @@ class MultiStreetLookup:
         self._loaded = True
 
     def _build_all_node_maps(self):
-        """Build game tree node maps for bet-state matching."""
+        """Build game tree node maps lazily — only build per-pot template once."""
         if self._pot_sizes is None:
             return
 
-        for bid in self._boards:
-            bd = self._boards[bid]
-            ps = bd['pot_sizes']
-            has_opp = 'opp_strategies' in bd
-            for pi in range(len(ps)):
-                hb, ob = int(ps[pi][0]), int(ps[pi][1])
-                try:
-                    tree = GameTree(hb, ob, 2, 100, True)
-                    # Hero (P0) node map
-                    node_info = []
-                    for i, nid in enumerate(tree.hero_node_ids):
-                        acts = [a for a, _ in tree.children[nid]]
-                        node_info.append((
-                            i,
-                            tree.hero_pot[nid],
-                            tree.opp_pot[nid],
-                            ACT_FOLD in acts,
-                        ))
-                    self._node_maps[(bid, pi)] = node_info
+        # Build ONE node map per pot size (same for all boards)
+        # instead of per-board × per-pot (20,475 trees → 7 trees)
+        sample_bid = next(iter(self._boards))
+        has_opp = 'opp_strategies' in self._boards[sample_bid]
+        ps = self._pot_sizes
 
-                    # Opp (P1) node map — for position-aware play
-                    if has_opp:
-                        opp_info = []
-                        for i, nid in enumerate(tree.opp_node_ids):
-                            acts = [a for a, _ in tree.children[nid]]
-                            opp_info.append((
-                                i,
-                                tree.hero_pot[nid],
-                                tree.opp_pot[nid],
-                                ACT_FOLD in acts,
-                            ))
-                        self._node_maps[(bid, pi, 'opp')] = opp_info
-                except Exception:
-                    self._node_maps[(bid, pi)] = [(0, hb, ob, False)]
+        self._pot_node_maps = {}
+        self._pot_opp_node_maps = {}
+
+        for pi in range(len(ps)):
+            hb, ob = int(ps[pi][0]), int(ps[pi][1])
+            try:
+                tree = GameTree(hb, ob, 2, 100, True)
+                node_info = []
+                for i, nid in enumerate(tree.hero_node_ids):
+                    acts = [a for a, _ in tree.children[nid]]
+                    node_info.append((i, tree.hero_pot[nid], tree.opp_pot[nid], ACT_FOLD in acts))
+                self._pot_node_maps[pi] = node_info
+
+                if has_opp:
+                    opp_info = []
+                    for i, nid in enumerate(tree.opp_node_ids):
+                        acts = [a for a, _ in tree.children[nid]]
+                        opp_info.append((i, tree.hero_pot[nid], tree.opp_pot[nid], ACT_FOLD in acts))
+                    self._pot_opp_node_maps[pi] = opp_info
+            except Exception:
+                self._pot_node_maps[pi] = [(0, hb, ob, False)]
 
     @property
     def n_boards(self):
@@ -646,6 +628,29 @@ class MultiStreetLookup:
             return None
 
         bd = self._boards[board_id]
+
+        # Lazy build turn data from raw arrays on first access
+        if '_turn_raw' in bd and not bd.get('turn_data'):
+            raw = bd['_turn_raw']
+            turn_data = {}
+            for ti in range(len(raw['cards'])):
+                tc = int(raw['cards'][ti])
+                t_h = raw['hands'][ti] if raw['hands'] is not None else None
+                t_hmap = {}
+                if t_h is not None:
+                    for hi in range(len(t_h)):
+                        c1, c2 = int(t_h[hi][0]), int(t_h[hi][1])
+                        if c1 == 0 and c2 == 0 and hi > 0:
+                            break
+                        t_hmap[(min(c1, c2), max(c1, c2))] = hi
+                turn_data[tc] = {
+                    'hands': t_h,
+                    'hand_map': t_hmap,
+                    'pot_strategies': {raw['pot_idx']: raw['strats'][ti]},
+                    'pot_actions': {raw['pot_idx']: raw['acts'][ti]} if raw['acts'] is not None else {},
+                }
+            bd['turn_data'] = turn_data
+
         turn_data = bd.get('turn_data', {})
         turn_card = int(board[3])
 
@@ -840,7 +845,7 @@ class MultiStreetLookup:
 
     def _find_node(self, my_bet, opp_bet, board_id, pot_idx):
         """Find hero node index for current bet state."""
-        node_info = self._node_maps.get((board_id, pot_idx))
+        node_info = self._pot_node_maps.get(pot_idx)
         if not node_info:
             return 0
 
@@ -882,7 +887,7 @@ class MultiStreetLookup:
         In the tree, P1 nodes have hero_pot=P0's bet, opp_pot=P1's bet.
         So we swap: match hp against opp_bet, op against my_bet.
         """
-        node_info = self._node_maps.get((board_id, pot_idx, 'opp'))
+        node_info = self._pot_opp_node_maps.get(pot_idx)
         if not node_info:
             # Fall back to hero node matching
             return self._find_node(my_bet, opp_bet, board_id, pot_idx)
