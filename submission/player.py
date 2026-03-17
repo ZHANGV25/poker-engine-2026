@@ -77,12 +77,18 @@ class PlayerAgent(Agent):
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
-        # Load multi-street blueprint synchronously in __init__.
-        # Server startup isn't time-limited — only individual actions are (5s).
-        # Loading 750MB takes ~30s on ARM64 but happens before any actions.
-        self._multi_street = self._load_multi_street()
-        self._blueprints = self._load_blueprints()
-        self._multi_street_loaded = True
+        # Load multi-street blueprint in background thread.
+        # Server must start fast (validation counts startup time).
+        # Use one-hand solver fallback until blueprint is ready.
+        self._multi_street = None
+        self._multi_street_loaded = False
+        self._blueprints = {}
+        import threading
+        def _bg_load():
+            self._multi_street = self._load_multi_street()
+            self._blueprints = self._load_blueprints()
+            self._multi_street_loaded = True
+        threading.Thread(target=_bg_load, daemon=True).start()
 
         self._current_hand = -1
         self._opp_weights = None
