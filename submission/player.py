@@ -623,6 +623,28 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
+        # Wait for deferred data (turn + river) to load.
+        # Tank 4s per action (under 5s timeout), fold/check until ready.
+        # Costs ~30 chips in blinds but prevents 100+ chip losses from
+        # playing without proper strategies.
+        if not _PRELOAD.get('deferred_done', False):
+            import time as _t
+            _t.sleep(4.0)
+            # Re-check after sleep
+            if not self._multi_street_loaded and _PRELOAD.get('done'):
+                self._multi_street = _PRELOAD.get('multi_street')
+                self._multi_street_loaded = True
+            if not _PRELOAD.get('deferred_done', False):
+                valid = observation["valid_actions"]
+                if valid[DISCARD]:
+                    my, board, opp_d, _ = self._parse_cards(observation)
+                    return self._handle_discard(observation, my, board, opp_d)
+                if valid[CHECK]:
+                    return (CHECK, 0, 0, 0)
+                if valid[FOLD]:
+                    return (FOLD, 0, 0, 0)
+                return (CALL, 0, 0, 0)
+
 
         # Lead protection — if we can survive on blinds alone, fold everything
         # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
