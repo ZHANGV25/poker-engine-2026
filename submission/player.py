@@ -422,8 +422,11 @@ class PlayerAgent(Agent):
             3. Single-street blueprint
             4. Range solver (river) or one-hand solver (flop/turn)
         """
-        # If background load hasn't finished, skip blueprint (use fallback solvers)
-        # Don't block — the 5s per-action timeout would kill us
+        # Wait for background blueprint load on first postflop call.
+        # This may take 10-20s on ARM64 but uses the time bank, not
+        # the per-action timeout (which only applies to the API response).
+        if not self._multi_street_loaded and hasattr(self, '_load_thread'):
+            self._load_thread.join(timeout=30)
 
         dead = my_discards + opp_discards
         my_bet, opp_bet = observation["my_bet"], observation["opp_bet"]
