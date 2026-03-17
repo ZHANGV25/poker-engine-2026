@@ -468,19 +468,47 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. Range solver (river — adapts to narrowed opponent range)
-        # Only use if enough time (ARM64 is ~10-20x slower than x86)
-        if street == 3 and self._opp_weights and time_left > 200:
-            action = self.range_solver.solve_and_act(
-                hero_cards=my_cards, board=board,
-                opp_range=self._opp_weights, dead_cards=dead,
-                my_bet=my_bet, opp_bet=opp_bet, street=street,
-                min_raise=observation["min_raise"],
-                max_raise=observation["max_raise"],
-                valid_actions=valid, time_remaining=time_left)
-            if action is not None:
-                self._path_counts['range_solver'] += 1
-                return action
+        # 3. River: equity-threshold strategy
+        # The range solver with 10-30 iterations doesn't converge on ARM64,
+        # producing random over-aggressive strategies (-21K chips in 10 matches).
+        # Instead, use exact equity with simple polarized thresholds.
+        if street == 3:
+            equity = self.engine.compute_equity(
+                my_cards, board, dead, self._opp_weights)
+            self._path_counts['range_solver'] += 1
+
+            facing_bet = opp_bet > my_bet
+            pot = my_bet + opp_bet
+
+            if facing_bet:
+                cost = opp_bet - my_bet
+                pot_odds = cost / (cost + pot) if (cost + pot) > 0 else 0.5
+                if equity >= pot_odds + 0.05:
+                    # Strong enough to call
+                    if equity > 0.75 and valid[RAISE]:
+                        # Very strong — raise for value
+                        raise_amt = max(int(pot * 0.6), observation["min_raise"])
+                        raise_amt = min(raise_amt, observation["max_raise"])
+                        return (RAISE, raise_amt, 0, 0)
+                    return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
+                else:
+                    # Too weak to call
+                    return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
+            else:
+                # Not facing bet — check or bet
+                if equity > 0.72 and valid[RAISE]:
+                    # Strong hand — value bet
+                    raise_amt = max(int(pot * 0.6), observation["min_raise"])
+                    raise_amt = min(raise_amt, observation["max_raise"])
+                    return (RAISE, raise_amt, 0, 0)
+                elif equity < 0.15 and valid[RAISE] and pot > 6:
+                    # Very weak — small bluff (polarized)
+                    raise_amt = max(int(pot * 0.35), observation["min_raise"])
+                    raise_amt = min(raise_amt, observation["max_raise"])
+                    return (RAISE, raise_amt, 0, 0)
+                else:
+                    # Medium hand — check for showdown value
+                    return (CHECK, 0, 0, 0) if valid[CHECK] else (CALL, 0, 0, 0)
 
         # 4. Single-street blueprint (FALLBACK — should not fire if above work)
         bp = self._blueprints.get(street)
