@@ -57,27 +57,6 @@ def _deferred_load():
             _PRELOAD['multi_street']._build_all_node_maps()
     except Exception:
         pass
-    # Load river GTO strategies
-    try:
-        river_path = os.path.join(_dir, "data", "river_gto.pkl.lzma")
-        if os.path.isfile(river_path):
-            with open(river_path, 'rb') as f:
-                river_data = pickle.loads(lzma.decompress(f.read()))
-            # Build board -> index mapping
-            boards = river_data['boards']
-            river_lookup = {}
-            for i in range(len(boards)):
-                key = tuple(sorted(int(c) for c in boards[i]))
-                river_lookup[key] = i
-            _PRELOAD['river'] = {
-                'strategies': river_data['strategies'],
-                'hands': river_data['hands'],
-                'n_hands': river_data['n_hands'],
-                'action_types': river_data['action_types'],
-                'lookup': river_lookup,
-            }
-    except Exception:
-        pass
     _PRELOAD['deferred_done'] = True
 
 threading.Thread(target=_deferred_load, daemon=True).start()
@@ -480,23 +459,6 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
-        # Equity guard: the backward induction strategies were computed with
-        # analytical river EVs that overvalue weak hands. This makes them
-        # never fold facing bets. Override with pot-odds fold when equity
-        # is clearly below the calling threshold.
-        facing_bet = opp_bet > my_bet
-        if facing_bet and valid[FOLD]:
-            equity = self.engine.compute_equity(
-                my_cards, board, dead, self._opp_weights)
-            cost = opp_bet - my_bet
-            pot = my_bet + opp_bet
-            pot_odds = cost / (pot + cost) if (pot + cost) > 0 else 0.5
-            # Fold if equity is significantly below pot odds
-            # (the blueprint might say call/raise, but it's wrong due to
-            # overvalued continuation values)
-            if equity < pot_odds - 0.05:
-                return (FOLD, 0, 0, 0)
-
         # Determine hero's position: BB acts first postflop, SB acts second
         # blind_position=0 means SB, blind_position=1 means BB
         blind_pos = observation.get("blind_position", 0)
@@ -528,64 +490,16 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 3. River: precomputed range-balanced CFR strategies
-        # Same approach as flop/turn: per-board, per-hand, range-balanced.
-        # Falls back to pot-odds if river data not loaded yet.
+        # 3. River: pot-odds (mathematically correct for deterministic equity)
         if street == 3:
             self._path_counts['range_solver'] += 1
-            river = _PRELOAD.get('river')
-
-            if river and len(board) == 5:
-                board_key = tuple(sorted(int(c) for c in board))
-                board_idx = river['lookup'].get(board_key)
-
-                if board_idx is not None:
-                    # Find our hand in the hand list
-                    c1, c2 = min(int(my_cards[0]), int(my_cards[1])), max(int(my_cards[0]), int(my_cards[1]))
-                    hands = river['hands'][board_idx]
-                    n_h = int(river['n_hands'][board_idx])
-                    hand_idx = None
-                    for hi in range(n_h):
-                        if int(hands[hi][0]) == c1 and int(hands[hi][1]) == c2:
-                            hand_idx = hi
-                            break
-
-                    if hand_idx is not None:
-                        strats = river['strategies'][board_idx]  # (231, n_hero, n_act)
-                        acts = river['action_types']  # (n_hero, n_act)
-
-                        # Find correct node (root if not facing bet, facing-bet node otherwise)
-                        facing_bet = opp_bet > my_bet
-                        node_idx = 0
-                        if facing_bet and strats.shape[1] > 1:
-                            node_idx = 1  # second hero node = facing bet
-
-                        raw = strats[hand_idx, node_idx, :]
-                        act_ids = acts[node_idx, :]
-                        probs = raw.astype(np.float64) / 255.0
-
-                        # Sample from strategy
-                        result = {}
-                        total = 0.0
-                        for a in range(len(probs)):
-                            if act_ids[a] >= 0 and probs[a] > 0:
-                                result[int(act_ids[a])] = float(probs[a])
-                                total += probs[a]
-                        if result and total > 0:
-                            for k in result:
-                                result[k] /= total
-                            action = self._try_strategy(result, observation)
-                            if action is not None:
-                                return action
-
-            # Fallback: pot-odds (if river data not loaded or lookup fails)
             equity = self.engine.compute_equity(
                 my_cards, board, dead, self._opp_weights)
             facing_bet = opp_bet > my_bet
             pot = my_bet + opp_bet
             if facing_bet:
-                bet_size = opp_bet - my_bet
-                threshold = bet_size / (pot + bet_size) if (pot + bet_size) > 0 else 0.5
+                cost = opp_bet - my_bet
+                threshold = cost / (pot + cost) if (pot + cost) > 0 else 0.5
                 if equity >= threshold:
                     return (CALL, 0, 0, 0) if valid[CALL] else (CHECK, 0, 0, 0)
                 return (FOLD, 0, 0, 0) if valid[FOLD] else (CHECK, 0, 0, 0)
@@ -640,27 +554,7 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
-        # Wait for deferred data (turn + river) to load.
-        # Tank 4s per action (under 5s timeout), fold/check until ready.
-        # Costs ~30 chips in blinds but prevents 100+ chip losses from
-        # playing without proper strategies.
-        if not _PRELOAD.get('deferred_done', False):
-            import time as _t
-            _t.sleep(4.0)
-            # Re-check after sleep
-            if not self._multi_street_loaded and _PRELOAD.get('done'):
-                self._multi_street = _PRELOAD.get('multi_street')
-                self._multi_street_loaded = True
-            if not _PRELOAD.get('deferred_done', False):
-                valid = observation["valid_actions"]
-                if valid[DISCARD]:
-                    my, board, opp_d, _ = self._parse_cards(observation)
-                    return self._handle_discard(observation, my, board, opp_d)
-                if valid[CHECK]:
-                    return (CHECK, 0, 0, 0)
-                if valid[FOLD]:
-                    return (FOLD, 0, 0, 0)
-                return (CALL, 0, 0, 0)
+
 
 
         # Lead protection — if we can survive on blinds alone, fold everything
