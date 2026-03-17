@@ -66,7 +66,7 @@ DEFAULT_N_ITERATIONS = 500
 DEFAULT_N_WORKERS = 4
 
 POT_SIZES = [
-    (2, 2), (50, 50),
+    (2, 2), (4, 4), (8, 8), (16, 16), (30, 30), (50, 50), (100, 100),
 ]
 
 # Which pot index to save turn strategies for (to limit disk/RAM usage).
