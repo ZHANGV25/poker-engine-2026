@@ -632,17 +632,26 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
-        # If blueprint not loaded yet, fold/check to avoid punting chips
+        # If blueprint not loaded yet, wait up to 4s per action for it.
+        # Uses time bank (1000s) but saves chips vs blind folding.
         if not self._multi_street_loaded:
-            valid = observation["valid_actions"]
-            if valid[DISCARD]:
-                my, board, opp_d, _ = self._parse_cards(observation)
-                return self._handle_discard(observation, my, board, opp_d)
-            if valid[CHECK]:
-                return (CHECK, 0, 0, 0)
-            if valid[FOLD]:
-                return (FOLD, 0, 0, 0)
-            return (CALL, 0, 0, 0)
+            import time
+            time.sleep(4.0)  # give background thread time to finish
+            if _PRELOAD.get('done'):
+                self._multi_street = _PRELOAD.get('multi_street')
+                self._multi_street_loaded = True
+                # Fall through to normal play below
+            else:
+                # Still loading — fold/check this hand
+                valid = observation["valid_actions"]
+                if valid[DISCARD]:
+                    my, board, opp_d, _ = self._parse_cards(observation)
+                    return self._handle_discard(observation, my, board, opp_d)
+                if valid[CHECK]:
+                    return (CHECK, 0, 0, 0)
+                if valid[FOLD]:
+                    return (FOLD, 0, 0, 0)
+                return (CALL, 0, 0, 0)
 
         # Lead protection — if we can survive on blinds alone, fold everything
         # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
