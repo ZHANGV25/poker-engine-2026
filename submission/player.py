@@ -632,11 +632,9 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
-        # If blueprint not loaded yet, wait up to 4s per action for it.
-        # Uses time bank (1000s) but saves chips vs blind folding.
+        # If blueprint not loaded yet, wait briefly for it.
         if not self._multi_street_loaded:
-            import time
-            time.sleep(4.0)  # give background thread time to finish
+            _preload_thread.join(timeout=0.5)  # quick check
             if _PRELOAD.get('done'):
                 self._multi_street = _PRELOAD.get('multi_street')
                 self._multi_street_loaded = True
