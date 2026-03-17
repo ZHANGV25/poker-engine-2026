@@ -480,6 +480,23 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
+        # Equity guard: the backward induction strategies were computed with
+        # analytical river EVs that overvalue weak hands. This makes them
+        # never fold facing bets. Override with pot-odds fold when equity
+        # is clearly below the calling threshold.
+        facing_bet = opp_bet > my_bet
+        if facing_bet and valid[FOLD]:
+            equity = self.engine.compute_equity(
+                my_cards, board, dead, self._opp_weights)
+            cost = opp_bet - my_bet
+            pot = my_bet + opp_bet
+            pot_odds = cost / (pot + cost) if (pot + cost) > 0 else 0.5
+            # Fold if equity is significantly below pot odds
+            # (the blueprint might say call/raise, but it's wrong due to
+            # overvalued continuation values)
+            if equity < pot_odds - 0.05:
+                return (FOLD, 0, 0, 0)
+
         # Determine hero's position: BB acts first postflop, SB acts second
         # blind_position=0 means SB, blind_position=1 means BB
         blind_pos = observation.get("blind_position", 0)
