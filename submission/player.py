@@ -999,27 +999,26 @@ class PlayerAgent(Agent):
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
-        # 3. River: range solver for facing bets (600 iters, well-converged)
-        #    equity thresholds for acting first (already profitable)
+        # 3. River: one-hand solver for facing bets (~100ms, 400 iters)
+        #    equity thresholds for acting first (bets + bluffs)
         if street == 3:
-            self._path_counts['range_solver'] += 1
             facing_bet = opp_bet > my_bet
 
-            if facing_bet and time_left > 100:
-                # Range already narrowed by polarized construction at line 850
-                # (opponent bet handling). Don't double-narrow.
-
-                # Range solver for call/fold with polarized range
-                result = self.range_solver.solve_and_act(
+            if facing_bet and time_left > 50:
+                self._path_counts['range_solver'] += 1
+                # One-hand solver: better converged than range solver at 200 iters
+                # (exploitability ~28 chips vs ~460), 40-100x faster (~100ms vs 4-10s).
+                result = self.solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
                     my_bet=my_bet, opp_bet=opp_bet, street=street,
                     min_raise=observation["min_raise"],
                     max_raise=observation["max_raise"],
-                    valid_actions=valid, time_remaining=time_left)
+                    valid_actions=valid, hero_is_first=True,
+                    time_remaining=time_left)
                 if result is not None:
                     return result
-                # Fallback: equity threshold with risk premium
+                # Fallback: equity threshold
                 return self._equity_threshold_play(
                     my_cards, board, dead, observation, valid, street)
             else:

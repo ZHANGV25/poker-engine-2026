@@ -72,7 +72,12 @@ class SubgameSolver:
                                   my_bet, opp_bet, valid_actions, min_raise, max_raise)
 
         max_bet = 100
-        tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet, hero_is_first)
+        # Always build tree with hero acting first. At the point solve_and_act
+        # is called, it's hero's turn — the tree should start with hero's
+        # decision (fold/call/raise if facing bet, check/bet if not).
+        # hero_is_first=False would put opponent at root, causing _run_cfr
+        # to fail to find hero's strategy.
+        tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet, True)
 
         if tree.size < 2:
             return self._fallback(hero_cards, board, dead_cards,
@@ -176,10 +181,30 @@ class SubgameSolver:
                 hero_regrets, hero_strategy_sum, opp_regrets,
                 hero_idx, opp_idx, terminal_values, n_opp, max_act, t)
 
+        # Extract hero's strategy at first hero decision node.
+        # If hero acts first, root (node 0) is a hero node.
+        # If opponent acts first, hero's first decision is a child of root.
         root = 0
+        hero_node = None
         if root in hero_idx:
-            idx = hero_idx[root]
-            n_act = tree.num_actions[root]
+            hero_node = root
+        else:
+            # Root is opponent node — find hero's first decision node.
+            # All children of the opponent root lead to hero decision nodes
+            # (or terminals). We need the one that matches the current game
+            # state (opponent already bet, so hero faces fold/call/raise).
+            # When facing a bet, the relevant child is after opponent's
+            # actual bet action. Since we don't know which action the opp
+            # took, find ANY hero child — they all share the same hero
+            # strategy in a one-hand solver (hero has one info set per node).
+            for _, child_id in tree.children[root]:
+                if child_id in hero_idx:
+                    hero_node = child_id
+                    break
+
+        if hero_node is not None:
+            idx = hero_idx[hero_node]
+            n_act = tree.num_actions[hero_node]
             total = hero_strategy_sum[idx, :n_act].sum()
             if total > 0:
                 return hero_strategy_sum[idx, :n_act] / total
