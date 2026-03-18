@@ -945,19 +945,35 @@ class PlayerAgent(Agent):
 
         equity = self.engine.compute_equity(my_cards, board, dead, self._opp_weights)
 
-        # Pot control: can only raise on 2 streets max unless near-nuts
-        can_raise = self._streets_raised < 2 or equity > 0.92
+        # For BETTING decisions: compute equity against opponent's CALLING range.
+        # When we bet, weak hands fold — only strong hands call.
+        # MDF = 1/(1+bet/pot). If we bet 50% pot, they call with top 67%.
+        # Our equity vs calling range is LOWER than vs full range.
+        bet_eq = equity  # default: same as full range equity
+        if self._opp_weights and valid[RAISE]:
+            # Estimate equity vs calling range for a typical bet size (50% pot)
+            bet_frac = 0.5
+            call_mdf = 1.0 / (1.0 + bet_frac)  # ~67% of hands call
+            # Temporarily narrow to calling range and compute equity
+            import copy
+            temp_weights = copy.copy(self._opp_weights)
+            self._mdf_narrow_range(board, dead, call_mdf)
+            bet_eq = self.engine.compute_equity(my_cards, board, dead, self._opp_weights)
+            self._opp_weights = temp_weights  # restore
 
-        # All-in with near-nuts
-        if equity > 0.92 and valid[RAISE]:
+        # Pot control: can only raise on 2 streets max unless near-nuts
+        can_raise = self._streets_raised < 2 or bet_eq > 0.92
+
+        # All-in with near-nuts (vs calling range)
+        if bet_eq > 0.92 and valid[RAISE]:
             self._raised_this_street = True
             self._streets_raised += 1
             self._last_hero_bet = max_raise
             self._last_pot_before = pot
             return (RAISE, max_raise, 0, 0)
 
-        # Strong value raise
-        if equity > 0.82 and valid[RAISE] and can_raise:
+        # Strong value raise (vs calling range)
+        if bet_eq > 0.82 and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.65), min_raise)
@@ -966,8 +982,8 @@ class PlayerAgent(Agent):
             self._last_pot_before = pot
             return (RAISE, amt, 0, 0)
 
-        # Medium value raise
-        if equity > 0.72 and valid[RAISE] and can_raise:
+        # Medium value raise (vs calling range)
+        if bet_eq > 0.72 and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.4), min_raise)
