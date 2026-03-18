@@ -552,7 +552,7 @@ def _cfr_vectorized(flat, showdown_values, valid_pairs, showdown_ids,
 # ---------------------------------------------------------------------------
 
 def _solve_street(tree, hands, showdown_values, showdown_ids, valid_pairs,
-                  n_iterations, return_opp=False):
+                  n_iterations, return_opp=False, flat=None):
     """
     Solve one street's betting with per-terminal showdown values.
 
@@ -564,6 +564,7 @@ def _solve_street(tree, hands, showdown_values, showdown_ids, valid_pairs,
         valid_pairs: (n_hands, n_hands) bool
         n_iterations: CFR iterations
         return_opp: if True, also return opp strategy (for position-aware play)
+        flat: pre-flattened tree dict (optimization to avoid re-flattening)
 
     Returns:
         (hero_strategy, root_ev) or (hero_strategy, opp_strategy, root_ev)
@@ -571,7 +572,8 @@ def _solve_street(tree, hands, showdown_values, showdown_ids, valid_pairs,
         opp_strategy: (n_hands, n_opp_nodes, max_actions) normalized
         root_ev: (n_hands, n_hands) hero's EV at root
     """
-    flat = _flatten_tree(tree)
+    if flat is None:
+        flat = _flatten_tree(tree)
     n_hands = len(hands)
     n_hero_nodes = flat['n_hero_nodes']
     n_opp_nodes = flat['n_opp_nodes']
@@ -1125,11 +1127,11 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
 
     remaining = [c for c in range(27) if c not in board_set]
 
-    # Iteration counts per street. River converges fast (deterministic
-    # equity), so 10 iterations is sufficient for continuation values.
-    # Turn needs more (uncertainty from 1 river card). Flop gets full.
-    river_iters = 10
-    turn_iters = max(20, n_iterations // 5)
+    # Iteration counts per street. River sub-games only need root EV
+    # (not full strategy), so fewer iterations suffice — EV converges
+    # faster than strategy. Turn and flop get more for strategy quality.
+    river_iters = 20   # root EV converges fast, ~552 solves per pot
+    turn_iters = max(40, n_iterations // 2)
     flop_iters = n_iterations
 
     t_total = time.time()
@@ -1147,17 +1149,19 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
                     pot_idx + 1, len(pot_sizes), hero_bet, opp_bet)
 
         # -------------------------------------------------------
-        # Phase 1: Scaled analytical river EVs
+        # Phase 1: River CFR backward induction
         # -------------------------------------------------------
-        # River betting amplifies outcomes: winners win more (bet, get
-        # called), losers lose more (face bets, fold or call and lose).
-        # Scale by 1.3x to approximate this effect. This makes the
-        # flop/turn solver correctly fold weak hands facing bets.
+        # Solve actual river betting games instead of analytical EVs.
+        # This correctly accounts for value betting, bluffing, and
+        # folding — weak hands get lower EV because they face bets.
         turn_data = {}
 
         seven_lookup = engine._seven
-        pot_won = min(hero_bet, opp_bet)
-        scaled_pot_won = pot_won * 1.3  # river betting amplification
+
+        # Build ONE river tree per pot (reuse across all river cards)
+        r_tree = GameTree(hero_bet, opp_bet, DEFAULT_MIN_RAISE,
+                          DEFAULT_MAX_BET, True)
+        r_flat = _flatten_tree(r_tree)  # cache flattened tree for reuse
 
         for turn_card in remaining:
             board_4 = board_3 + [turn_card]
@@ -1173,22 +1177,18 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
 
             for river_card in river_cards:
                 board_5 = board_4 + [river_card]
-                board_mask = 0
-                for c in board_5:
-                    board_mask |= 1 << c
 
                 r_hands = [(c1, c2) for c1, c2 in turn_hands
                            if c1 != river_card and c2 != river_card]
                 n_river = len(r_hands)
                 r_valid = _build_valid_pairs(r_hands)
 
-                hand_ranks = np.zeros(n_river, dtype=np.int64)
-                for i, hand in enumerate(r_hands):
-                    mask = (1 << hand[0]) | (1 << hand[1]) | board_mask
-                    hand_ranks[i] = seven_lookup[mask]
-
-                r_ev = np.zeros((n_river, n_river), dtype=np.float64)
-                _fill_analytical_ev(r_ev, hand_ranks, r_valid, scaled_pot_won, n_river)
+                # Solve the river betting game with full CFR
+                r_sd_vals, r_sd_ids = _river_showdown_values(
+                    r_tree, r_hands, board_5, r_valid, engine)
+                _, r_ev = _solve_street(
+                    r_tree, r_hands, r_sd_vals, r_sd_ids,
+                    r_valid, river_iters, flat=r_flat)
 
                 r_to_t = np.full(n_river, -1, dtype=np.int32)
                 for ri, rh in enumerate(r_hands):
@@ -1204,7 +1204,7 @@ def solve_flop_board(board_3_cards, engine, n_iterations=500, pot_sizes=None,
 
             turn_data[turn_card] = (turn_hands, turn_idx, turn_valid, cont_ev)
 
-        logger.info("    Phase 1 (scaled river) done: %.1fs", time.time() - t_pot)
+        logger.info("    Phase 1 (river CFR) done: %.1fs", time.time() - t_pot)
 
         # -------------------------------------------------------
         # Phase 2: Solve all turns, aggregate into flop EVs

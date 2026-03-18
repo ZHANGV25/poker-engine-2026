@@ -196,8 +196,8 @@ python3 blueprint/compute_multi_street.py \\
     --all_boards \\
     --cluster_start ${board_start} \\
     --cluster_end ${board_end} \\
-    --n_iterations 100 \\
-    --n_workers 8 \\
+    --n_iterations 200 \\
+    --n_workers 30 \\
     --position_aware \\
     --output_dir /opt/blueprint/output \\
     2>&1 | tee /opt/blueprint/compute.log
@@ -214,7 +214,7 @@ fi
 # --- Step 5: Upload results to S3 ---
 echo "[6/6] Uploading results to S3..."
 aws s3 cp /opt/blueprint/output/ \\
-    ${S3_BUCKET}/multi_street_v7/ \\
+    ${S3_BUCKET}/multi_street_v9/ \\
     --recursive --region ${REGION}
 
 # Upload the log too

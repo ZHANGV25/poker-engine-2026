@@ -209,6 +209,11 @@ class MultiStreetLookup:
         import lzma, pickle
         with open(fpath, 'rb') as f:
             data = pickle.loads(lzma.decompress(f.read()))
+        # Handle 4-bit quantized strategies: upscale to uint8 range
+        if data.get('quantization_bits') == 4:
+            for key in ['flop_strategies', 'flop_opp_strategies']:
+                if key in data:
+                    data[key] = (data[key].astype(np.uint8) << 4)
         self._load_compact_merged_dict(data)
         self._load_turn_from_dict(data)
 

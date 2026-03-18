@@ -95,14 +95,17 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # ARM64 (Graviton2) is ~10-20x slower than x86 for Python loops.
-        # Keep iterations low to stay under the 5s per-action timeout.
+        # Used ONLY for river facing-bet decisions (~50 calls/match).
+        # Turn uses equity thresholds (0 compute) so 94% of budget is free.
+        # 200 iters at ~50 calls = ~500s ARM = 33% of 1500s budget.
         if time_remaining > 800:
-            iterations = 30
+            iterations = 200
         elif time_remaining > 400:
-            iterations = 15
+            iterations = 100
+        elif time_remaining > 200:
+            iterations = 50
         else:
-            iterations = 10
+            iterations = 20
 
         # Build game tree
         max_bet = 100

@@ -66,13 +66,12 @@ DEFAULT_N_ITERATIONS = 500
 DEFAULT_N_WORKERS = 4
 
 POT_SIZES = [
-    (2, 2), (4, 4), (8, 8), (16, 16), (30, 30), (50, 50), (100, 100),
+    (2, 2), (4, 4), (10, 10), (30, 30), (50, 50),
 ]
 
-# Which pot index to save turn strategies for (to limit disk/RAM usage).
-# Index 1 = (4,4). Turn strategies for other pots are discarded; at runtime,
-# all turn lookups round to this pot.
-TURN_SAVE_POT_IDX = 1
+# Don't save turn strategies — runtime solver handles turn.
+# All 100MB budget goes to flop data quality.
+TURN_SAVE_POT_IDX = 99  # no pot index matches → nothing saved
 
 
 # ---------------------------------------------------------------------------
