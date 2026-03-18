@@ -125,6 +125,7 @@ class PlayerAgent(Agent):
         self._last_street_seen = -1
         self._last_hero_bet = 0     # track our bet size for MDF narrowing
         self._last_pot_before = 0   # pot before our bet
+        self._opp_bet_at_raise = 0  # opponent's bet when we last raised (for re-raise MDF)
 
         # Track opponent betting patterns for adaptive play
         self._opp_river_bets = 0
@@ -293,6 +294,8 @@ class PlayerAgent(Agent):
             self._raised_this_street = False
             self._last_street_seen = -1
             self._opp_bet_this_hand = False
+            self._narrowed_this_street = False
+            self._opp_bet_at_raise = 0
 
     def _parse_cards(self, observation):
         my = [c for c in observation["my_cards"] if c != -1]
@@ -634,6 +637,107 @@ class PlayerAgent(Agent):
             for k in self._opp_weights:
                 self._opp_weights[k] /= total
 
+    def _reraise_narrow_range(self, board, dead_cards, my_bet, opp_bet):
+        """Two-phase game-theoretic narrowing for opponent re-raises.
+
+        Phase 1 — MDF fold removal:
+            When opponent faces our raise, the weakest hands in their range
+            fold. Fold fraction = 1 - MDF, where:
+                MDF = pot_faced / (pot_faced + call_cost)
+                pot_faced = my_bet + opp_bet_before_reraise
+                call_cost = my_bet - opp_bet_before_reraise
+
+            Simplifies to: MDF = (my_bet + O) / (2 × my_bet)
+            where O = opponent's bet when we raised.
+
+        Phase 2 — Polarized re-raise selection:
+            Of the defending hands (those that didn't fold), the re-raisers
+            form a polarized sub-range: top value + bottom bluffs.
+
+            Bluff ratio α = rr_size / (rr_size + pot_if_called)
+            where rr_size = opp_bet - my_bet, pot_if_called = 2 × my_bet.
+
+            Re-raise frequency within defending range: same GTO proportion
+            as initial bet (geometric/self-similar model). Each raise level
+            selects ~f of the acting range, where f = 0.17 (river) / 0.13 (turn)
+            from solved equilibrium.
+        """
+        if self._opp_weights is None:
+            return
+
+        # Phase 1: MDF fold removal
+        O = self._opp_bet_at_raise  # opponent's bet when we raised
+        if my_bet > O and my_bet > 0:
+            # MDF = (my_bet + O) / (2 * my_bet)
+            mdf = (my_bet + O) / (2.0 * my_bet)
+            mdf = max(0.3, min(0.95, mdf))  # safety clamp
+            self._mdf_narrow_range(board, dead_cards, mdf)
+
+        # Phase 2: Polarized re-raise within defending range
+        rr_size = opp_bet - my_bet
+        pot_if_called = 2.0 * my_bet  # pot if they had just called our raise
+        if rr_size <= 0 or pot_if_called <= 0:
+            return
+
+        # Bluff ratio: α = rr_size / (rr_size + pot_if_called)
+        bluff_ratio = rr_size / (rr_size + pot_if_called)
+
+        # GTO re-raise frequency within defending range (geometric model)
+        street = len(board)  # 4 = turn, 5 = river
+        default_freq = 0.13 if street <= 4 else 0.17
+
+        # Use tracked opponent data if available
+        if self._opp_river_actions > 20:
+            total_bet_freq = self._opp_river_bets / self._opp_river_actions
+        else:
+            total_bet_freq = default_freq
+        total_bet_freq = max(0.08, min(0.60, total_bet_freq))
+
+        value_pct = total_bet_freq / (1.0 + bluff_ratio)
+        bluff_pct = total_bet_freq - value_pct
+
+        # Rank surviving hands by strength and apply polarized selection
+        board_set = set(board)
+        strengths = {}
+        for pair in self._opp_weights:
+            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
+                continue
+            try:
+                if len(board) >= 5:
+                    r = self.engine.lookup_seven(list(pair) + list(board))
+                elif len(board) == 4:
+                    import itertools as _it
+                    cards_6 = list(pair) + list(board)
+                    r = min(self.engine.lookup_five(list(c))
+                            for c in _it.combinations(cards_6, 5))
+                elif len(board) >= 3:
+                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
+                else:
+                    continue
+            except Exception:
+                continue
+            strengths[pair] = r
+
+        if not strengths:
+            return
+
+        ranked = sorted(strengths.items(), key=lambda x: x[1])  # best first
+        n = len(ranked)
+        n_value = max(1, int(n * value_pct))
+        n_bluff = int(n * bluff_pct)
+
+        keep_indices = set(range(n_value))
+        keep_indices.update(range(n - n_bluff, n))
+
+        for i, (hand, _) in enumerate(ranked):
+            if i not in keep_indices:
+                self._opp_weights[hand] = 0.0
+
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
     def _mdf_narrow_range(self, board, dead_cards, keep_fraction):
         """Narrow opponent range by keeping top X% of hands.
 
@@ -822,14 +926,16 @@ class PlayerAgent(Agent):
                 if self._last_hero_bet > 0 and self._last_pot_before > 0:
                     bet_frac = self._last_hero_bet / self._last_pot_before
                     mdf = 1.0 / (1.0 + bet_frac)  # game theory MDF
-                    self._mdf_narrow_range(board, dead, 0.5)
+                    self._mdf_narrow_range(board, dead, mdf)
                 else:
                     # No bet on previous street (check-check) — mild narrowing
                     self._mdf_narrow_range(board, dead, 0.85)
             self._current_street = street
             self._raised_this_street = False
+            self._narrowed_this_street = False
             self._last_hero_bet = 0
             self._last_pot_before = 0
+            self._opp_bet_at_raise = 0
 
         # Opponent range inference
         if len(opp_discards) == 3 and self._opp_weights is None:
@@ -841,13 +947,19 @@ class PlayerAgent(Agent):
             self._opp_bet_this_hand = True
         if opp_bet > my_bet and self._opp_weights is not None:
             if street == 1:
-                # Flop: Bayesian update from blueprint P(action|hand)
-                if not self._bayesian_range_update(board, my_bet, opp_bet, street):
-                    self._soft_narrow_range(my_bet, opp_bet, board, dead)
+                if not self._narrowed_this_street:
+                    self._narrowed_this_street = True
+                    # Flop: Bayesian update from blueprint P(action|hand)
+                    if not self._bayesian_range_update(board, my_bet, opp_bet, street):
+                        self._soft_narrow_range(my_bet, opp_bet, board, dead)
             elif street in (2, 3):
-                # Turn/River: polarized range construction
-                # Opponent bets with value (top) + bluffs (bottom), not middle
-                self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                if not self._narrowed_this_street:
+                    # First bet on this street: full polarized narrowing
+                    self._narrowed_this_street = True
+                    self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                else:
+                    # Re-raise: two-phase game-theoretic narrowing
+                    self._reraise_narrow_range(board, dead, my_bet, opp_bet)
 
         pot_state = (my_bet, opp_bet)
 
@@ -869,6 +981,7 @@ class PlayerAgent(Agent):
                     if action[0] == RAISE:
                         self._last_hero_bet = action[1]
                         self._last_pot_before = pot_state[0] + pot_state[1]
+                        self._opp_bet_at_raise = opp_bet
                     return action
             except Exception:
                 pass
@@ -886,10 +999,8 @@ class PlayerAgent(Agent):
             facing_bet = opp_bet > my_bet
 
             if facing_bet and time_left > 100:
-                # Construct POLARIZED range from game theory:
-                # Opponent bets with top X% (value) + bottom Y% (bluffs)
-                # where Y = X × bet/(bet+pot). Remove middle.
-                self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                # Range already narrowed by polarized construction at line 850
+                # (opponent bet handling). Don't double-narrow.
 
                 # Range solver for call/fold with polarized range
                 result = self.range_solver.solve_and_act(
@@ -970,6 +1081,7 @@ class PlayerAgent(Agent):
             self._streets_raised += 1
             self._last_hero_bet = max_raise
             self._last_pot_before = pot
+            self._opp_bet_at_raise = opp_bet
             return (RAISE, max_raise, 0, 0)
 
         # Strong value raise (vs calling range)
@@ -980,6 +1092,7 @@ class PlayerAgent(Agent):
             amt = min(amt, max_raise)
             self._last_hero_bet = amt
             self._last_pot_before = pot
+            self._opp_bet_at_raise = opp_bet
             return (RAISE, amt, 0, 0)
 
         # Medium value raise (vs calling range)
@@ -990,6 +1103,7 @@ class PlayerAgent(Agent):
             amt = min(amt, max_raise)
             self._last_hero_bet = amt
             self._last_pot_before = pot
+            self._opp_bet_at_raise = opp_bet
             return (RAISE, amt, 0, 0)
 
         # GTO bluff with near-zero equity hands
@@ -1002,6 +1116,7 @@ class PlayerAgent(Agent):
             if _random.random() < bluff_freq * street_bluff_scale:
                 self._raised_this_street = True
                 self._streets_raised += 1
+                self._opp_bet_at_raise = opp_bet
                 return (RAISE, min(bet_size, max_raise), 0, 0)
 
         # Call if equity justifies (against polarized-narrowed range)
