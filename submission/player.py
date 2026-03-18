@@ -124,7 +124,14 @@ class PlayerAgent(Agent):
         self._raised_this_street = False
         self._last_street_seen = -1
         self._last_hero_bet = 0     # track our bet size for MDF narrowing
-        self._last_pot_before = 0   # pot before our bet  # for detecting new streets → opponent continued
+        self._last_pot_before = 0   # pot before our bet
+
+        # Track opponent betting patterns for adaptive play
+        self._opp_river_bets = 0
+        self._opp_river_actions = 0
+        self._opp_bet_showdown_wins = 0   # times they bet, went to showdown, won
+        self._opp_bet_showdown_total = 0  # times they bet and went to showdown
+        self._opp_bet_this_hand = False   # did opponent bet this hand
 
         # Track time ourselves — observation doesn't include time_left
         import time as _time
@@ -270,6 +277,12 @@ class PlayerAgent(Agent):
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
+            # Track opponent bet showdown results from previous hand
+            if self._hand_reward != 0 and self._opp_bet_this_hand:
+                self._opp_bet_showdown_total += 1
+                if self._hand_reward < 0:  # we lost = they won
+                    self._opp_bet_showdown_wins += 1
+
             # Apply accumulated reward from previous hand
             self._bankroll += self._hand_reward
             self._hand_reward = 0
@@ -279,6 +292,7 @@ class PlayerAgent(Agent):
             self._current_street = -1
             self._raised_this_street = False
             self._last_street_seen = -1
+            self._opp_bet_this_hand = False
 
     def _parse_cards(self, observation):
         my = [c for c in observation["my_cards"] if c != -1]
@@ -528,6 +542,98 @@ class PlayerAgent(Agent):
         except Exception:
             return False
 
+    def _polarized_narrow_range(self, board, dead_cards, my_bet, opp_bet):
+        """Construct polarized opponent range when facing a river bet.
+
+        GTO: opponent bets with VALUE (top) + BLUFFS (bottom), checks MIDDLE.
+        Bluff ratio = bet / (bet + pot), derived from bet size.
+        Total bet frequency tracked during the match.
+        """
+        if self._opp_weights is None:
+            return
+
+        raise_amt = opp_bet - my_bet
+        pot_before = my_bet * 2
+        if raise_amt <= 0 or pot_before <= 0:
+            return
+
+        bet_frac = raise_amt / pot_before
+        bluff_ratio = bet_frac / (1 + bet_frac)
+
+        # Estimate total bet frequency from tracked data.
+        # Defaults from computed GTO equilibrium:
+        #   River: 17% (50 boards, 100 iters)
+        #   Turn:  13% (30 boards, 50 iters)
+        street = len(board)  # 4 = turn, 5 = river
+        default_freq = 0.13 if street <= 4 else 0.17
+
+        if self._opp_river_actions > 20:
+            total_bet_freq = self._opp_river_bets / self._opp_river_actions
+        else:
+            total_bet_freq = default_freq
+
+        # Adaptive: if opponent wins 75%+ of showdowns when they bet,
+        # they're a pure value bettor → reduce bet freq estimate
+        # (their range when betting is tighter than GTO)
+        if self._opp_bet_showdown_total > 10:
+            opp_sd_wr = self._opp_bet_showdown_wins / self._opp_bet_showdown_total
+            if opp_sd_wr > 0.75:
+                # Value-heavy: their actual betting range is tighter
+                total_bet_freq *= (1.0 - opp_sd_wr) * 2  # scale down
+            elif opp_sd_wr < 0.45:
+                # Bluff-heavy: their range is wider than GTO
+                total_bet_freq *= 1.5  # scale up
+
+        total_bet_freq = max(0.08, min(0.60, total_bet_freq))  # clamp
+
+        value_pct = total_bet_freq / (1 + bluff_ratio)
+        bluff_pct = total_bet_freq - value_pct
+
+        # Rank all hands by strength
+        board_set = set(board)
+        strengths = {}
+        for pair in self._opp_weights:
+            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
+                continue
+            try:
+                if len(board) >= 5:
+                    r = self.engine.lookup_seven(list(pair) + list(board))
+                elif len(board) == 4:
+                    import itertools as _it
+                    cards_6 = list(pair) + list(board)
+                    r = min(self.engine.lookup_five(list(c)) for c in _it.combinations(cards_6, 5))
+                elif len(board) >= 3:
+                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
+                else:
+                    continue
+            except Exception:
+                continue
+            strengths[pair] = r
+
+        if not strengths:
+            return
+
+        ranked = sorted(strengths.items(), key=lambda x: x[1])  # best first
+        n = len(ranked)
+
+        # Keep top value_pct (value bets) + bottom bluff_pct (bluffs)
+        # Remove the middle
+        n_value = int(n * value_pct)
+        n_bluff = int(n * bluff_pct)
+        n_value = max(1, n_value)
+
+        keep_indices = set(range(n_value))  # top
+        keep_indices.update(range(n - n_bluff, n))  # bottom
+
+        for i, (hand, _) in enumerate(ranked):
+            if i not in keep_indices:
+                self._opp_weights[hand] = 0.0
+
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
     def _mdf_narrow_range(self, board, dead_cards, keep_fraction):
         """Narrow opponent range by keeping top X% of hands.
 
@@ -730,11 +836,18 @@ class PlayerAgent(Agent):
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards)
 
-        # Bayesian range update on opponent RAISES (flop only — we have blueprint)
-        # For turn/river: soft narrowing as fallback
+        # Range update when opponent bets
+        if opp_bet > my_bet:
+            self._opp_bet_this_hand = True
         if opp_bet > my_bet and self._opp_weights is not None:
-            if not self._bayesian_range_update(board, my_bet, opp_bet, street):
-                self._soft_narrow_range(my_bet, opp_bet, board, dead)
+            if street == 1:
+                # Flop: Bayesian update from blueprint P(action|hand)
+                if not self._bayesian_range_update(board, my_bet, opp_bet, street):
+                    self._soft_narrow_range(my_bet, opp_bet, board, dead)
+            elif street in (2, 3):
+                # Turn/River: polarized range construction
+                # Opponent bets with value (top) + bluffs (bottom), not middle
+                self._polarized_narrow_range(board, dead, my_bet, opp_bet)
 
         pot_state = (my_bet, opp_bet)
 
@@ -773,7 +886,12 @@ class PlayerAgent(Agent):
             facing_bet = opp_bet > my_bet
 
             if facing_bet and time_left > 100:
-                # Range solver for call/fold — this is the 8% WR leak
+                # Construct POLARIZED range from game theory:
+                # Opponent bets with top X% (value) + bottom Y% (bluffs)
+                # where Y = X × bet/(bet+pot). Remove middle.
+                self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+
+                # Range solver for call/fold with polarized range
                 result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
@@ -858,24 +976,21 @@ class PlayerAgent(Agent):
             self._last_pot_before = pot
             return (RAISE, amt, 0, 0)
 
-        # GTO bluff on river with near-zero equity hands only
-        if street == 3 and equity < 0.15 and valid[RAISE] and can_raise:
+        # GTO bluff with near-zero equity hands
+        # Bluff frequency = bet/(bet+pot) scaled by street
+        # Computed from equilibrium: turn bets at 78% of river frequency.
+        street_bluff_scale = {2: 0.78, 3: 1.0}.get(street, 0)
+        if equity < 0.15 and valid[RAISE] and can_raise and street_bluff_scale > 0:
             bet_size = max(int(pot * 0.6), min_raise)
             bluff_freq = bet_size / (bet_size + pot) if pot > 0 else 0.1
-            if _random.random() < bluff_freq * 0.5:
+            if _random.random() < bluff_freq * street_bluff_scale:
                 self._raised_this_street = True
                 self._streets_raised += 1
                 return (RAISE, min(bet_size, max_raise), 0, 0)
 
-        # Call if equity justifies — but require MORE equity for bigger bets.
-        # Pot odds alone doesn't account for risk: calling a 96-chip shove
-        # needs higher equity than calling a 2-chip bet.
-        if valid[CALL]:
-            # Risk premium: the bigger the call, the more equity we need
-            risk = continue_cost / 100.0  # 0.0 for tiny bets, ~1.0 for all-in
-            required = pot_odds + risk * 0.15  # up to 15% extra for all-ins
-            if equity >= required:
-                return (CALL, 0, 0, 0)
+        # Call if equity justifies (against polarized-narrowed range)
+        if valid[CALL] and equity >= pot_odds:
+            return (CALL, 0, 0, 0)
 
         # Check
         if valid[CHECK]:
@@ -1095,6 +1210,14 @@ class PlayerAgent(Agent):
         self._reset_hand(hand_number)
         if reward != 0:
             self._hand_reward += reward
+
+        # Track opponent river aggression
+        if observation["street"] == 3:
+            opp_bet = observation["opp_bet"]
+            my_bet = observation["my_bet"]
+            if opp_bet > my_bet:
+                self._opp_river_bets += 1
+            self._opp_river_actions += 1
 
         opp_d = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_d) == 3 and self._opp_weights is None:
