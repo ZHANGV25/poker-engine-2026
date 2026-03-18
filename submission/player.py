@@ -133,6 +133,7 @@ class PlayerAgent(Agent):
         self._opp_bet_showdown_wins = 0   # times they bet, went to showdown, won
         self._opp_bet_showdown_total = 0  # times they bet and went to showdown
         self._opp_bet_this_hand = False   # did opponent bet this hand
+        self._we_folded_this_hand = False
 
         # Track time ourselves — observation doesn't include time_left
         import time as _time
@@ -278,10 +279,13 @@ class PlayerAgent(Agent):
 
     def _reset_hand(self, hand_number):
         if hand_number != self._current_hand:
-            # Track opponent bet showdown results from previous hand
-            if self._hand_reward != 0 and self._opp_bet_this_hand:
+            # Track opponent bet showdown results from previous hand.
+            # Only count actual showdowns (river reached, we didn't fold).
+            # Excludes our folds (main contamination source in old code).
+            if (self._opp_bet_this_hand and not self._we_folded_this_hand
+                    and self._current_street == 3 and self._hand_reward != 0):
                 self._opp_bet_showdown_total += 1
-                if self._hand_reward < 0:  # we lost = they won
+                if self._hand_reward < 0:  # we lost at showdown = they won
                     self._opp_bet_showdown_wins += 1
 
             # Apply accumulated reward from previous hand
@@ -294,6 +298,7 @@ class PlayerAgent(Agent):
             self._raised_this_street = False
             self._last_street_seen = -1
             self._opp_bet_this_hand = False
+            self._we_folded_this_hand = False
             self._narrowed_this_street = False
             self._opp_bet_at_raise = 0
 
@@ -922,14 +927,16 @@ class PlayerAgent(Agent):
             # New street — opponent continued (didn't fold)
             if self._current_street >= 1 and self._opp_weights is not None:
                 # MDF-based narrowing: use our last bet size to compute
-                # how tight the opponent's calling range should be
+                # how tight the opponent's calling range should be.
+                # Use PREVIOUS street's board (what opponent saw when deciding
+                # to call). Current board already has the new card dealt.
+                prev_board = board[:len(board) - 1] if len(board) > 3 else board
                 if self._last_hero_bet > 0 and self._last_pot_before > 0:
                     bet_frac = self._last_hero_bet / self._last_pot_before
                     mdf = 1.0 / (1.0 + bet_frac)  # game theory MDF
-                    self._mdf_narrow_range(board, dead, mdf)
-                else:
-                    # No bet on previous street (check-check) — mild narrowing
-                    self._mdf_narrow_range(board, dead, 0.85)
+                    self._mdf_narrow_range(prev_board, dead, mdf)
+                # else: check-check — both showed weakness, range stays wide.
+                # Don't narrow: opponent chose not to bet strong hands.
             self._current_street = street
             self._raised_this_street = False
             self._narrowed_this_street = False
@@ -1320,10 +1327,12 @@ class PlayerAgent(Agent):
             if valid[CHECK]:
                 return (CHECK, 0, 0, 0)
             if valid[FOLD]:
+                self._we_folded_this_hand = True
                 return (FOLD, 0, 0, 0)
             if valid[DISCARD]:
                 my, board, opp_d, _ = self._parse_cards(observation)
                 return self._handle_discard(observation, my, board, opp_d)
+            self._we_folded_this_hand = True
             return (FOLD, 0, 0, 0)
 
         my_cards, board, opp_d, my_d = self._parse_cards(observation)
@@ -1332,9 +1341,14 @@ class PlayerAgent(Agent):
         if valid[DISCARD]:
             return self._handle_discard(observation, my_cards, board, opp_d)
         if observation["street"] == 0:
-            return self._handle_preflop(observation, my_cards)
-        return self._handle_postflop(observation, my_cards, board,
-                                     opp_d, my_d, info)
+            action = self._handle_preflop(observation, my_cards)
+        else:
+            action = self._handle_postflop(observation, my_cards, board,
+                                           opp_d, my_d, info)
+
+        if action[0] == FOLD:
+            self._we_folded_this_hand = True
+        return action
 
     def observe(self, observation, reward, terminated, truncated, info):
         hand_number = info.get("hand_number", 0)
