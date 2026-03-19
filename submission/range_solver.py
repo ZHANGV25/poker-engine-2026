@@ -95,17 +95,17 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Vectorized CFR — ~2s per 1000 iters on Mac, ~5s on ARM.
+        # Vectorized CFR — ~4s per 2000 iters on Mac, ~10s on ARM.
         # Range-balanced solving for river decisions.
-        # 1000 iters × ~60 calls = ~300s ARM = 20% of 1500s budget.
+        # 2000 iters × ~60 calls = ~600s ARM = 40% of 1500s budget.
         if time_remaining > 600:
-            iterations = 1000
+            iterations = 2000
         elif time_remaining > 300:
-            iterations = 500
+            iterations = 1000
         elif time_remaining > 100:
-            iterations = 200
+            iterations = 400
         else:
-            iterations = 50
+            iterations = 100
 
         # Build game tree
         max_bet = 100
