@@ -1080,13 +1080,16 @@ class PlayerAgent(Agent):
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
-        # 3. River: range-balanced solver (1000 iters, ~5s ARM)
-        #    Solves for ALL hero hands simultaneously — produces coordinated
-        #    value bet + bluff strategies across our range. This is the key
-        #    difference from the one-hand solver which can't range-balance.
+        # 3. River: equity thresholds acting first (bets 20-25%, includes bluffs)
+        #    range solver facing bets (range-balanced call/fold/raise)
         if street == 3:
-            if time_left > 50:
+            facing_bet = opp_bet > my_bet
+
+            if facing_bet and time_left > 50:
                 self._path_counts['range_solver'] += 1
+                # Range solver for call/fold: solves ALL hero hands for
+                # coordinated calling strategy (can't be exploited by
+                # opponent varying bet sizing).
                 result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
@@ -1096,7 +1099,10 @@ class PlayerAgent(Agent):
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
                     return result
-            # Fallback: equity thresholds
+
+            # Acting first OR fallback: equity thresholds
+            # Bets more aggressively than the range solver (20-25% vs 14%)
+            # and includes bluffs — better for exploiting this field.
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
