@@ -1088,32 +1088,25 @@ class PlayerAgent(Agent):
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
-        # 3. River: one-hand solver for facing bets (~100ms, 400 iters)
-        #    equity thresholds for acting first (bets + bluffs)
+        # 3. River: range-balanced solver (1000 iters, ~5s ARM)
+        #    Solves for ALL hero hands simultaneously — produces coordinated
+        #    value bet + bluff strategies across our range. This is the key
+        #    difference from the one-hand solver which can't range-balance.
         if street == 3:
-            facing_bet = opp_bet > my_bet
-
-            if facing_bet and time_left > 50:
+            if time_left > 50:
                 self._path_counts['range_solver'] += 1
-                # One-hand solver: better converged than range solver at 200 iters
-                # (exploitability ~28 chips vs ~460), 40-100x faster (~100ms vs 4-10s).
-                result = self.solver.solve_and_act(
+                result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
                     my_bet=my_bet, opp_bet=opp_bet, street=street,
                     min_raise=observation["min_raise"],
                     max_raise=observation["max_raise"],
-                    valid_actions=valid, hero_is_first=True,
-                    time_remaining=time_left)
+                    valid_actions=valid, time_remaining=time_left)
                 if result is not None:
                     return result
-                # Fallback: equity threshold
-                return self._equity_threshold_play(
-                    my_cards, board, dead, observation, valid, street)
-            else:
-                # Acting first: equity thresholds (betting is +2382, works fine)
-                return self._equity_threshold_play(
-                    my_cards, board, dead, observation, valid, street)
+            # Fallback: equity thresholds
+            return self._equity_threshold_play(
+                my_cards, board, dead, observation, valid, street)
 
         # 4. Flop fallback: equity thresholds (if blueprint missed)
         if street == 1:

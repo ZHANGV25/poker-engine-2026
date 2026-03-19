@@ -95,17 +95,17 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Used ONLY for river facing-bet decisions (~50 calls/match).
-        # Turn uses equity thresholds (0 compute) so 94% of budget is free.
-        # 200 iters at ~50 calls = ~500s ARM = 33% of 1500s budget.
-        if time_remaining > 800:
+        # Vectorized CFR — ~2s per 1000 iters on Mac, ~5s on ARM.
+        # Range-balanced solving for river decisions.
+        # 1000 iters × ~60 calls = ~300s ARM = 20% of 1500s budget.
+        if time_remaining > 600:
+            iterations = 1000
+        elif time_remaining > 300:
+            iterations = 500
+        elif time_remaining > 100:
             iterations = 200
-        elif time_remaining > 400:
-            iterations = 100
-        elif time_remaining > 200:
-            iterations = 50
         else:
-            iterations = 20
+            iterations = 50
 
         # Build game tree
         max_bet = 100
@@ -256,30 +256,33 @@ class RangeSolver:
 
         idx = hero_node_idx[root]
         n_act = tree.num_actions[root]
-        result = np.zeros((n_hero, n_act), dtype=np.float64)
-
-        for hi in range(n_hero):
-            total = hero_strat_sum[idx, hi, :n_act].sum()
-            if total > 0:
-                result[hi] = hero_strat_sum[idx, hi, :n_act] / total
-            else:
-                result[hi] = np.ones(n_act) / n_act
-
+        strat_slice = hero_strat_sum[idx, :, :n_act]  # (n_hero, n_act)
+        totals = strat_slice.sum(axis=1, keepdims=True)  # (n_hero, 1)
+        result = np.where(totals > 0, strat_slice / np.maximum(totals, 1e-10),
+                         np.full_like(strat_slice, 1.0 / n_act))
         return result
 
-    def _regret_match_single(self, regrets, n_act):
-        """Regret matching for a single information set."""
-        pos = np.maximum(regrets[:n_act], 0)
-        total = pos.sum()
-        if total > 0:
-            return pos / total
-        return np.ones(n_act) / n_act
+    @staticmethod
+    def _regret_match_batch(regrets, n_act):
+        """Vectorized regret matching for all hands at once.
+
+        Args:
+            regrets: (n_hands, max_act) array
+            n_act: number of valid actions
+
+        Returns:
+            (n_hands, n_act) strategy array
+        """
+        pos = np.maximum(regrets[:, :n_act], 0)
+        totals = pos.sum(axis=1, keepdims=True)
+        return np.where(totals > 0, pos / np.maximum(totals, 1e-10),
+                       np.full_like(pos, 1.0 / n_act))
 
     def _range_cfr_traverse(self, tree, node_id, hero_reach, opp_reach,
                              hero_regrets, hero_strat_sum, opp_regrets,
                              hero_node_idx, opp_node_idx, terminal_values,
                              n_hero, n_opp, max_act):
-        """Range-based CFR traversal.
+        """Vectorized range-based CFR traversal.
 
         Returns np.array of shape (n_hero, n_opp) — utility matrix.
         """
@@ -293,10 +296,8 @@ class RangeSolver:
         if player == 0:  # Hero node
             idx = hero_node_idx[node_id]
 
-            # Each hero hand has its own strategy
-            strategies = np.zeros((n_hero, n_act), dtype=np.float64)
-            for hi in range(n_hero):
-                strategies[hi] = self._regret_match_single(hero_regrets[idx, hi], n_act)
+            # Vectorized regret matching for all hero hands
+            strategies = self._regret_match_batch(hero_regrets[idx], n_act)
 
             action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
             node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
@@ -311,25 +312,23 @@ class RangeSolver:
                     n_hero, n_opp, max_act)
                 node_value += strategies[:, a:a+1] * action_values[a]
 
-            # Update regrets per hero hand
-            for hi in range(n_hero):
-                for a in range(n_act):
-                    cf_regret = np.dot(action_values[a, hi] - node_value[hi], opp_reach)
-                    hero_regrets[idx, hi, a] = max(0, hero_regrets[idx, hi, a] + cf_regret)
+            # Vectorized regret update: (n_act, n_hero, n_opp) -> (n_hero, n_act)
+            # cf_regret[h,a] = dot(action_values[a,h,:] - node_value[h,:], opp_reach)
+            diff = action_values - node_value[np.newaxis, :, :]  # (n_act, n_hero, n_opp)
+            cf_regrets = np.tensordot(diff, opp_reach, axes=([2], [0]))  # (n_act, n_hero)
+            hero_regrets[idx, :, :n_act] = np.maximum(
+                0, hero_regrets[idx, :, :n_act] + cf_regrets.T)
 
-            # Update strategy sum
-            for hi in range(n_hero):
-                hero_strat_sum[idx, hi, :n_act] += hero_reach[hi] * strategies[hi]
+            # Vectorized strategy sum update
+            hero_strat_sum[idx, :, :n_act] += hero_reach[:, np.newaxis] * strategies
 
             return node_value
 
         else:  # Opponent node
             idx = opp_node_idx[node_id]
 
-            # Each opp hand has its own strategy
-            strategies = np.zeros((n_opp, n_act), dtype=np.float64)
-            for oi in range(n_opp):
-                strategies[oi] = self._regret_match_single(opp_regrets[idx, oi], n_act)
+            # Vectorized regret matching for all opp hands
+            strategies = self._regret_match_batch(opp_regrets[idx], n_act)
 
             action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
             node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
@@ -344,12 +343,12 @@ class RangeSolver:
                     n_hero, n_opp, max_act)
                 node_value += strategies[:, a:a+1].T * action_values[a]
 
-            # Update opp regrets
-            for oi in range(n_opp):
-                for a in range(n_act):
-                    # Opp utility = -hero utility
-                    cf_regret = np.dot(hero_reach, node_value[:, oi] - action_values[a, :, oi])
-                    opp_regrets[idx, oi, a] = max(0, opp_regrets[idx, oi, a] + cf_regret)
+            # Vectorized opp regret update: (n_opp, n_act)
+            # cf_regret[o,a] = dot(hero_reach, node_value[:,o] - action_values[a,:,o])
+            diff = node_value[np.newaxis, :, :] - action_values  # (n_act, n_hero, n_opp)
+            cf_regrets = np.tensordot(diff, hero_reach, axes=([1], [0]))  # (n_act, n_opp)
+            opp_regrets[idx, :, :n_act] = np.maximum(
+                0, opp_regrets[idx, :, :n_act] + cf_regrets.T)
 
             return node_value
 
