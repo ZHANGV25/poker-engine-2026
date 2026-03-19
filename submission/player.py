@@ -127,7 +127,10 @@ class PlayerAgent(Agent):
         self._last_pot_before = 0   # pot before our bet
         self._opp_bet_at_raise = 0  # opponent's bet when we last raised (for re-raise MDF)
 
-        # Track opponent betting patterns for adaptive play
+        # Track opponent betting patterns per street for adaptive narrowing
+        self._opp_bets_by_street = {1: 0, 2: 0, 3: 0}   # flop, turn, river
+        self._opp_actions_by_street = {1: 0, 2: 0, 3: 0}
+        # Keep old names for backward compat with adaptive showdown tracking
         self._opp_river_bets = 0
         self._opp_river_actions = 0
         self._opp_bet_showdown_wins = 0   # times they bet, went to showdown, won
@@ -568,15 +571,17 @@ class PlayerAgent(Agent):
         bet_frac = raise_amt / pot_before
         bluff_ratio = bet_frac / (1 + bet_frac)
 
-        # Estimate total bet frequency from tracked data.
+        # Estimate total bet frequency from per-street tracked data.
         # Defaults from computed GTO equilibrium:
         #   River: 17% (50 boards, 100 iters)
         #   Turn:  13% (30 boards, 50 iters)
-        street = len(board)  # 4 = turn, 5 = river
-        default_freq = 0.13 if street <= 4 else 0.17
+        n_board = len(board)  # 4 = turn, 5 = river
+        default_freq = 0.13 if n_board <= 4 else 0.17
+        obs_street = 2 if n_board <= 4 else 3  # map board length to street number
 
-        if self._opp_river_actions > 20:
-            total_bet_freq = self._opp_river_bets / self._opp_river_actions
+        if self._opp_actions_by_street.get(obs_street, 0) > 15:
+            total_bet_freq = (self._opp_bets_by_street[obs_street] /
+                              self._opp_actions_by_street[obs_street])
         else:
             total_bet_freq = default_freq
 
@@ -688,12 +693,14 @@ class PlayerAgent(Agent):
         bluff_ratio = rr_size / (rr_size + pot_if_called)
 
         # GTO re-raise frequency within defending range (geometric model)
-        street = len(board)  # 4 = turn, 5 = river
-        default_freq = 0.13 if street <= 4 else 0.17
+        n_board = len(board)  # 4 = turn, 5 = river
+        default_freq = 0.13 if n_board <= 4 else 0.17
+        obs_street = 2 if n_board <= 4 else 3
 
-        # Use tracked opponent data if available
-        if self._opp_river_actions > 20:
-            total_bet_freq = self._opp_river_bets / self._opp_river_actions
+        # Use per-street tracked opponent data if available
+        if self._opp_actions_by_street.get(obs_street, 0) > 15:
+            total_bet_freq = (self._opp_bets_by_street[obs_street] /
+                              self._opp_actions_by_street[obs_street])
         else:
             total_bet_freq = default_freq
         total_bet_freq = max(0.08, min(0.60, total_bet_freq))
@@ -1355,13 +1362,19 @@ class PlayerAgent(Agent):
         if reward != 0:
             self._hand_reward += reward
 
-        # Track opponent river aggression
-        if observation["street"] == 3:
+        # Track opponent aggression per street
+        street = observation["street"]
+        if street in (1, 2, 3):
             opp_bet = observation["opp_bet"]
             my_bet = observation["my_bet"]
+            self._opp_actions_by_street[street] += 1
             if opp_bet > my_bet:
-                self._opp_river_bets += 1
-            self._opp_river_actions += 1
+                self._opp_bets_by_street[street] += 1
+            # Keep legacy river counters for showdown tracking
+            if street == 3:
+                if opp_bet > my_bet:
+                    self._opp_river_bets += 1
+                self._opp_river_actions += 1
 
         opp_d = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_d) == 3 and self._opp_weights is None:
