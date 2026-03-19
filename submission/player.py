@@ -1161,27 +1161,11 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: range solver for ALL decisions (~1s ARM, compact tree)
-        #    Range-balanced strategies: coordinates value bets + bluffs.
-        #    Compact tree (2 sizes, 1 raise) prevents raise-then-fold pattern.
+        # 2. Turn: equity thresholds (proven 133% recovery, 22% bet freq)
+        #    Compact range solver over-bets turn (50%) — builds pots we lose
+        #    because it ignores river continuation (opponent calls turn, bets river).
         if street == 2:
             self._path_counts['ms_turn'] += 1
-            if time_left > 50 and self._opp_weights is not None:
-                result = self.range_solver.solve_and_act(
-                    hero_cards=my_cards, board=board,
-                    opp_range=self._opp_weights, dead_cards=dead,
-                    my_bet=my_bet, opp_bet=opp_bet, street=street,
-                    min_raise=observation["min_raise"],
-                    max_raise=observation["max_raise"],
-                    valid_actions=valid, time_remaining=time_left)
-                if result is not None:
-                    if result[0] == RAISE:
-                        self._raised_this_street = True
-                        self._streets_raised += 1
-                        self._last_hero_bet = result[1]
-                        self._last_pot_before = my_bet + opp_bet
-                        self._opp_bet_at_raise = opp_bet
-                    return result
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
