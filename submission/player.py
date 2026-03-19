@@ -572,10 +572,11 @@ class PlayerAgent(Agent):
         bluff_ratio = bet_frac / (1 + bet_frac)
 
         # Estimate total bet frequency from per-street tracked data.
-        # Defaults tuned for competition field (most bots bet 30-50%,
-        # well above GTO equilibrium of 13-17%).
+        # Defaults from field median across 12 matches:
+        #   Turn: 31% (range 14-77%, median 31%)
+        #   River: 23% (range 8-56%, median 23%)
         n_board = len(board)  # 4 = turn, 5 = river
-        default_freq = 0.30 if n_board <= 4 else 0.30
+        default_freq = 0.31 if n_board <= 4 else 0.23
         obs_street = 2 if n_board <= 4 else 3  # map board length to street number
 
         if self._opp_actions_by_street.get(obs_street, 0) > 15:
