@@ -96,9 +96,13 @@ class RangeSolver:
             return None
 
         # Compact tree + float32: ~0.3s per 1000 iters Mac, ~0.7s ARM.
-        # 2000 iters × ~260 calls (turn+river) = ~364s ARM = 24% budget.
+        # Scale iterations by pot size — spend more compute on big decisions.
+        pot = my_bet + opp_bet
         if time_remaining > 600:
-            iterations = 2000
+            if pot >= 40:
+                iterations = 3000  # big pot: spend more, decision matters most
+            else:
+                iterations = 1500  # small pot: standard
         elif time_remaining > 300:
             iterations = 1000
         elif time_remaining > 100:
