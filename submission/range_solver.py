@@ -138,6 +138,73 @@ class RangeSolver:
             tree, our_strategy, my_bet, opp_bet, min_raise, max_raise,
             valid_actions)
 
+    def compute_opp_bet_probs(self, board, opp_range, hero_range,
+                               dead_cards, my_bet, opp_bet, street,
+                               min_raise, iterations=1000):
+        """Compute P(bet|hand) for each opponent hand via range-balanced CFR.
+
+        Solves from opponent's perspective: they are "hero" deciding whether
+        to bet/check. Returns equilibrium P(bet|hand) for each hand.
+
+        This is the exact GTO P(bet|hand) — board-specific, range-specific,
+        accounts for bluff ratios and range composition.
+        """
+        known = set(board) | set(dead_cards)
+
+        opp_hands = []
+        opp_weights = []
+        for hand, w in opp_range.items():
+            if w > 0.001 and not (set(hand) & known):
+                opp_hands.append(hand)
+                opp_weights.append(w)
+
+        hero_hands = []
+        hero_weights = []
+        for hand, w in hero_range.items():
+            if w > 0.001 and not (set(hand) & known):
+                hero_hands.append(hand)
+                hero_weights.append(w)
+
+        if len(opp_hands) < 3 or len(hero_hands) < 3:
+            return None
+
+        opp_w = np.array(opp_weights, dtype=np.float32)
+        opp_w /= opp_w.sum()
+        hero_w = np.array(hero_weights, dtype=np.float32)
+        hero_w /= hero_w.sum()
+
+        n_opp = len(opp_hands)
+        n_hero = len(hero_hands)
+
+        # Tree from opponent's perspective: equal bets (pre-bet state)
+        # Opponent decides to check or bet
+        pre_bet = min(my_bet, opp_bet)
+        tree = self._get_tree(pre_bet, pre_bet, min_raise, 100)
+        if tree.size < 2:
+            return None
+
+        # Equity from opponent's perspective
+        eq_matrix = self._compute_equity_matrix(
+            opp_hands, hero_hands, board, dead_cards, street)
+
+        # Terminal values from opponent's perspective
+        tv = self._compute_terminal_values(tree, eq_matrix, n_opp, n_hero)
+
+        # Solve: opponent is "hero", we are "opp"
+        strat = self._run_range_cfr(tree, hero_w, tv, n_opp, n_hero, iterations)
+
+        # Extract P(bet|hand): sum of all non-check actions
+        children = tree.children[0]
+        bet_indices = [a for a, (act_type, _) in enumerate(children) if act_type != 1]
+
+        result = {}
+        for oi, hand in enumerate(opp_hands):
+            p_bet = float(strat[oi, bet_indices].sum()) if bet_indices else 0.0
+            key = (min(hand[0], hand[1]), max(hand[0], hand[1]))
+            result[key] = p_bet
+
+        return result
+
     def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet):
         # Compact tree: 2 bet sizes + 1 raise max → ~6x smaller
         key = (hero_bet, opp_bet, min_raise, max_bet, True, True)

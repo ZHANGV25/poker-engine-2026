@@ -787,6 +787,73 @@ class PlayerAgent(Agent):
         except Exception:
             pass
 
+    def _river_solve_narrow(self, board, dead_cards, my_bet, opp_bet):
+        """Narrow opponent range on river using solved P(bet|hand).
+
+        Solves the game from opponent's perspective via range-balanced CFR.
+        Returns exact equilibrium P(bet|hand) for each hand — board-specific,
+        range-specific, accounts for bluff ratios and range composition.
+
+        Cost: ~0.7s ARM. Replaces heuristic polarized narrowing.
+        Returns True if applied, False on failure (falls back to polarized).
+        """
+        if self._opp_weights is None:
+            return False
+
+        try:
+            # Build our range (what opponent thinks we have)
+            known = set(board) | set(dead_cards)
+            hero_range = {}
+            import itertools as _it
+            remaining = [c for c in range(27) if c not in known]
+            for h in _it.combinations(remaining, 2):
+                hero_range[h] = 1.0
+
+            p_bet = self.range_solver.compute_opp_bet_probs(
+                board=board, opp_range=self._opp_weights,
+                hero_range=hero_range, dead_cards=dead_cards,
+                my_bet=my_bet, opp_bet=opp_bet, street=3,
+                min_raise=max(2, opp_bet - my_bet),
+                iterations=1000)
+
+            if p_bet is None or len(p_bet) < 3:
+                return False
+
+            # Bayesian update: weight *= P(bet|hand)
+            # With trust blending for non-GTO opponents
+            blueprint_avg = sum(p_bet.values()) / len(p_bet)
+            obs_street = 3
+            tracked_freq = None
+            if self._opp_actions_by_street.get(obs_street, 0) > 15:
+                tracked_freq = (self._opp_bets_by_street[obs_street] /
+                                self._opp_actions_by_street[obs_street])
+
+            if tracked_freq is not None and max(tracked_freq, blueprint_avg) > 0.01:
+                alpha = max(0.1, 1.0 - abs(tracked_freq - blueprint_avg) /
+                            max(tracked_freq, blueprint_avg, 0.01))
+                uniform_bet = tracked_freq
+            else:
+                alpha = 1.0
+                uniform_bet = blueprint_avg
+
+            for pair, weight in list(self._opp_weights.items()):
+                if weight <= 0:
+                    continue
+                key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                p = p_bet.get(key)
+                if p is not None:
+                    p_blended = alpha * p + (1.0 - alpha) * uniform_bet
+                    self._opp_weights[pair] *= max(p_blended, 0.05)
+
+            total = sum(self._opp_weights.values())
+            if total > 0:
+                for k in self._opp_weights:
+                    self._opp_weights[k] /= total
+            return True
+
+        except Exception:
+            return False
+
     def _turn_bayesian_narrow(self, board, my_bet, opp_bet):
         """Bayesian narrowing on turn using precomputed P(bet|hand).
 
@@ -1326,6 +1393,12 @@ class PlayerAgent(Agent):
                 elif street == 2 and self._multi_street is not None:
                     # Turn: try Bayesian from turn opp data, fall back to polarized
                     if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
+                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                elif street == 3 and time_left > 100:
+                    # River: solve from opponent's perspective to get exact
+                    # GTO P(bet|hand). Board-specific, range-specific.
+                    # ~0.7s ARM, replaces heuristic polarized narrowing.
+                    if not self._river_solve_narrow(board, dead, my_bet, opp_bet):
                         self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     self._polarized_narrow_range(board, dead, my_bet, opp_bet)
