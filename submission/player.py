@@ -1437,13 +1437,10 @@ class PlayerAgent(Agent):
                     # Turn: try Bayesian from turn opp data, fall back to polarized
                     if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
                         self._polarized_narrow_range(board, dead, my_bet, opp_bet)
-                elif street == 3 and time_left > 100:
-                    # River: solve from opponent's perspective to get exact
-                    # GTO P(bet|hand). Board-specific, range-specific.
-                    # ~0.7s ARM, replaces heuristic polarized narrowing.
-                    if not self._river_solve_narrow(board, dead, my_bet, opp_bet):
-                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
+                    # River + fallback: polarized narrowing with per-street tracking.
+                    # River solve-narrow was too aggressive — made us bet 34-48%
+                    # on river (was 16-25% at 55% WR). Reverted to polarized.
                     self._polarized_narrow_range(board, dead, my_bet, opp_bet)
             elif opp_bet == my_bet and not hero_is_first and street in (1, 2):
                 # Opponent CHECKED: Bayesian update with P(check|hand) from
