@@ -591,7 +591,7 @@ class PlayerAgent(Agent):
                 my_bet=my_bet, opp_bet=opp_bet,
                 street=street,
                 min_raise=max(2, opp_bet - my_bet),
-                iterations=100)
+                iterations=50)
 
             if p_bet is None or len(p_bet) < 3:
                 return False
@@ -1288,14 +1288,14 @@ class PlayerAgent(Agent):
                     pot_won = min(hp, op)
                     tv[nid] = (2.0 * equity_vec - 1.0) * pot_won
 
-            # Run 150 CFR iterations for each river card — well-converged
-            # root EV. Cost: ~50ms per card, ~750ms total for 15 cards.
+            # Run 75 CFR iterations for each river card — decent convergence
+            # while staying under 5s per-action ARM limit.
             hero_reg = np.zeros((n_hero_r, max_act), dtype=np.float64)
             hero_ss = np.zeros((n_hero_r, max_act), dtype=np.float64)
             opp_reg = np.zeros((n_opp_r, n_opp, max_act), dtype=np.float64)
 
             root_val = None
-            for t in range(150):
+            for t in range(75):
                 root_val = self.solver._cfr_traverse(
                     river_tree, 0, 1.0, opp_w,
                     hero_reg, hero_ss, opp_reg,
