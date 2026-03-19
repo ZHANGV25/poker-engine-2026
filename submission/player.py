@@ -1050,22 +1050,19 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: equity thresholds (proven 133% recovery rate in field)
-        #    Turn lookahead overcalled — 32% WR on invested hands vs 56% on checks.
-        #    One-hand solver for facing bets to avoid raise-then-fold pattern.
+        # 2. Turn: range solver for ALL decisions (~1s ARM, compact tree)
+        #    Range-balanced strategies: coordinates value bets + bluffs.
+        #    Compact tree (2 sizes, 1 raise) prevents raise-then-fold pattern.
         if street == 2:
             self._path_counts['ms_turn'] += 1
-            facing_bet = opp_bet > my_bet
-
-            if facing_bet and time_left > 100:
-                result = self.solver.solve_and_act(
+            if time_left > 50 and self._opp_weights is not None:
+                result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
                     my_bet=my_bet, opp_bet=opp_bet, street=street,
                     min_raise=observation["min_raise"],
                     max_raise=observation["max_raise"],
-                    valid_actions=valid, hero_is_first=True,
-                    time_remaining=time_left)
+                    valid_actions=valid, time_remaining=time_left)
                 if result is not None:
                     if result[0] == RAISE:
                         self._raised_this_street = True
@@ -1074,20 +1071,15 @@ class PlayerAgent(Agent):
                         self._last_pot_before = my_bet + opp_bet
                         self._opp_bet_at_raise = opp_bet
                     return result
-
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
-        # 3. River: equity thresholds acting first (bets 20-25%, includes bluffs)
-        #    range solver facing bets (range-balanced call/fold/raise)
+        # 3. River: range solver for ALL decisions (~0.8s ARM, compact tree)
+        #    Compact tree bets ~49% (vs 13% full tree / 16% equity thresholds).
+        #    Range-balanced: coordinates value bets, bluffs, and calls.
         if street == 3:
-            facing_bet = opp_bet > my_bet
-
-            if facing_bet and time_left > 50:
-                self._path_counts['range_solver'] += 1
-                # Range solver for call/fold: solves ALL hero hands for
-                # coordinated calling strategy (can't be exploited by
-                # opponent varying bet sizing).
+            self._path_counts['range_solver'] += 1
+            if time_left > 50 and self._opp_weights is not None:
                 result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
@@ -1097,10 +1089,6 @@ class PlayerAgent(Agent):
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
                     return result
-
-            # Acting first OR fallback: equity thresholds
-            # Bets more aggressively than the range solver (20-25% vs 14%)
-            # and includes bluffs — better for exploiting this field.
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 

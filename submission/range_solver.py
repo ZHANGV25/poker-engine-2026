@@ -70,7 +70,7 @@ class RangeSolver:
         if not opp_hands:
             return None
 
-        opp_weights = np.array(opp_weights, dtype=np.float64)
+        opp_weights = np.array(opp_weights, dtype=np.float32)
         opp_weights /= opp_weights.sum()
 
         # Enumerate all possible hero hands
@@ -95,15 +95,14 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Vectorized CFR — must stay under 5s per action on ARM.
-        # ~2s per 1000 iters on Mac, ~4-5s on ARM (4 vCPU Graviton2).
-        # 1000 iters × ~60 calls = ~300s ARM = 20% of 1500s budget.
+        # Compact tree + float32: ~0.3s per 1000 iters Mac, ~0.7s ARM.
+        # 2000 iters × ~260 calls (turn+river) = ~364s ARM = 24% budget.
         if time_remaining > 600:
-            iterations = 1000
+            iterations = 2000
         elif time_remaining > 300:
-            iterations = 500
+            iterations = 1000
         elif time_remaining > 100:
-            iterations = 200
+            iterations = 500
         else:
             iterations = 50
 
@@ -136,16 +135,18 @@ class RangeSolver:
             valid_actions)
 
     def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet):
-        key = (hero_bet, opp_bet, min_raise, max_bet, True)
+        # Compact tree: 2 bet sizes + 1 raise max → ~6x smaller
+        key = (hero_bet, opp_bet, min_raise, max_bet, True, True)
         if key not in self._tree_cache:
-            self._tree_cache[key] = GameTree(hero_bet, opp_bet, min_raise, max_bet, True)
+            self._tree_cache[key] = GameTree(
+                hero_bet, opp_bet, min_raise, max_bet, True, compact=True)
         return self._tree_cache[key]
 
     def _compute_equity_matrix(self, hero_hands, opp_hands, board, dead_cards, street):
         """Compute equity[h][o] = hero hand h's equity vs opp hand o."""
         n_hero = len(hero_hands)
         n_opp = len(opp_hands)
-        equity = np.zeros((n_hero, n_opp), dtype=np.float64)
+        equity = np.zeros((n_hero, n_opp), dtype=np.float32)
 
         known_base = set(board) | set(dead_cards)
         board_list = list(board)
@@ -205,9 +206,9 @@ class RangeSolver:
             opp_pot = tree.opp_pot[node_id]
 
             if term_type == TERM_FOLD_HERO:
-                values[node_id] = np.full((n_hero, n_opp), -hero_pot, dtype=np.float64)
+                values[node_id] = np.full((n_hero, n_opp), -hero_pot, dtype=np.float32)
             elif term_type == TERM_FOLD_OPP:
-                values[node_id] = np.full((n_hero, n_opp), opp_pot, dtype=np.float64)
+                values[node_id] = np.full((n_hero, n_opp), opp_pot, dtype=np.float32)
             elif term_type == TERM_SHOWDOWN:
                 pot_won = min(hero_pot, opp_pot)
                 values[node_id] = (2.0 * equity_matrix - 1.0) * pot_won
@@ -233,14 +234,14 @@ class RangeSolver:
         )
 
         # Hero: regrets and strategy sum per hand per node
-        hero_regrets = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float64)
-        hero_strat_sum = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float64)
+        hero_regrets = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float32)
+        hero_strat_sum = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float32)
 
         # Opponent: regrets per hand per node (same as one-hand solver)
-        opp_regrets = np.zeros((n_opp_nodes, n_opp, max_act), dtype=np.float64)
+        opp_regrets = np.zeros((n_opp_nodes, n_opp, max_act), dtype=np.float32)
 
         # Initial hero reach: uniform (each hand equally likely)
-        hero_reach_init = np.ones(n_hero, dtype=np.float64) / n_hero
+        hero_reach_init = np.ones(n_hero, dtype=np.float32) / n_hero
 
         for t in range(iterations):
             self._range_cfr_traverse(
@@ -299,8 +300,8 @@ class RangeSolver:
             # Vectorized regret matching for all hero hands
             strategies = self._regret_match_batch(hero_regrets[idx], n_act)
 
-            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
-            node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
+            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float32)
+            node_value = np.zeros((n_hero, n_opp), dtype=np.float32)
 
             for a in range(n_act):
                 _, child_id = children[a]
@@ -330,8 +331,8 @@ class RangeSolver:
             # Vectorized regret matching for all opp hands
             strategies = self._regret_match_batch(opp_regrets[idx], n_act)
 
-            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
-            node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
+            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float32)
+            node_value = np.zeros((n_hero, n_opp), dtype=np.float32)
 
             for a in range(n_act):
                 _, child_id = children[a]

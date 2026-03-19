@@ -35,7 +35,8 @@ class GameTree:
     CFR iterations. Stores tree structure as parallel lists for fast access.
     """
 
-    def __init__(self, hero_bet, opp_bet, min_raise, max_bet, hero_first):
+    def __init__(self, hero_bet, opp_bet, min_raise, max_bet, hero_first,
+                 compact=False):
         """Build the game tree.
 
         Args:
@@ -44,7 +45,9 @@ class GameTree:
             min_raise: minimum raise increment
             max_bet: maximum total bet per player (100)
             hero_first: True if hero acts first on this street
+            compact: if True, use 2 bet sizes + 1 raise max (for range solver)
         """
+        self._compact = compact
         # Node data (parallel lists, indexed by node_id)
         self.player = []        # 0=hero, 1=opp
         self.terminal = []      # TERM_* constant
@@ -88,7 +91,8 @@ class GameTree:
 
         Returns list of (action_id, new_acting_bet) pairs.
         """
-        if raises_so_far >= MAX_RAISES_PER_STREET:
+        max_raises = 1 if self._compact else MAX_RAISES_PER_STREET
+        if raises_so_far >= max_raises:
             return []
 
         remaining = self._max_bet - max(acting_bet, other_bet)
@@ -99,39 +103,50 @@ class GameTree:
         call_amount = other_bet - acting_bet  # amount to match first
         sizes = []
 
-        # PROPORTIONAL bet sizes — all relative to pot, never overbetting.
-        # This prevents the abstraction gap that caused overbets (96 into 4).
-        # The solver computes equilibria for these ACTUAL bet amounts.
+        if self._compact:
+            # Compact mode: 2 bet sizes only (60% pot + all-in)
+            # Smaller tree for range solver — ~6x fewer nodes.
+            med = max(self._min_raise, int(0.6 * pot))
+            med = min(med, remaining)
+            new_bet_med = other_bet + med
+            if new_bet_med <= self._max_bet:
+                sizes.append((ACT_RAISE_POT, new_bet_med))
 
-        # Small: 40% pot
-        small = max(self._min_raise, int(0.4 * pot))
-        small = min(small, remaining)
-        new_bet_small = other_bet + small
-        if new_bet_small <= self._max_bet:
-            sizes.append((ACT_RAISE_HALF, new_bet_small))
+            allin = self._max_bet
+            if allin > other_bet and allin != new_bet_med:
+                sizes.append((ACT_RAISE_ALLIN, allin))
+        else:
+            # Full mode: 4 bet sizes for maximum expressiveness.
 
-        # Medium: 70% pot
-        med = max(self._min_raise, int(0.7 * pot))
-        med = min(med, remaining)
-        new_bet_med = other_bet + med
-        if new_bet_med <= self._max_bet:
-            sizes.append((ACT_RAISE_POT, new_bet_med))
+            # Small: 40% pot
+            small = max(self._min_raise, int(0.4 * pot))
+            small = min(small, remaining)
+            new_bet_small = other_bet + small
+            if new_bet_small <= self._max_bet:
+                sizes.append((ACT_RAISE_HALF, new_bet_small))
 
-        # Large: 100% pot
-        large = max(self._min_raise, pot)
-        large = min(large, remaining)
-        new_bet_large = other_bet + large
-        new_bet_large = min(new_bet_large, self._max_bet)
-        if new_bet_large > other_bet:
-            sizes.append((ACT_RAISE_ALLIN, new_bet_large))
+            # Medium: 70% pot
+            med = max(self._min_raise, int(0.7 * pot))
+            med = min(med, remaining)
+            new_bet_med = other_bet + med
+            if new_bet_med <= self._max_bet:
+                sizes.append((ACT_RAISE_POT, new_bet_med))
 
-        # Overbet: 150% pot
-        overbet = max(self._min_raise, int(1.5 * pot))
-        overbet = min(overbet, remaining)
-        new_bet_over = other_bet + overbet
-        new_bet_over = min(new_bet_over, self._max_bet)
-        if new_bet_over > other_bet:
-            sizes.append((ACT_RAISE_OVERBET, new_bet_over))
+            # Large: 100% pot
+            large = max(self._min_raise, pot)
+            large = min(large, remaining)
+            new_bet_large = other_bet + large
+            new_bet_large = min(new_bet_large, self._max_bet)
+            if new_bet_large > other_bet:
+                sizes.append((ACT_RAISE_ALLIN, new_bet_large))
+
+            # Overbet: 150% pot
+            overbet = max(self._min_raise, int(1.5 * pot))
+            overbet = min(overbet, remaining)
+            new_bet_over = other_bet + overbet
+            new_bet_over = min(new_bet_over, self._max_bet)
+            if new_bet_over > other_bet:
+                sizes.append((ACT_RAISE_OVERBET, new_bet_over))
 
         # Deduplicate (if sizes overlap, keep unique values)
         seen = set()
