@@ -1526,20 +1526,16 @@ class PlayerAgent(Agent):
                     max_raise=observation["max_raise"],
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
-                    # Opponent profiling: if they almost never bluff
-                    # (win 75%+ at showdown when betting), require more
-                    # equity to call. Detects value-heavy opponents
-                    # like frogtron within ~15 showdowns.
+                    # Opponent profiling: if they don't bluff enough,
+                    # fold even when solver says call.
+                    # Derived: need P(bluff) ≥ pot_odds to justify calling.
                     if result[0] == CALL and self._opp_bet_showdown_total > 10:
-                        opp_wr = self._opp_bet_showdown_wins / self._opp_bet_showdown_total
-                        if opp_wr > 0.75:
-                            # Value-heavy: require extra equity to call
-                            eq = self.engine.compute_equity(
-                                my_cards, board, dead, self._opp_weights)
-                            premium = (opp_wr - 0.50) * 0.3  # 75%→+7.5%, 90%→+12%
-                            pot_odds = (opp_bet - my_bet) / (my_bet + opp_bet)
-                            if eq < pot_odds + premium:
-                                result = (FOLD, 0, 0, 0)
+                        opp_bluff_rate = 1.0 - (self._opp_bet_showdown_wins /
+                                                 self._opp_bet_showdown_total)
+                        pot_odds_here = (opp_bet - my_bet) / (my_bet + opp_bet)
+                        if opp_bluff_rate < pot_odds_here * 0.8:
+                            # They don't bluff enough to justify calling
+                            result = (FOLD, 0, 0, 0)
                     return result
 
             # Acting first or fallback: equity thresholds + exploit layer
@@ -1725,13 +1721,18 @@ class PlayerAgent(Agent):
                     self._opp_bet_at_raise = opp_bet
                     return (RAISE, min(bet_size, max_raise), 0, 0)
 
-        # Call if equity justifies (with bankroll + opponent profiling)
-        call_threshold = pot_odds + (1.0 - rf) * 0.05  # bankroll: ahead +0.02, behind -0.02
-        # Opponent profiling: value-heavy opponents require more equity
+        # Call if equity justifies.
+        # Derived: call when P(opponent bluffing) ≥ pot_odds.
+        # P(bluff) = 1 - opp_showdown_wr. If opp wins 80% at showdown
+        # when betting, they bluff 20%. Pot-sized bet needs 33% → fold.
+        call_threshold = pot_odds + (1.0 - rf) * 0.05  # bankroll adjustment
         if self._opp_bet_showdown_total > 10:
-            opp_wr = self._opp_bet_showdown_wins / self._opp_bet_showdown_total
-            if opp_wr > 0.65:
-                call_threshold += (opp_wr - 0.50) * 0.3  # 75%→+7.5%, 90%→+12%
+            opp_bluff_rate = 1.0 - (self._opp_bet_showdown_wins /
+                                     self._opp_bet_showdown_total)
+            # Need: equity ≥ pot_odds AND opp_bluff_rate ≥ pot_odds
+            # If opponent doesn't bluff enough, folding is correct regardless of equity
+            if opp_bluff_rate < pot_odds * 0.8:  # 80% of needed bluff rate
+                call_threshold = max(call_threshold, 1.0 - opp_bluff_rate)
         if valid[CALL] and equity >= call_threshold:
             return (CALL, 0, 0, 0)
 
