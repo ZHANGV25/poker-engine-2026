@@ -1100,7 +1100,7 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.02
+                self._opp_weights[hand] *= 0.05
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1203,7 +1203,7 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.02
+                self._opp_weights[hand] *= 0.05
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1248,7 +1248,7 @@ class PlayerAgent(Agent):
         cutoff = int(len(ranked) * keep_fraction)
         if cutoff < len(ranked):
             for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.02
+                self._opp_weights[hand] *= 0.05
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1362,7 +1362,7 @@ class PlayerAgent(Agent):
         cutoff = int(len(ranked) * keep)
         if cutoff < len(ranked):
             for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.02
+                self._opp_weights[hand] *= 0.05
 
         total = sum(self._opp_weights.values())
         if total > 0:
