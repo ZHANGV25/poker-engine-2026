@@ -1908,25 +1908,24 @@ class PlayerAgent(Agent):
 
         # Turn data loaded lazily per-board — no stalling needed.
 
-        # Bankroll-aware risk scaling.
-        # Match objective: P(end with more chips), not per-hand EV.
-        # When ahead: reduce variance (tighter, fewer bluffs, smaller pots).
-        # When behind: increase variance (looser, more bluffs, bigger pots).
-        actual_bankroll = self._bankroll
+        # Bankroll-aware risk scaling derived from match win probability.
+        # P(win) = Φ(Z) where Z = bankroll / (σ × √hands_remaining).
+        # σ ≈ 20 chips/hand (empirical from match data).
+        # Z > 2: 97.7% winning → conserve. Z < -2: aggressive to catch up.
         hands_remaining = self._total_hands - hand_number
-        if hands_remaining > 0:
-            # chips_per_hand needed to break even from current position
-            pace = actual_bankroll / hands_remaining
-            if pace > 3.0:
-                self._risk_factor = 0.6  # way ahead: very conservative
-            elif pace > 1.0:
-                self._risk_factor = 0.8  # ahead: somewhat conservative
-            elif pace > -1.0:
-                self._risk_factor = 1.0  # even: standard play
-            elif pace > -3.0:
-                self._risk_factor = 1.2  # behind: somewhat aggressive
+        if hands_remaining > 10:
+            sigma_per_hand = 20.0
+            z_score = self._bankroll / (sigma_per_hand * (hands_remaining ** 0.5))
+            if z_score > 2.0:
+                self._risk_factor = 0.6
+            elif z_score > 1.0:
+                self._risk_factor = 0.8
+            elif z_score > -1.0:
+                self._risk_factor = 1.0
+            elif z_score > -2.0:
+                self._risk_factor = 1.2
             else:
-                self._risk_factor = 1.4  # way behind: very aggressive
+                self._risk_factor = 1.5  # desperate: maximum aggression
         else:
             self._risk_factor = 1.0
 
