@@ -1238,6 +1238,10 @@ class PlayerAgent(Agent):
         if fold_rate <= 0.50:
             return default_result  # defending correctly, don't bluff extra
 
+        # Respect pot control — don't bluff on 3rd+ street of aggression
+        if self._streets_raised >= 2:
+            return default_result
+
         # Only bluff with weak hands (strong hands should value bet,
         # which the solver/thresholds already handle)
         equity = self.engine.compute_equity(my_cards, board, dead, self._opp_weights)
