@@ -1128,14 +1128,9 @@ class PlayerAgent(Agent):
                         self._soft_narrow_range(my_bet, opp_bet, board, dead)
                 else:
                     self._polarized_narrow_range(board, dead, my_bet, opp_bet)
-
-            elif opp_bet == my_bet and self._opp_weights is not None:
-                # Opponent CHECKED: cap range — downweight strong hands
-                # that would have bet. P(check|hand) is low for strong hands.
-                # Only apply if opponent acted first (we're responding to check).
-                if not hero_is_first and street >= 1:
-                    self._narrowed_this_street = True
-                    self._cap_range_on_check(board, dead, street)
+            # NOTE: opponent CHECKS are NOT narrowed. Check-capping caused
+            # 6% river call WR (was 51%) — capped weights persisted across
+            # streets, making slow-played hands invisible to river solver.
 
         elif opp_bet > my_bet and self._opp_weights is not None and self._narrowed_this_street:
             # Re-raise: two-phase game-theoretic narrowing
