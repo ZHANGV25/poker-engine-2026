@@ -1477,11 +1477,33 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: blueprint lookup (if available) or equity thresholds
+        # 2. Turn: depth-limited solving with river continuation values.
+        #    Solves turn subgame using actual narrowed opponent range +
+        #    river sub-game values at showdown terminals.
+        #    Falls back to blueprint lookup, then equity thresholds.
         if street == 2:
             self._path_counts['ms_turn'] += 1
 
-            # Try turn blueprint first (precomputed from EC2)
+            # Depth-limited solve: one-hand solver with river lookahead
+            # using actual narrowed opponent range (not generic blueprint range)
+            if (self._opp_weights is not None and time_left > 200
+                    and len(board) >= 4):
+                try:
+                    result = self._solve_turn_with_river(
+                        my_cards, board, dead, my_bet, opp_bet,
+                        observation, valid, True, time_left)
+                    if result is not None:
+                        if result[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
+                            self._last_hero_bet = result[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        return result
+                except Exception:
+                    pass
+
+            # Fallback 1: blueprint lookup
             if self._multi_street is not None:
                 try:
                     strat = self._multi_street.get_turn_strategy(
@@ -1499,7 +1521,7 @@ class PlayerAgent(Agent):
                 except Exception:
                     pass
 
-            # Fallback: equity thresholds + exploit layer
+            # Fallback 2: equity thresholds + exploit layer
             result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
             if (result[0] == CHECK and valid[RAISE] and
