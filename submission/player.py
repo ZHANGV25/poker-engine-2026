@@ -1648,8 +1648,17 @@ class PlayerAgent(Agent):
         # Pot control: can only raise on 2 streets max unless near-nuts
         can_raise = self._streets_raised < 2 or bet_eq > 0.92
 
+        # Bankroll-aware thresholds: when ahead, require more equity to bet.
+        # When behind, bet with less equity (seek variance).
+        rf = getattr(self, '_risk_factor', 1.0)
+        # rf=0.6 (ahead): thresholds go UP (0.92→0.95, 0.82→0.88, 0.72→0.80)
+        # rf=1.4 (behind): thresholds go DOWN (0.92→0.88, 0.82→0.75, 0.72→0.63)
+        thresh_nuts = min(0.98, 0.92 + (1.0 - rf) * 0.08)
+        thresh_strong = min(0.95, 0.82 + (1.0 - rf) * 0.15)
+        thresh_medium = min(0.90, 0.72 + (1.0 - rf) * 0.20)
+
         # All-in with near-nuts (vs calling range)
-        if bet_eq > 0.92 and valid[RAISE]:
+        if bet_eq > thresh_nuts and valid[RAISE]:
             self._raised_this_street = True
             self._streets_raised += 1
             self._last_hero_bet = max_raise
@@ -1658,7 +1667,7 @@ class PlayerAgent(Agent):
             return (RAISE, max_raise, 0, 0)
 
         # Strong value raise (vs calling range)
-        if bet_eq > 0.82 and valid[RAISE] and can_raise:
+        if bet_eq > thresh_strong and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.65), min_raise)
@@ -1669,7 +1678,7 @@ class PlayerAgent(Agent):
             return (RAISE, amt, 0, 0)
 
         # Medium value raise (vs calling range)
-        if bet_eq > 0.72 and valid[RAISE] and can_raise:
+        if bet_eq > thresh_medium and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.4), min_raise)
@@ -1697,14 +1706,19 @@ class PlayerAgent(Agent):
             if street_bluff_scale > 0:
                 bet_size = max(int(pot * 0.6), min_raise)
                 bluff_freq = bet_size / (bet_size + pot) if pot > 0 else 0.1
+                # When ahead: bluff less (protect lead). Behind: bluff more.
+                bluff_freq *= rf
                 if _random.random() < bluff_freq * street_bluff_scale:
                     self._raised_this_street = True
                     self._streets_raised += 1
                     self._opp_bet_at_raise = opp_bet
                     return (RAISE, min(bet_size, max_raise), 0, 0)
 
-        # Call if equity justifies (against polarized-narrowed range)
-        if valid[CALL] and equity >= pot_odds:
+        # Call if equity justifies (with bankroll-aware risk premium)
+        # When ahead: require more equity to call (avoid variance).
+        # When behind: call lighter (need action to catch up).
+        call_threshold = pot_odds + (1.0 - rf) * 0.05  # ahead: +0.02, behind: -0.02
+        if valid[CALL] and equity >= call_threshold:
             return (CALL, 0, 0, 0)
 
         # Check
@@ -1894,15 +1908,34 @@ class PlayerAgent(Agent):
 
         # Turn data loaded lazily per-board — no stalling needed.
 
-
-
-
-        # Lead protection — if we can survive on blinds alone, fold everything
-        # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
+        # Bankroll-aware risk scaling.
+        # Match objective: P(end with more chips), not per-hand EV.
+        # When ahead: reduce variance (tighter, fewer bluffs, smaller pots).
+        # When behind: increase variance (looser, more bluffs, bigger pots).
         actual_bankroll = self._bankroll
         hands_remaining = self._total_hands - hand_number
+        if hands_remaining > 0:
+            # chips_per_hand needed to break even from current position
+            pace = actual_bankroll / hands_remaining
+            if pace > 3.0:
+                self._risk_factor = 0.6  # way ahead: very conservative
+            elif pace > 1.0:
+                self._risk_factor = 0.8  # ahead: somewhat conservative
+            elif pace > -1.0:
+                self._risk_factor = 1.0  # even: standard play
+            elif pace > -3.0:
+                self._risk_factor = 1.2  # behind: somewhat aggressive
+            else:
+                self._risk_factor = 1.4  # way behind: very aggressive
+        else:
+            self._risk_factor = 1.0
+
+        # Lead protection — if we can survive on blinds alone, fold everything.
+        # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
+        # Kick in with comfortable margin (2x blind cost) for safety.
+        hands_remaining = self._total_hands - hand_number
         blind_cost = hands_remaining * 1.5
-        if actual_bankroll > blind_cost + 10:
+        if self._bankroll > blind_cost * 2 + 10:
             valid = observation["valid_actions"]
             if valid[CHECK]:
                 return (CHECK, 0, 0, 0)
