@@ -69,9 +69,9 @@ POT_SIZES = [
     (2, 2), (4, 4), (10, 10), (30, 30), (50, 50),
 ]
 
-# Don't save turn strategies — runtime solver handles turn.
-# All 100MB budget goes to flop data quality.
-TURN_SAVE_POT_IDX = 99  # no pot index matches → nothing saved
+# Save turn strategies for ALL pot sizes.
+# With 1GB upload limit, we can fit flop (163MB) + turn (~316MB).
+TURN_SAVE_POT_IDX = -1  # -1 = save all pots
 
 
 # ---------------------------------------------------------------------------

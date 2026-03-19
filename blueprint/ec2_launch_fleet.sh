@@ -214,7 +214,7 @@ fi
 # --- Step 5: Upload results to S3 ---
 echo "[6/6] Uploading results to S3..."
 aws s3 cp /opt/blueprint/output/ \\
-    ${S3_BUCKET}/multi_street_v9/ \\
+    ${S3_BUCKET}/multi_street_v10_turn/ \\
     --recursive --region ${REGION}
 
 # Upload the log too
