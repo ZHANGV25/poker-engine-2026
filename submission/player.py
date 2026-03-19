@@ -1774,15 +1774,7 @@ class PlayerAgent(Agent):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
 
-        # Wait for deferred load (turn data) on early hands.
-        # Burns up to 2s per action to let background thread finish.
-        # Keeps under 5s per-action timeout with margin for decisions.
-        if not _PRELOAD.get('deferred_done') and hand_number < 30:
-            import time as _time
-            deadline = 2.0  # conservative: leave 3s for actual decision
-            t0 = _time.time()
-            while not _PRELOAD.get('deferred_done') and (_time.time() - t0) < deadline:
-                _time.sleep(0.1)
+        # Turn data loaded lazily per-board — no stalling needed.
 
 
 
