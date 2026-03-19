@@ -130,6 +130,9 @@ class PlayerAgent(Agent):
         # Track opponent betting patterns per street for adaptive narrowing
         self._opp_bets_by_street = {1: 0, 2: 0, 3: 0}   # flop, turn, river
         self._opp_actions_by_street = {1: 0, 2: 0, 3: 0}
+        # Track opponent folds to our bets (for adaptive bluffing)
+        self._opp_folds_to_bet = {1: 0, 2: 0, 3: 0}
+        self._opp_faces_bet = {1: 0, 2: 0, 3: 0}
         # Keep old names for backward compat with adaptive showdown tracking
         self._opp_river_bets = 0
         self._opp_river_actions = 0
@@ -1156,17 +1159,19 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: equity thresholds (proven 133% recovery, 22% bet freq)
-        #    Compact range solver over-bets turn (50%) — builds pots we lose
-        #    because it ignores river continuation (opponent calls turn, bets river).
+        # 2. Turn: equity thresholds + adaptive exploit layer
         if street == 2:
             self._path_counts['ms_turn'] += 1
-            return self._equity_threshold_play(
+            result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
+            # Adaptive exploit: if thresholds say CHECK but opponent over-folds
+            if (result[0] == CHECK and valid[RAISE] and
+                    opp_bet == my_bet):  # acting first only
+                result = self._maybe_exploit_bluff(
+                    result, my_cards, board, dead, observation, street)
+            return result
 
-        # 3. River: range solver for ALL decisions (~0.8s ARM, compact tree)
-        #    Compact tree bets ~49% (vs 13% full tree / 16% equity thresholds).
-        #    Range-balanced: coordinates value bets, bluffs, and calls.
+        # 3. River: range solver + adaptive exploit layer
         if street == 3:
             self._path_counts['range_solver'] += 1
             if time_left > 50 and self._opp_weights is not None:
@@ -1178,6 +1183,12 @@ class PlayerAgent(Agent):
                     max_raise=observation["max_raise"],
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
+                    # Adaptive exploit: if solver says CHECK but opponent
+                    # over-folds, bluff with weak hands for free money.
+                    if (result[0] == CHECK and valid[RAISE] and
+                            opp_bet == my_bet):  # acting first only
+                        result = self._maybe_exploit_bluff(
+                            result, my_cards, board, dead, observation, street)
                     return result
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
@@ -1199,6 +1210,56 @@ class PlayerAgent(Agent):
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
         return (FOLD, 0, 0, 0)
+
+    def _equity_threshold_play(self, my_cards, board, dead, observation, valid, street):
+        """Equity thresholds + pot control for turn and river.
+
+        Simple, consistent, no solver convergence issues.
+        Proven to beat the complex solver approach by +3464 chips in self-play.
+        """
+        import random as _random
+
+    def _maybe_exploit_bluff(self, default_result, my_cards, board, dead,
+                              observation, street):
+        """Override CHECK with a bluff if opponent over-folds.
+
+        If opponent folds > 50% to our bets on this street (tracked),
+        any bluff is +EV. Bluff with weak hands (equity < 0.30).
+        Only fires after 20+ observations to avoid noise.
+        """
+        import random as _random
+
+        obs_street = street
+        faces = self._opp_faces_bet.get(obs_street, 0)
+        if faces < 20:
+            return default_result
+
+        fold_rate = self._opp_folds_to_bet[obs_street] / faces
+        if fold_rate <= 0.50:
+            return default_result  # defending correctly, don't bluff extra
+
+        # Only bluff with weak hands (strong hands should value bet,
+        # which the solver/thresholds already handle)
+        equity = self.engine.compute_equity(my_cards, board, dead, self._opp_weights)
+        if equity > 0.30:
+            return default_result  # not a bluff candidate
+
+        # Bluff frequency scales with how much they over-fold
+        # fold_rate=60%: bluff 30% of weak hands
+        # fold_rate=80%: bluff 70% of weak hands
+        bluff_prob = min(1.0, (fold_rate - 0.50) * 3.0)
+        if _random.random() >= bluff_prob:
+            return default_result
+
+        min_raise = observation["min_raise"]
+        max_raise = observation["max_raise"]
+        pot = observation["my_bet"] + observation["opp_bet"]
+        amt = max(int(pot * 0.6), min_raise)
+        amt = min(amt, max_raise)
+
+        if observation["valid_actions"][RAISE]:
+            return (RAISE, amt, 0, 0)
+        return default_result
 
     def _equity_threshold_play(self, my_cards, board, dead, observation, valid, street):
         """Equity thresholds + pot control for turn and river.
@@ -1525,6 +1586,19 @@ class PlayerAgent(Agent):
                 if opp_bet > my_bet:
                     self._opp_river_bets += 1
                 self._opp_river_actions += 1
+
+        # Track opponent folds to our bets (for adaptive bluffing)
+        # If we had bet (my_bet > opp_bet before their action) and
+        # the hand terminates with positive reward, opponent folded.
+        if terminated and reward > 0 and street in (1, 2, 3):
+            my_bet = observation["my_bet"]
+            opp_bet = observation["opp_bet"]
+            if my_bet > opp_bet:  # we had bet, they folded
+                self._opp_folds_to_bet[street] += 1
+                self._opp_faces_bet[street] += 1
+            elif my_bet == opp_bet and my_bet > 2:
+                # They called and we won at showdown — they faced our bet
+                self._opp_faces_bet[street] += 1
 
         opp_d = [c for c in observation["opp_discarded_cards"] if c != -1]
         if len(opp_d) == 3 and self._opp_weights is None:
