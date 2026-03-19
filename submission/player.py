@@ -572,11 +572,10 @@ class PlayerAgent(Agent):
         bluff_ratio = bet_frac / (1 + bet_frac)
 
         # Estimate total bet frequency from per-street tracked data.
-        # Defaults from computed GTO equilibrium:
-        #   River: 17% (50 boards, 100 iters)
-        #   Turn:  13% (30 boards, 50 iters)
+        # Defaults tuned for competition field (most bots bet 30-50%,
+        # well above GTO equilibrium of 13-17%).
         n_board = len(board)  # 4 = turn, 5 = river
-        default_freq = 0.13 if n_board <= 4 else 0.17
+        default_freq = 0.30 if n_board <= 4 else 0.30
         obs_street = 2 if n_board <= 4 else 3  # map board length to street number
 
         if self._opp_actions_by_street.get(obs_street, 0) > 15:
@@ -585,19 +584,7 @@ class PlayerAgent(Agent):
         else:
             total_bet_freq = default_freq
 
-        # Adaptive: if opponent wins 75%+ of showdowns when they bet,
-        # they're a pure value bettor → reduce bet freq estimate
-        # (their range when betting is tighter than GTO)
-        if self._opp_bet_showdown_total > 10:
-            opp_sd_wr = self._opp_bet_showdown_wins / self._opp_bet_showdown_total
-            if opp_sd_wr > 0.75:
-                # Value-heavy: their actual betting range is tighter
-                total_bet_freq *= (1.0 - opp_sd_wr) * 2  # scale down
-            elif opp_sd_wr < 0.45:
-                # Bluff-heavy: their range is wider than GTO
-                total_bet_freq *= 1.5  # scale up
-
-        total_bet_freq = max(0.08, min(0.60, total_bet_freq))  # clamp
+        total_bet_freq = max(0.10, min(0.70, total_bet_freq))  # clamp
 
         value_pct = total_bet_freq / (1 + bluff_ratio)
         bluff_pct = total_bet_freq - value_pct
