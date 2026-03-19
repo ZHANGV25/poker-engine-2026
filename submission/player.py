@@ -591,7 +591,7 @@ class PlayerAgent(Agent):
                 my_bet=my_bet, opp_bet=opp_bet,
                 street=street,
                 min_raise=max(2, opp_bet - my_bet),
-                iterations=50)
+                iterations=100)
 
             if p_bet is None or len(p_bet) < 3:
                 return False
@@ -1017,12 +1017,18 @@ class PlayerAgent(Agent):
             elif street in (2, 3):
                 if not self._narrowed_this_street:
                     self._narrowed_this_street = True
-                    # Compute P(bet|hand) via real-time CFR from opponent's
-                    # perspective. Board-specific, pot-specific, equilibrium-derived.
-                    # Falls back to heuristic polarized narrowing if solver fails.
-                    narrowed = self._cfr_bayesian_narrow(
-                        board, dead, my_bet, opp_bet, street)
-                    if not narrowed:
+                    if street == 3:
+                        # River: real-time CFR Bayesian narrowing (~1-3s).
+                        # Equity is deterministic (fast). This is where
+                        # biggest pots and most expensive decisions happen.
+                        narrowed = self._cfr_bayesian_narrow(
+                            board, dead, my_bet, opp_bet, street)
+                        if not narrowed:
+                            self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                    else:
+                        # Turn: heuristic narrowing (CFR too slow — needs
+                        # rollout equity, 15x more expensive than river).
+                        # Per-street tracking adapts to opponent bet frequency.
                         self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     # Re-raise: two-phase game-theoretic narrowing
