@@ -801,13 +801,19 @@ class PlayerAgent(Agent):
             return False
 
         try:
-            # Build our range (what opponent thinks we have)
+            import time as _time
+            t_start = _time.time()
+
+            # Build our range weighted by equity (not uniform).
+            # Hands with higher equity are more likely in our range
+            # because we bet/called with them on previous streets.
             known = set(board) | set(dead_cards)
             hero_range = {}
             import itertools as _it
             remaining = [c for c in range(27) if c not in known]
             for h in _it.combinations(remaining, 2):
-                hero_range[h] = 1.0
+                eq = self.engine.compute_equity(list(h), board, dead_cards)
+                hero_range[h] = max(eq, 0.1)
 
             p_bet = self.range_solver.compute_opp_bet_probs(
                 board=board, opp_range=self._opp_weights,
@@ -818,6 +824,29 @@ class PlayerAgent(Agent):
 
             if p_bet is None or len(p_bet) < 3:
                 return False
+
+            # Iterative refinement: if time allows, re-solve with
+            # the narrowed range for a tighter P(bet|hand).
+            # Second pass uses updated opp weights → better answer.
+            elapsed = _time.time() - t_start
+            if elapsed < 1.5:  # leave room for the decision solve
+                # Apply first-pass narrowing temporarily
+                import copy
+                temp_weights = copy.copy(self._opp_weights)
+                self._apply_bet_narrowing(p_bet)
+
+                # Re-solve with narrowed range
+                p_bet2 = self.range_solver.compute_opp_bet_probs(
+                    board=board, opp_range=self._opp_weights,
+                    hero_range=hero_range, dead_cards=dead_cards,
+                    my_bet=my_bet, opp_bet=opp_bet, street=3,
+                    min_raise=max(2, opp_bet - my_bet),
+                    iterations=500)  # fewer iters for refinement
+
+                # Restore original weights and use refined P(bet)
+                self._opp_weights = temp_weights
+                if p_bet2 is not None and len(p_bet2) >= 3:
+                    p_bet = p_bet2
 
             # Bayesian update: weight *= P(bet|hand)
             # With trust blending for non-GTO opponents
@@ -853,6 +882,20 @@ class PlayerAgent(Agent):
 
         except Exception:
             return False
+
+    def _apply_bet_narrowing(self, p_bet):
+        """Apply P(bet|hand) Bayesian update to opponent weights."""
+        for pair, weight in list(self._opp_weights.items()):
+            if weight <= 0:
+                continue
+            key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+            p = p_bet.get(key)
+            if p is not None:
+                self._opp_weights[pair] *= max(p, 0.05)
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
 
     def _turn_bayesian_narrow(self, board, my_bet, opp_bet):
         """Bayesian narrowing on turn using precomputed P(bet|hand).
