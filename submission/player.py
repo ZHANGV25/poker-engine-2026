@@ -1059,24 +1059,16 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: one-hand solver for facing bets, equity thresholds acting first
+        # 2. Turn: one-hand solver with river lookahead (all decisions)
+        #    ~500ms per decision, captures implied odds and river dynamics.
         if street == 2:
             self._path_counts['ms_turn'] += 1
-            facing_bet = opp_bet > my_bet
 
-            if facing_bet and time_left > 100:
-                # One-hand solver computes correct call/fold/raise from game tree.
-                # Avoids the raise-then-fold pattern from equity thresholds.
-                result = self.solver.solve_and_act(
-                    hero_cards=my_cards, board=board,
-                    opp_range=self._opp_weights, dead_cards=dead,
-                    my_bet=my_bet, opp_bet=opp_bet, street=street,
-                    min_raise=observation["min_raise"],
-                    max_raise=observation["max_raise"],
-                    valid_actions=valid, hero_is_first=True,
-                    time_remaining=time_left)
+            if time_left > 100 and self._opp_weights is not None:
+                result = self._solve_turn_with_river(
+                    my_cards, board, dead, my_bet, opp_bet,
+                    observation, valid, True, time_left)
                 if result is not None:
-                    # Track raise for narrowing
                     if result[0] == RAISE:
                         self._raised_this_street = True
                         self._streets_raised += 1
@@ -1296,13 +1288,14 @@ class PlayerAgent(Agent):
                     pot_won = min(hp, op)
                     tv[nid] = (2.0 * equity_vec - 1.0) * pot_won
 
-            # Run 15 CFR iterations — only need root EV, converges fast
+            # Run 150 CFR iterations for each river card — well-converged
+            # root EV. Cost: ~50ms per card, ~750ms total for 15 cards.
             hero_reg = np.zeros((n_hero_r, max_act), dtype=np.float64)
             hero_ss = np.zeros((n_hero_r, max_act), dtype=np.float64)
             opp_reg = np.zeros((n_opp_r, n_opp, max_act), dtype=np.float64)
 
             root_val = None
-            for t in range(15):
+            for t in range(150):
                 root_val = self.solver._cfr_traverse(
                     river_tree, 0, 1.0, opp_w,
                     hero_reg, hero_ss, opp_reg,
@@ -1338,11 +1331,11 @@ class PlayerAgent(Agent):
 
         # Determine iterations based on time
         if time_left > 800:
-            turn_iters = 200
+            turn_iters = 400
         elif time_left > 500:
-            turn_iters = 100
+            turn_iters = 200
         else:
-            turn_iters = 50
+            turn_iters = 100
 
         turn_strategy = self.solver._run_cfr(
             turn_tree, opp_w, turn_tv, n_opp, turn_iters)
