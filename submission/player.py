@@ -523,7 +523,28 @@ class PlayerAgent(Agent):
             # Extract P(bet|hand) for this action
             p_bet_per_hand = node_strats[:, best_act_idx].astype(np.float64) / 255.0
 
-            # Apply Bayesian update to opponent range
+            # Compute blueprint's average bet frequency for this board/pot
+            blueprint_avg_bet = p_bet_per_hand.mean()
+
+            # Compare with tracked opponent bet frequency
+            obs_street = street  # 1=flop, 2=turn
+            tracked_freq = None
+            if self._opp_actions_by_street.get(obs_street, 0) > 15:
+                tracked_freq = (self._opp_bets_by_street[obs_street] /
+                                self._opp_actions_by_street[obs_street])
+
+            # Blend blueprint with uniform based on deviation.
+            # trust=1.0: full blueprint (opponent plays GTO)
+            # trust=0.0: uniform (opponent bets randomly, blueprint useless)
+            if tracked_freq is not None and blueprint_avg_bet > 0.01:
+                deviation = tracked_freq / max(blueprint_avg_bet, 0.05)
+                # deviation=1.0: matches GTO, trust blueprint
+                # deviation=3.0+: bets 3x GTO, don't trust blueprint
+                trust = max(0.2, min(1.0, 2.0 - deviation))
+            else:
+                trust = 1.0  # no data yet, trust blueprint
+
+            # Apply Bayesian update with trust-weighted P(bet|hand)
             hands = bd['hands']
             hand_map = ms._hand_maps.get(board_id, {})
 
@@ -535,11 +556,10 @@ class PlayerAgent(Agent):
                 hand_idx = hand_map.get(key)
 
                 if hand_idx is not None and hand_idx < len(p_bet_per_hand):
-                    p_bet = p_bet_per_hand[hand_idx]
-                    # Multiply weight by P(bet|hand), with a high floor to protect
-                    # against opponents who deviate from equilibrium (bet with
-                    # hands the blueprint says wouldn't bet)
-                    self._opp_weights[pair] *= max(p_bet, 0.20)
+                    p_blueprint = p_bet_per_hand[hand_idx]
+                    # Blend: trust × blueprint + (1-trust) × uniform
+                    p_blended = trust * p_blueprint + (1.0 - trust) * 0.5
+                    self._opp_weights[pair] *= max(p_blended, 0.15)
                     updated = True
 
             if not updated:
