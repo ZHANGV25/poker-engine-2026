@@ -1193,10 +1193,17 @@ class PlayerAgent(Agent):
                     result, my_cards, board, dead, observation, street)
             return result
 
-        # 3. River: range solver + adaptive exploit layer
+        # 3. River: equity thresholds acting first + range solver facing bets
+        #    Range solver can't find correct acting-first frequency:
+        #      compact tree (no re-raise) → 49% (too aggressive)
+        #      medium/full tree (re-raise) → 11-13% (too passive)
+        #    Equity thresholds land at 20-25% — closest to GTO (17%).
+        #    Range solver is correct for facing bets (coordinated call/fold).
         if street == 3:
-            self._path_counts['range_solver'] += 1
-            if time_left > 50 and self._opp_weights is not None:
+            facing_bet = opp_bet > my_bet
+
+            if facing_bet and time_left > 50 and self._opp_weights is not None:
+                self._path_counts['range_solver'] += 1
                 result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
                     opp_range=self._opp_weights, dead_cards=dead,
@@ -1205,15 +1212,15 @@ class PlayerAgent(Agent):
                     max_raise=observation["max_raise"],
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
-                    # Adaptive exploit: if solver says CHECK but opponent
-                    # over-folds, bluff with weak hands for free money.
-                    if (result[0] == CHECK and valid[RAISE] and
-                            opp_bet == my_bet):  # acting first only
-                        result = self._maybe_exploit_bluff(
-                            result, my_cards, board, dead, observation, street)
                     return result
-            return self._equity_threshold_play(
+
+            # Acting first or fallback: equity thresholds + exploit layer
+            result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
+            if (result[0] == CHECK and valid[RAISE] and opp_bet == my_bet):
+                result = self._maybe_exploit_bluff(
+                    result, my_cards, board, dead, observation, street)
+            return result
 
         # 4. Flop fallback: equity thresholds (if blueprint missed)
         if street == 1:
