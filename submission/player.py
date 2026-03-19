@@ -524,7 +524,7 @@ class PlayerAgent(Agent):
             p_bet_per_hand = node_strats[:, best_act_idx].astype(np.float64) / 255.0
 
             # Compute blueprint's average bet frequency for this board/pot
-            blueprint_avg_bet = p_bet_per_hand.mean()
+            blueprint_avg_bet = float(p_bet_per_hand.mean())
 
             # Compare with tracked opponent bet frequency
             obs_street = street  # 1=flop, 2=turn
@@ -533,18 +533,20 @@ class PlayerAgent(Agent):
                 tracked_freq = (self._opp_bets_by_street[obs_street] /
                                 self._opp_actions_by_street[obs_street])
 
-            # Blend blueprint with uniform based on deviation.
-            # trust=1.0: full blueprint (opponent plays GTO)
-            # trust=0.0: uniform (opponent bets randomly, blueprint useless)
-            if tracked_freq is not None and blueprint_avg_bet > 0.01:
-                deviation = tracked_freq / max(blueprint_avg_bet, 0.05)
-                # deviation=1.0: matches GTO, trust blueprint
-                # deviation=3.0+: bets 3x GTO, don't trust blueprint
-                trust = max(0.2, min(1.0, 2.0 - deviation))
+            # Principled mixture model:
+            # Opponent = α × GTO_player + (1-α) × random_bettor
+            # α = how closely they match GTO:
+            #   α = 1 - |f_tracked - f_blueprint| / max(f_tracked, f_blueprint)
+            # Random bettor bets each hand at f_tracked (their actual rate).
+            if tracked_freq is not None and max(tracked_freq, blueprint_avg_bet) > 0.01:
+                alpha = max(0.1, 1.0 - abs(tracked_freq - blueprint_avg_bet) /
+                            max(tracked_freq, blueprint_avg_bet, 0.01))
+                uniform_bet = tracked_freq
             else:
-                trust = 1.0  # no data yet, trust blueprint
+                alpha = 1.0  # no data yet, trust blueprint
+                uniform_bet = blueprint_avg_bet
 
-            # Apply Bayesian update with trust-weighted P(bet|hand)
+            # Apply Bayesian update with blended P(bet|hand)
             hands = bd['hands']
             hand_map = ms._hand_maps.get(board_id, {})
 
@@ -556,10 +558,10 @@ class PlayerAgent(Agent):
                 hand_idx = hand_map.get(key)
 
                 if hand_idx is not None and hand_idx < len(p_bet_per_hand):
-                    p_blueprint = p_bet_per_hand[hand_idx]
-                    # Blend: trust × blueprint + (1-trust) × uniform
-                    p_blended = trust * p_blueprint + (1.0 - trust) * 0.5
-                    self._opp_weights[pair] *= max(p_blended, 0.15)
+                    p_blueprint = float(p_bet_per_hand[hand_idx])
+                    # P(bet|hand) = α × P_blueprint + (1-α) × f_tracked
+                    p_blended = alpha * p_blueprint + (1.0 - alpha) * uniform_bet
+                    self._opp_weights[pair] *= max(p_blended, 0.10)
                     updated = True
 
             if not updated:
