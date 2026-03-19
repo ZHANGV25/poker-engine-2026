@@ -684,6 +684,74 @@ class PlayerAgent(Agent):
             for k in self._opp_weights:
                 self._opp_weights[k] /= total
 
+    def _turn_bayesian_narrow(self, board, my_bet, opp_bet):
+        """Bayesian narrowing on turn using precomputed P(bet|hand).
+
+        Same principle as flop Bayesian: multiply each hand's weight by
+        P(bet|hand) from the precomputed turn blueprint. Board-specific,
+        pot-specific, equilibrium-derived.
+
+        Returns True if applied, False if no turn data available.
+        """
+        if self._opp_weights is None or self._multi_street is None:
+            return False
+
+        try:
+            flop = board[:3]
+            turn_card = board[3] if len(board) >= 4 else None
+            if turn_card is None:
+                return False
+
+            p_bet_map = self._multi_street.get_turn_opp_bet_prob(
+                flop, turn_card, (my_bet, opp_bet))
+
+            if p_bet_map is None or len(p_bet_map) < 3:
+                return False
+
+            # Compute blueprint average for trust blending
+            p_values = list(p_bet_map.values())
+            blueprint_avg = sum(p_values) / len(p_values) if p_values else 0.2
+
+            # Track opponent turn bet frequency for trust blending
+            obs_street = 2
+            tracked_freq = None
+            if self._opp_actions_by_street.get(obs_street, 0) > 15:
+                tracked_freq = (self._opp_bets_by_street[obs_street] /
+                                self._opp_actions_by_street[obs_street])
+
+            # Trust blending (same formula as flop)
+            if tracked_freq is not None and max(tracked_freq, blueprint_avg) > 0.01:
+                alpha = max(0.1, 1.0 - abs(tracked_freq - blueprint_avg) /
+                            max(tracked_freq, blueprint_avg, 0.01))
+                uniform_bet = tracked_freq
+            else:
+                alpha = 1.0
+                uniform_bet = blueprint_avg
+
+            # Apply Bayesian update
+            updated = False
+            for pair, weight in list(self._opp_weights.items()):
+                if weight <= 0:
+                    continue
+                key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                p_blueprint = p_bet_map.get(key)
+                if p_blueprint is not None:
+                    p_blended = alpha * p_blueprint + (1.0 - alpha) * uniform_bet
+                    self._opp_weights[pair] *= max(p_blended, 0.10)
+                    updated = True
+
+            if not updated:
+                return False
+
+            total = sum(self._opp_weights.values())
+            if total > 0:
+                for k in self._opp_weights:
+                    self._opp_weights[k] /= total
+            return True
+
+        except Exception:
+            return False
+
     def _cfr_bayesian_narrow(self, board, dead_cards, my_bet, opp_bet, street):
         """Narrow opponent range using real-time CFR-computed P(bet|hand).
 
@@ -1149,8 +1217,13 @@ class PlayerAgent(Agent):
                 # Opponent BET: narrow range toward betting hands
                 self._narrowed_this_street = True
                 if street == 1:
+                    # Flop: Bayesian from blueprint
                     if not self._bayesian_range_update(board, my_bet, opp_bet, street):
                         self._soft_narrow_range(my_bet, opp_bet, board, dead)
+                elif street == 2 and self._multi_street is not None:
+                    # Turn: try Bayesian from turn opp data, fall back to polarized
+                    if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
+                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     self._polarized_narrow_range(board, dead, my_bet, opp_bet)
             # NOTE: opponent CHECKS are NOT narrowed. Check-capping caused

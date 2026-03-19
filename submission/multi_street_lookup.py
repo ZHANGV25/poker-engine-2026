@@ -260,6 +260,73 @@ class MultiStreetLookup:
                         self._boards[bid]['opp_strategies'] = opp_strats[i]
                         self._boards[bid]['opp_action_types'] = opp_acts[i]
 
+        # Load turn opponent strategies (for Bayesian narrowing on turn)
+        turn_opp_path = os.path.join(dir_path, 'turn_opp.pkl.lzma')
+        if os.path.isfile(turn_opp_path):
+            with open(turn_opp_path, 'rb') as f:
+                self._turn_opp = pickle.loads(lzma.decompress(f.read()))
+            # Build board→board_id lookup for turn data
+            self._turn_opp_board_map = {}
+            for bid, td in self._turn_opp.items():
+                board_key = tuple(sorted(td['board']))
+                self._turn_opp_board_map[board_key] = bid
+
+    def get_turn_opp_bet_prob(self, board_3, turn_card, pot_state):
+        """Get P(bet|hand) for each opponent hand on this turn board.
+
+        Returns dict {(c1,c2): p_bet} or None if no data.
+        Used for Bayesian narrowing when opponent bets on turn.
+        """
+        if not hasattr(self, '_turn_opp') or self._turn_opp is None:
+            return None
+
+        board_key = tuple(sorted(int(c) for c in board_3))
+        bid = self._turn_opp_board_map.get(board_key)
+        if bid is None:
+            return None
+
+        td = self._turn_opp.get(bid)
+        if td is None:
+            return None
+
+        tc = int(turn_card)
+        if tc not in td.get('turn_cards', []):
+            return None
+
+        # Find nearest pot
+        pot_sizes = td['pot_sizes']
+        my_bet, opp_bet = pot_state
+        pot = my_bet + opp_bet
+        best_pi = 0
+        best_dist = float('inf')
+        for pi, ps in enumerate(pot_sizes):
+            dist = abs(ps[0] + ps[1] - pot)
+            if dist < best_dist:
+                best_dist = dist
+                best_pi = pi
+
+        # Minimal format: pb_{pi}_{tc} = uint8 P(bet|hand), h_{tc} = hands
+        pb_key = f'pb_{best_pi}_{tc}'
+        hands_key = f'h_{tc}'
+
+        if pb_key not in td or hands_key not in td:
+            return None
+
+        p_bet_q = td[pb_key]     # uint8 (n_hands,)
+        hands = td[hands_key]     # int8 (n_hands, 2)
+
+        if p_bet_q is None or hands is None:
+            return None
+
+        # Convert uint8 back to float and build hand→p_bet mapping
+        result = {}
+        for hi in range(len(hands)):
+            h = (int(hands[hi][0]), int(hands[hi][1]))
+            h_sorted = (min(h), max(h))
+            result[h_sorted] = float(p_bet_q[hi]) / 255.0
+
+        return result
+
     def _load_compact_split(self, dir_path):
         """Load from split files (bp_a.npz for flop, bp_b.npz for turn, etc.)."""
         import glob
