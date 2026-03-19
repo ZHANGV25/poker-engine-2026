@@ -261,10 +261,12 @@ class MultiStreetLookup:
                         self._boards[bid]['opp_action_types'] = opp_acts[i]
 
         # Load turn hero strategies (for blueprint decisions on turn)
+        # Use streaming decompression to avoid peak memory spike
         turn_hero_path = os.path.join(dir_path, 'turn_hero.pkl.lzma')
         if os.path.isfile(turn_hero_path):
-            with open(turn_hero_path, 'rb') as f:
-                self._turn_hero = pickle.loads(lzma.decompress(f.read()))
+            import io
+            with lzma.open(turn_hero_path, 'rb') as f:
+                self._turn_hero = pickle.load(f)
             self._turn_hero_board_map = {}
             for bid, td in self._turn_hero.items():
                 board_key = tuple(sorted(td['board']))
@@ -273,8 +275,8 @@ class MultiStreetLookup:
         # Load turn opponent strategies (for Bayesian narrowing on turn)
         turn_opp_path = os.path.join(dir_path, 'turn_opp.pkl.lzma')
         if os.path.isfile(turn_opp_path):
-            with open(turn_opp_path, 'rb') as f:
-                self._turn_opp = pickle.loads(lzma.decompress(f.read()))
+            with lzma.open(turn_opp_path, 'rb') as f:
+                self._turn_opp = pickle.load(f)
             # Build board→board_id lookup for turn data
             self._turn_opp_board_map = {}
             for bid, td in self._turn_opp.items():
