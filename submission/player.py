@@ -1363,17 +1363,28 @@ class PlayerAgent(Agent):
             return (RAISE, amt, 0, 0)
 
         # GTO bluff with near-zero equity hands
-        # Bluff frequency = bet/(bet+pot) scaled by street
-        # Computed from equilibrium: turn bets at 78% of river frequency.
+        # Bluff frequency = bet/(bet+pot) scaled by street and opponent tendency.
+        # Suppress bluffs against calling stations (they call >50% → bluffs are -EV).
         street_bluff_scale = {2: 0.78, 3: 1.0}.get(street, 0)
         if equity < 0.15 and valid[RAISE] and can_raise and street_bluff_scale > 0:
-            bet_size = max(int(pot * 0.6), min_raise)
-            bluff_freq = bet_size / (bet_size + pot) if pot > 0 else 0.1
-            if _random.random() < bluff_freq * street_bluff_scale:
-                self._raised_this_street = True
-                self._streets_raised += 1
-                self._opp_bet_at_raise = opp_bet
-                return (RAISE, min(bet_size, max_raise), 0, 0)
+            # Check opponent fold rate — don't bluff if they call too much
+            obs_street = street
+            faces = self._opp_faces_bet.get(obs_street, 0)
+            if faces > 15:
+                fold_rate = self._opp_folds_to_bet[obs_street] / faces
+                if fold_rate < 0.35:
+                    street_bluff_scale = 0  # calling station — never bluff
+                elif fold_rate < 0.50:
+                    street_bluff_scale *= 0.3  # tight caller — bluff rarely
+
+            if street_bluff_scale > 0:
+                bet_size = max(int(pot * 0.6), min_raise)
+                bluff_freq = bet_size / (bet_size + pot) if pot > 0 else 0.1
+                if _random.random() < bluff_freq * street_bluff_scale:
+                    self._raised_this_street = True
+                    self._streets_raised += 1
+                    self._opp_bet_at_raise = opp_bet
+                    return (RAISE, min(bet_size, max_raise), 0, 0)
 
         # Call if equity justifies (against polarized-narrowed range)
         if valid[CALL] and equity >= pot_odds:
