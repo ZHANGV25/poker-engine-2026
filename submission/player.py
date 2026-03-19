@@ -988,9 +988,32 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: equity thresholds + pot control
+        # 2. Turn: one-hand solver for facing bets, equity thresholds acting first
         if street == 2:
             self._path_counts['ms_turn'] += 1
+            facing_bet = opp_bet > my_bet
+
+            if facing_bet and time_left > 100:
+                # One-hand solver computes correct call/fold/raise from game tree.
+                # Avoids the raise-then-fold pattern from equity thresholds.
+                result = self.solver.solve_and_act(
+                    hero_cards=my_cards, board=board,
+                    opp_range=self._opp_weights, dead_cards=dead,
+                    my_bet=my_bet, opp_bet=opp_bet, street=street,
+                    min_raise=observation["min_raise"],
+                    max_raise=observation["max_raise"],
+                    valid_actions=valid, hero_is_first=True,
+                    time_remaining=time_left)
+                if result is not None:
+                    # Track raise for narrowing
+                    if result[0] == RAISE:
+                        self._raised_this_street = True
+                        self._streets_raised += 1
+                        self._last_hero_bet = result[1]
+                        self._last_pot_before = my_bet + opp_bet
+                        self._opp_bet_at_raise = opp_bet
+                    return result
+
             return self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
 
