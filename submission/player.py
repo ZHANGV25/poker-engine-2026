@@ -553,6 +553,112 @@ class PlayerAgent(Agent):
         except Exception:
             return False
 
+    def _cap_range_on_check(self, board, dead_cards, street):
+        """Cap opponent range when they CHECK — downweight strong hands.
+
+        When opponent checks, they reveal they don't have a hand strong
+        enough to bet. Strong hands get reduced weight, weak hands keep
+        full weight. This is the inverse of polarized narrowing.
+
+        On flop: uses blueprint P(check|hand) = 1 - P(bet|hand) if available.
+        On turn/river: heuristic — downweight top 30% of hands by strength.
+        """
+        if self._opp_weights is None:
+            return
+
+        if street == 1 and self._multi_street is not None:
+            # Flop: Bayesian update with P(check|hand) from blueprint
+            try:
+                ms = self._multi_street
+                flop = tuple(sorted(int(c) for c in board[:3]))
+                board_id = ms._find_board(flop)
+                if board_id is None:
+                    return
+
+                bd = ms._boards[board_id]
+                if 'opp_strategies' not in bd:
+                    return
+
+                # Use pot (2,2) as default for check scenario
+                pot_idx = ms._find_pot((2, 2), bd['pot_sizes'])
+                opp_node_idx = ms._find_opp_node(2, 2, board_id, pot_idx)
+                opp_strats = bd['opp_strategies']
+
+                if pot_idx >= opp_strats.shape[0] or opp_node_idx >= opp_strats.shape[2]:
+                    return
+
+                node_strats = opp_strats[pot_idx, :, opp_node_idx, :]
+                node_acts = bd['opp_action_types'][pot_idx, opp_node_idx, :]
+
+                # Sum P(bet|hand) across all aggressive actions
+                p_bet = np.zeros(node_strats.shape[0], dtype=np.float64)
+                for a_idx in range(len(node_acts)):
+                    act = int(node_acts[a_idx])
+                    if act in (3, 4, 5, 6):  # ACT_RAISE_*
+                        p_bet += node_strats[:, a_idx].astype(np.float64) / 255.0
+
+                # P(check|hand) = 1 - P(bet|hand)
+                p_check = np.maximum(1.0 - p_bet, 0.05)
+
+                hands = bd['hands']
+                hand_map = ms._hand_maps.get(board_id, {})
+
+                for pair, weight in list(self._opp_weights.items()):
+                    if weight <= 0:
+                        continue
+                    key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                    hand_idx = hand_map.get(key)
+                    if hand_idx is not None and hand_idx < len(p_check):
+                        self._opp_weights[pair] *= max(p_check[hand_idx], 0.10)
+
+                total = sum(self._opp_weights.values())
+                if total > 0:
+                    for k in self._opp_weights:
+                        self._opp_weights[k] /= total
+                return
+            except Exception:
+                pass
+
+        # Turn/River: heuristic cap — downweight top 30% by hand strength
+        board_set = set(board)
+        strengths = {}
+        for pair in self._opp_weights:
+            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
+                continue
+            try:
+                if len(board) >= 5:
+                    r = self.engine.lookup_seven(list(pair) + list(board))
+                elif len(board) == 4:
+                    import itertools as _it
+                    cards_6 = list(pair) + list(board)
+                    r = min(self.engine.lookup_five(list(c))
+                            for c in _it.combinations(cards_6, 5))
+                elif len(board) >= 3:
+                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
+                else:
+                    continue
+            except Exception:
+                continue
+            strengths[pair] = r
+
+        if not strengths:
+            return
+
+        ranked = sorted(strengths.items(), key=lambda x: x[1])  # best first
+        n = len(ranked)
+        # Top 30% of hands get reduced weight (they would have bet)
+        cap_count = int(n * 0.30)
+        for i, (hand, _) in enumerate(ranked):
+            if i < cap_count:
+                # Strong hand that checked — reduce weight (wouldn't usually check)
+                self._opp_weights[hand] *= 0.30
+            # Weak/medium hands keep full weight (checking is expected)
+
+        total = sum(self._opp_weights.values())
+        if total > 0:
+            for k in self._opp_weights:
+                self._opp_weights[k] /= total
+
     def _cfr_bayesian_narrow(self, board, dead_cards, my_bet, opp_bet, street):
         """Narrow opponent range using real-time CFR-computed P(bet|hand).
 
@@ -999,38 +1105,43 @@ class PlayerAgent(Agent):
             self._last_pot_before = 0
             self._opp_bet_at_raise = 0
 
+        # Determine hero's position from cached blind_pos (detected at preflop)
+        blind_pos = self._blind_pos
+        hero_position = 1 if blind_pos == 0 else 0  # SB=second(1), BB=first(0)
+        hero_is_first = (hero_position == 0)
+
         # Opponent range inference
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards)
 
-        # Range update when opponent bets
+        # Range update from opponent actions
         if opp_bet > my_bet:
             self._opp_bet_this_hand = True
-        if opp_bet > my_bet and self._opp_weights is not None:
-            if street == 1:
-                if not self._narrowed_this_street:
-                    self._narrowed_this_street = True
-                    # Flop: Bayesian update from blueprint P(action|hand)
+
+        if self._opp_weights is not None and not self._narrowed_this_street:
+            if opp_bet > my_bet:
+                # Opponent BET: narrow range toward betting hands
+                self._narrowed_this_street = True
+                if street == 1:
                     if not self._bayesian_range_update(board, my_bet, opp_bet, street):
                         self._soft_narrow_range(my_bet, opp_bet, board, dead)
-            elif street in (2, 3):
-                if not self._narrowed_this_street:
-                    self._narrowed_this_street = True
-                    # Polarized narrowing with per-street tracked frequency.
-                    # Tested: more accurate than CFR Bayesian (54% vs 40%
-                    # at predicting actual opponent hand across 35 scenarios).
-                    self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
-                    # Re-raise: two-phase game-theoretic narrowing
-                    self._reraise_narrow_range(board, dead, my_bet, opp_bet)
+                    self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+
+            elif opp_bet == my_bet and self._opp_weights is not None:
+                # Opponent CHECKED: cap range — downweight strong hands
+                # that would have bet. P(check|hand) is low for strong hands.
+                # Only apply if opponent acted first (we're responding to check).
+                if not hero_is_first and street >= 1:
+                    self._narrowed_this_street = True
+                    self._cap_range_on_check(board, dead, street)
+
+        elif opp_bet > my_bet and self._opp_weights is not None and self._narrowed_this_street:
+            # Re-raise: two-phase game-theoretic narrowing
+            self._reraise_narrow_range(board, dead, my_bet, opp_bet)
 
         pot_state = (my_bet, opp_bet)
-
-        # Determine hero's position from cached blind_pos (detected at preflop)
-        blind_pos = self._blind_pos
-        hero_position = 1 if blind_pos == 0 else 0  # SB=second(1), BB=first(0)
-        hero_is_first = (hero_position == 0)
 
         # 1. Flop: multi-street blueprint (backward induction)
         if street == 1 and self._multi_street is not None:
