@@ -260,6 +260,16 @@ class MultiStreetLookup:
                         self._boards[bid]['opp_strategies'] = opp_strats[i]
                         self._boards[bid]['opp_action_types'] = opp_acts[i]
 
+        # Load turn hero strategies (for blueprint decisions on turn)
+        turn_hero_path = os.path.join(dir_path, 'turn_hero.pkl.lzma')
+        if os.path.isfile(turn_hero_path):
+            with open(turn_hero_path, 'rb') as f:
+                self._turn_hero = pickle.loads(lzma.decompress(f.read()))
+            self._turn_hero_board_map = {}
+            for bid, td in self._turn_hero.items():
+                board_key = tuple(sorted(td['board']))
+                self._turn_hero_board_map[board_key] = bid
+
         # Load turn opponent strategies (for Bayesian narrowing on turn)
         turn_opp_path = os.path.join(dir_path, 'turn_opp.pkl.lzma')
         if os.path.isfile(turn_opp_path):
@@ -270,6 +280,109 @@ class MultiStreetLookup:
             for bid, td in self._turn_opp.items():
                 board_key = tuple(sorted(td['board']))
                 self._turn_opp_board_map[board_key] = bid
+
+    def get_turn_strategy(self, hero_cards, board, pot_state, hero_position=0):
+        """Get precomputed turn strategy for hero's hand.
+
+        Returns dict {action_type: probability} or None.
+        """
+        if not hasattr(self, '_turn_hero') or self._turn_hero is None:
+            return None
+
+        if len(board) < 4:
+            return None
+
+        board_3 = board[:3]
+        turn_card = board[3]
+        board_key = tuple(sorted(int(c) for c in board_3))
+        bid = self._turn_hero_board_map.get(board_key)
+        if bid is None:
+            return None
+
+        td = self._turn_hero.get(bid)
+        if td is None:
+            return None
+
+        tc = int(turn_card)
+        if tc not in td.get('turn_cards', []):
+            return None
+
+        # Find nearest pot
+        pot_sizes = td['pot_sizes']
+        my_bet, opp_bet = pot_state
+        pot = my_bet + opp_bet
+        best_pi = 0
+        best_dist = float('inf')
+        for pi, ps in enumerate(pot_sizes):
+            dist = abs(ps[0] + ps[1] - pot)
+            if dist < best_dist:
+                best_dist = dist
+                best_pi = pi
+
+        strat_key = f's_{best_pi}_{tc}'
+        act_key = f'a_{best_pi}_{tc}'
+        hands_key = f'h_{tc}'
+
+        if strat_key not in td or act_key not in td or hands_key not in td:
+            return None
+
+        strats = td[strat_key]    # 4-bit uint8 (n_hands, n_nodes, n_actions)
+        act_types = td[act_key]   # int8 (n_nodes, n_actions)
+        hands = td[hands_key]     # int8 (n_hands, 2)
+
+        # Find hero's hand in the hands array
+        hero_sorted = tuple(sorted(int(c) for c in hero_cards[:2]))
+        hand_idx = None
+        for hi in range(len(hands)):
+            h = (int(hands[hi][0]), int(hands[hi][1]))
+            if (min(h), max(h)) == hero_sorted:
+                hand_idx = hi
+                break
+
+        if hand_idx is None:
+            return None
+
+        # Find correct node based on bet state
+        # Node 0 is root (first to act). For facing a bet, need to find
+        # the node after opponent's bet action.
+        # Simple approach: use node 0 for acting first, node 1+ for facing bet
+        node_idx = 0
+        if opp_bet > my_bet:
+            # Facing a bet — find a node where we respond
+            # In the tree, after opponent bets, hero has fold/call/raise
+            # This is typically node 1 or later
+            # Use node that has FOLD as first action (response to bet)
+            for ni in range(min(strats.shape[1], act_types.shape[0])):
+                if act_types.shape[0] > ni and int(act_types[ni][0]) == 0:  # ACT_FOLD
+                    node_idx = ni
+                    break
+
+        if node_idx >= strats.shape[1] or node_idx >= act_types.shape[0]:
+            return None
+
+        # Extract strategy for this hand at this node
+        hand_strat = strats[hand_idx, node_idx, :]  # 4-bit quantized
+        node_acts = act_types[node_idx, :]
+
+        # Build {action_type: probability} dict
+        result = {}
+        total = 0
+        for a in range(len(node_acts)):
+            act = int(node_acts[a])
+            if act < 0:
+                continue
+            # Upscale 4-bit: multiply by 16 to get uint8 range, then /255
+            prob = float(hand_strat[a]) * 16.0 / 255.0
+            if prob > 0.001:
+                result[act] = prob
+                total += prob
+
+        # Normalize
+        if total > 0:
+            for k in result:
+                result[k] /= total
+
+        return result if result else None
 
     def get_turn_opp_bet_prob(self, board_3, turn_card, pot_state):
         """Get P(bet|hand) for each opponent hand on this turn board.

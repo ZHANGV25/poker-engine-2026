@@ -684,6 +684,109 @@ class PlayerAgent(Agent):
             for k in self._opp_weights:
                 self._opp_weights[k] /= total
 
+    def _turn_check_bayesian_narrow(self, board, street):
+        """Bayesian narrowing when opponent CHECKS, using blueprint P(check|hand).
+
+        P(check|hand) = 1 - P(bet|hand). Hands the blueprint says would
+        bet get downweighted (they checked but "shouldn't" have). Hands
+        the blueprint says would check keep full weight.
+
+        Board-specific — accounts for slow-playing. On trap-heavy boards,
+        strong hands have high P(check) and keep weight. On value-heavy
+        boards, strong hands that check get downweighted.
+
+        Uses same trust blending as bet narrowing.
+        """
+        if self._opp_weights is None:
+            return
+
+        try:
+            if street == 2 and self._multi_street is not None:
+                # Turn: use turn opp data
+                if len(board) < 4:
+                    return
+                p_bet_map = self._multi_street.get_turn_opp_bet_prob(
+                    board[:3], board[3], (2, 2))  # use small pot for check scenario
+                if p_bet_map is None:
+                    return
+            elif street == 1 and self._multi_street is not None:
+                # Flop: use flop blueprint opp data
+                # Reuse the existing _bayesian_range_update logic but for checks
+                # Get P(bet|hand) from flop blueprint
+                ms = self._multi_street
+                flop = tuple(sorted(int(c) for c in board[:3]))
+                board_id = ms._find_board(flop)
+                if board_id is None:
+                    return
+                bd = ms._boards[board_id]
+                if 'opp_strategies' not in bd:
+                    return
+                pot_idx = ms._find_pot((2, 2), bd['pot_sizes'])
+                opp_node_idx = ms._find_opp_node(2, 2, board_id, pot_idx)
+                opp_strats = bd['opp_strategies']
+                if pot_idx >= opp_strats.shape[0] or opp_node_idx >= opp_strats.shape[2]:
+                    return
+                node_strats = opp_strats[pot_idx, :, opp_node_idx, :]
+                node_acts = bd['opp_action_types'][pot_idx, opp_node_idx, :]
+                # Sum P(bet|hand) across raise actions
+                p_bet_arr = np.zeros(node_strats.shape[0], dtype=np.float64)
+                for a_idx in range(len(node_acts)):
+                    act = int(node_acts[a_idx])
+                    if act in (3, 4, 5, 6):
+                        p_bet_arr += node_strats[:, a_idx].astype(np.float64) / 255.0
+                # Build hand map
+                hand_map = ms._hand_maps.get(board_id, {})
+                p_bet_map = {}
+                for pair in self._opp_weights:
+                    key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                    hand_idx = hand_map.get(key)
+                    if hand_idx is not None and hand_idx < len(p_bet_arr):
+                        p_bet_map[key] = float(p_bet_arr[hand_idx])
+                if not p_bet_map:
+                    return
+            else:
+                return
+
+            # Compute blueprint average for trust blending
+            p_values = list(p_bet_map.values())
+            blueprint_avg = sum(p_values) / len(p_values) if p_values else 0.2
+
+            # Trust blending with tracked frequency
+            obs_street = street
+            tracked_freq = None
+            if self._opp_actions_by_street.get(obs_street, 0) > 15:
+                tracked_freq = (self._opp_bets_by_street[obs_street] /
+                                self._opp_actions_by_street[obs_street])
+
+            if tracked_freq is not None and max(tracked_freq, blueprint_avg) > 0.01:
+                alpha = max(0.1, 1.0 - abs(tracked_freq - blueprint_avg) /
+                            max(tracked_freq, blueprint_avg, 0.01))
+            else:
+                alpha = 1.0
+
+            # Apply P(check|hand) = 1 - P(bet|hand)
+            for pair, weight in list(self._opp_weights.items()):
+                if weight <= 0:
+                    continue
+                key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                p_bet = p_bet_map.get(key)
+                if p_bet is not None:
+                    # Blend: P(check) from blueprint vs uniform
+                    p_check_blueprint = 1.0 - p_bet
+                    # If opponent checks more than GTO, trust check less
+                    # (everyone checks, so check is less informative)
+                    p_check_uniform = 1.0 - (tracked_freq if tracked_freq else blueprint_avg)
+                    p_check = alpha * p_check_blueprint + (1.0 - alpha) * p_check_uniform
+                    self._opp_weights[pair] *= max(p_check, 0.10)
+
+            total = sum(self._opp_weights.values())
+            if total > 0:
+                for k in self._opp_weights:
+                    self._opp_weights[k] /= total
+
+        except Exception:
+            pass
+
     def _turn_bayesian_narrow(self, board, my_bet, opp_bet):
         """Bayesian narrowing on turn using precomputed P(bet|hand).
 
@@ -1226,9 +1329,13 @@ class PlayerAgent(Agent):
                         self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     self._polarized_narrow_range(board, dead, my_bet, opp_bet)
-            # NOTE: opponent CHECKS are NOT narrowed. Check-capping caused
-            # 6% river call WR (was 51%) — capped weights persisted across
-            # streets, making slow-played hands invisible to river solver.
+            elif opp_bet == my_bet and not hero_is_first and street in (1, 2):
+                # Opponent CHECKED: Bayesian update with P(check|hand) from
+                # blueprint. Board-specific — accounts for slow-playing
+                # (strong hands that GTO checks sometimes to trap).
+                # Only on flop/turn where we have blueprint data.
+                self._narrowed_this_street = True
+                self._turn_check_bayesian_narrow(board, street)
 
         elif opp_bet > my_bet and self._opp_weights is not None and self._narrowed_this_street:
             # Re-raise: two-phase game-theoretic narrowing
@@ -1254,14 +1361,33 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: equity thresholds + adaptive exploit layer
+        # 2. Turn: blueprint lookup (if available) or equity thresholds
         if street == 2:
             self._path_counts['ms_turn'] += 1
+
+            # Try turn blueprint first (precomputed from EC2)
+            if self._multi_street is not None:
+                try:
+                    strat = self._multi_street.get_turn_strategy(
+                        my_cards, board, pot_state=pot_state,
+                        hero_position=hero_position)
+                    action = self._try_strategy(strat, observation)
+                    if action is not None:
+                        if action[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
+                            self._last_hero_bet = action[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        return action
+                except Exception:
+                    pass
+
+            # Fallback: equity thresholds + exploit layer
             result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
-            # Adaptive exploit: if thresholds say CHECK but opponent over-folds
             if (result[0] == CHECK and valid[RAISE] and
-                    opp_bet == my_bet):  # acting first only
+                    opp_bet == my_bet):
                 result = self._maybe_exploit_bluff(
                     result, my_cards, board, dead, observation, street)
             return result
