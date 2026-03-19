@@ -1930,12 +1930,12 @@ class PlayerAgent(Agent):
         else:
             self._risk_factor = 1.0
 
-        # Lead protection — if we can survive on blinds alone, fold everything.
-        # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
-        # Kick in with comfortable margin (2x blind cost) for safety.
+        # Lead protection — mathematically guaranteed win.
+        # If we fold every remaining hand, we lose 1.5 chips/hand (avg of SB+BB).
+        # Auto-fold when bankroll > max possible blind loss + 1 chip margin.
         hands_remaining = self._total_hands - hand_number
         blind_cost = hands_remaining * 1.5
-        if self._bankroll > blind_cost * 2 + 10:
+        if hands_remaining > 0 and self._bankroll > blind_cost + 1:
             valid = observation["valid_actions"]
             if valid[CHECK]:
                 return (CHECK, 0, 0, 0)
