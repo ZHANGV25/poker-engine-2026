@@ -553,6 +553,66 @@ class PlayerAgent(Agent):
         except Exception:
             return False
 
+    def _cfr_bayesian_narrow(self, board, dead_cards, my_bet, opp_bet, street):
+        """Narrow opponent range using real-time CFR-computed P(bet|hand).
+
+        Solves the game from opponent's perspective: for each hand in their
+        range, computes the equilibrium probability of betting. Hands that
+        would bet get full weight, hands that wouldn't get reduced weight.
+
+        This replaces heuristic polarized narrowing with game-theoretic
+        Bayesian narrowing. ~400ms per call, well within budget.
+
+        Returns True if narrowing was applied, False on failure.
+        """
+        if self._opp_weights is None:
+            return False
+
+        try:
+            # Build hero range (what opponent thinks we have)
+            # Use uniform over non-conflicting hands
+            known = set(board) | set(dead_cards)
+            hero_range = {}
+            import itertools as _it
+            remaining = [c for c in range(27) if c not in known]
+            for h in _it.combinations(remaining, 2):
+                hero_range[h] = 1.0
+
+            # Skip if ranges are too large (would be too slow)
+            n_opp = sum(1 for w in self._opp_weights.values() if w > 0.001)
+            n_hero = len(hero_range)
+            if n_opp * n_hero > 10000:
+                return False  # fall back to heuristic
+
+            p_bet = self.solver.compute_opponent_bet_probs(
+                board=board, dead_cards=dead_cards,
+                opp_range=self._opp_weights,
+                hero_range=hero_range,
+                my_bet=my_bet, opp_bet=opp_bet,
+                street=street,
+                min_raise=max(2, opp_bet - my_bet),
+                iterations=50)
+
+            if p_bet is None or len(p_bet) < 3:
+                return False
+
+            # Bayesian update: multiply each hand's weight by P(bet|hand)
+            # Floor at 0.05 to avoid zeroing out hands that deviate from GTO
+            for hand in list(self._opp_weights.keys()):
+                if hand in p_bet:
+                    self._opp_weights[hand] *= max(p_bet[hand], 0.05)
+
+            # Renormalize
+            total = sum(self._opp_weights.values())
+            if total > 0:
+                for k in self._opp_weights:
+                    self._opp_weights[k] /= total
+
+            return True
+
+        except Exception:
+            return False
+
     def _polarized_narrow_range(self, board, dead_cards, my_bet, opp_bet):
         """Construct polarized opponent range when facing a river bet.
 
@@ -956,9 +1016,14 @@ class PlayerAgent(Agent):
                         self._soft_narrow_range(my_bet, opp_bet, board, dead)
             elif street in (2, 3):
                 if not self._narrowed_this_street:
-                    # First bet on this street: full polarized narrowing
                     self._narrowed_this_street = True
-                    self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                    # Compute P(bet|hand) via real-time CFR from opponent's
+                    # perspective. Board-specific, pot-specific, equilibrium-derived.
+                    # Falls back to heuristic polarized narrowing if solver fails.
+                    narrowed = self._cfr_bayesian_narrow(
+                        board, dead, my_bet, opp_bet, street)
+                    if not narrowed:
+                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     # Re-raise: two-phase game-theoretic narrowing
                     self._reraise_narrow_range(board, dead, my_bet, opp_bet)
