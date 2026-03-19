@@ -1100,7 +1100,7 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1203,7 +1203,7 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1248,7 +1248,7 @@ class PlayerAgent(Agent):
         cutoff = int(len(ranked) * keep_fraction)
         if cutoff < len(ranked):
             for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1362,7 +1362,7 @@ class PlayerAgent(Agent):
         cutoff = int(len(ranked) * keep)
         if cutoff < len(ranked):
             for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1477,33 +1477,13 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: depth-limited solving with river continuation values.
-        #    Solves turn subgame using actual narrowed opponent range +
-        #    river sub-game values at showdown terminals.
-        #    Falls back to blueprint lookup, then equity thresholds.
+        # 2. Turn: blueprint lookup (depth-limited solving reverted —
+        #    75-iter river continuation values had ~65 chip error bound,
+        #    causing overcalling that lost every match at v10).
         if street == 2:
             self._path_counts['ms_turn'] += 1
 
-            # Depth-limited solve: one-hand solver with river lookahead
-            # using actual narrowed opponent range (not generic blueprint range)
-            if (self._opp_weights is not None and time_left > 200
-                    and len(board) >= 4):
-                try:
-                    result = self._solve_turn_with_river(
-                        my_cards, board, dead, my_bet, opp_bet,
-                        observation, valid, True, time_left)
-                    if result is not None:
-                        if result[0] == RAISE:
-                            self._raised_this_street = True
-                            self._streets_raised += 1
-                            self._last_hero_bet = result[1]
-                            self._last_pot_before = pot_state[0] + pot_state[1]
-                            self._opp_bet_at_raise = opp_bet
-                        return result
-                except Exception:
-                    pass
-
-            # Fallback 1: blueprint lookup
+            # Blueprint lookup
             if self._multi_street is not None:
                 try:
                     strat = self._multi_street.get_turn_strategy(
