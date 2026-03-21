@@ -1578,6 +1578,28 @@ class PlayerAgent(Agent):
                                     bet_amt = min(bet_amt, _max_r)
                                     result = (RAISE, bet_amt, 0, 0)
 
+                    # River bluff injection: if solver checked, we have a weak hand,
+                    # and opponent folds >50% to our bets, bluff at half-GTO frequency.
+                    # Our bluff rate is 5% vs GTO 33%. Opponents fold 4663 times —
+                    # massive fold equity left on table. Half-GTO is near-breakeven
+                    # even if called, so risk is minimal.
+                    if (result[0] == CHECK and my_bet == opp_bet
+                            and valid[RAISE]
+                            and self._opp_faces_bet.get(3, 0) >= 20):
+                        _r_fold_rate = (self._opp_folds_to_bet[3] /
+                                        self._opp_faces_bet[3])
+                        if _r_fold_rate > 0.50:
+                            _eq_bluff = self.engine.compute_equity(
+                                my_cards, board, dead, solve_range)
+                            if _eq_bluff < 0.25:
+                                import random as _rng2
+                                _pot = my_bet + opp_bet
+                                _bet = max(int(_pot * 0.6), observation["min_raise"])
+                                _bet = min(_bet, observation["max_raise"])
+                                _bluff_freq = _bet / (_bet + _pot) * 0.5
+                                if _rng2.random() < _bluff_freq:
+                                    result = (RAISE, _bet, 0, 0)
+
                     # River equity gate: fold when equity < pot odds + margin.
                     # Margin of 0.12 trims marginal calls that are technically
                     # above pot odds but lose in practice (97.8% accuracy
