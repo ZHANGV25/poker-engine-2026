@@ -1,22 +1,21 @@
 """
-Range-based real-time subgame re-solver.
+Range-based real-time subgame re-solver with DCFR.
 
-Unlike the one-hand solver (solver.py), this solves for ALL hero hands
-simultaneously, producing range-balanced strategies. Used when the
-opponent's range has been narrowed by their betting actions, making
-the precomputed blueprint inaccurate.
+Solves for ALL hero hands simultaneously, producing range-balanced
+strategies. Full tree (4 bet sizes, 2 raises max) accounts for
+re-raise threat, giving realistic ~17% bet frequency acting first
+with proper value+bluff polarization.
 
-Key differences from one-hand solver:
-- Hero has N_HERO possible hands, each with its own strategy
-- Terminal values: (n_terminals, n_hero, n_opp) matrix
-- Hero regrets: (n_hero_nodes, n_hero, max_act)
-- Output: strategy for each hero hand (not just one hand)
-
-This is what Pluribus calls "depth-limited subgame solving."
+Key features:
+- Full tree with re-raises (not compact) for solve_and_act
+- DCFR (Noam Brown's params: alpha=1.5, beta=0, gamma=2)
+- Proper card blocking in terminal values (blocked pairs = 0)
+- Vectorized traversal with numpy tensordot
 """
 
 import numpy as np
 import itertools
+from math import pow as fpow
 from game_tree import (
     GameTree, ACT_FOLD, ACT_CHECK, ACT_CALL,
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
@@ -39,24 +38,11 @@ class RangeSolver:
                       valid_actions, time_remaining):
         """Re-solve the subgame with full hero range and narrowed opponent range.
 
-        Args:
-            hero_cards: list of 2 ints (our actual hand)
-            board: list of 3-5 ints
-            opp_range: dict (c1,c2) -> weight (narrowed)
-            dead_cards: list of ints
-            my_bet, opp_bet: current bets
-            street: 1-3
-            min_raise, max_raise: raise bounds
-            valid_actions: list of 5 bools
-            time_remaining: seconds left
-
-        Returns:
-            (action_type, raise_amount, 0, 0) tuple
+        Uses full tree (4 bet sizes, 2 raises) + DCFR for balanced strategies.
         """
         if opp_range is None:
-            return None  # can't re-solve without opponent range
+            return None
 
-        # Build hero and opponent hand lists
         known = set(board) | set(dead_cards)
         hero_hands = []
         opp_hands = []
@@ -70,10 +56,9 @@ class RangeSolver:
         if not opp_hands:
             return None
 
-        opp_weights = np.array(opp_weights, dtype=np.float32)
+        opp_weights = np.array(opp_weights, dtype=np.float64)
         opp_weights /= opp_weights.sum()
 
-        # Enumerate all possible hero hands
         remaining = [c for c in range(27) if c not in known]
         for h in itertools.combinations(remaining, 2):
             hero_hands.append(h)
@@ -84,7 +69,6 @@ class RangeSolver:
         if n_hero == 0:
             return None
 
-        # Find our hand's index
         hero_tuple = tuple(sorted(hero_cards))
         hero_idx_in_list = None
         for i, h in enumerate(hero_hands):
@@ -95,45 +79,39 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Compact tree + float32: ~0.3s per 1000 iters Mac, ~0.7s ARM.
-        # Scale iterations by pot size — spend more compute on big decisions.
-        pot = my_bet + opp_bet
+        # Full tree + DCFR: ~1.2s per 500 iters Mac, ~3s ARM.
         if time_remaining > 600:
-            if pot >= 40:
-                iterations = 3000  # big pot: spend more, decision matters most
-            else:
-                iterations = 1500  # small pot: standard
-        elif time_remaining > 300:
-            iterations = 1000
-        elif time_remaining > 100:
             iterations = 500
+        elif time_remaining > 300:
+            iterations = 300
+        elif time_remaining > 100:
+            iterations = 200
         else:
             iterations = 50
 
-        # Build game tree
+        # Full tree: 4 bet sizes, 2 raises max
         max_bet = 100
-        tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet)
+        tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet,
+                              compact=False)
 
         if tree.size < 2:
             return None
 
-        # Compute pairwise equity matrix: (n_hero, n_opp)
-        equity_matrix = self._compute_equity_matrix(
+        # Compute equity matrix AND not-blocked mask
+        equity_matrix, not_blocked = self._compute_equity_and_mask(
             hero_hands, opp_hands, board, dead_cards, street)
 
-        # Compute terminal values for all (hero, opp) pairs
+        # Terminal values with proper card blocking
         terminal_values = self._compute_terminal_values(
-            tree, equity_matrix, n_hero, n_opp)
+            tree, equity_matrix, not_blocked)
 
-        # Run range-based CFR
-        hero_strategy = self._run_range_cfr(
+        # Run DCFR
+        hero_strategy = self._run_dcfr(
             tree, opp_weights, terminal_values,
             n_hero, n_opp, iterations)
 
-        # Extract strategy for our specific hand
         our_strategy = hero_strategy[hero_idx_in_list]
 
-        # Convert to action
         return self._strategy_to_action(
             tree, our_strategy, my_bet, opp_bet, min_raise, max_raise,
             valid_actions)
@@ -141,13 +119,9 @@ class RangeSolver:
     def compute_opp_bet_probs(self, board, opp_range, hero_range,
                                dead_cards, my_bet, opp_bet, street,
                                min_raise, iterations=1000):
-        """Compute P(bet|hand) for each opponent hand via range-balanced CFR.
+        """Compute P(bet|hand) for each opponent hand.
 
-        Solves from opponent's perspective: they are "hero" deciding whether
-        to bet/check. Returns equilibrium P(bet|hand) for each hand.
-
-        This is the exact GTO P(bet|hand) — board-specific, range-specific,
-        accounts for bluff ratios and range composition.
+        Uses compact tree (lighter weight, adequate for narrowing).
         """
         known = set(board) | set(dead_cards)
 
@@ -168,34 +142,31 @@ class RangeSolver:
         if len(opp_hands) < 3 or len(hero_hands) < 3:
             return None
 
-        opp_w = np.array(opp_weights, dtype=np.float32)
+        opp_w = np.array(opp_weights, dtype=np.float64)
         opp_w /= opp_w.sum()
-        hero_w = np.array(hero_weights, dtype=np.float32)
+        hero_w = np.array(hero_weights, dtype=np.float64)
         hero_w /= hero_w.sum()
 
         n_opp = len(opp_hands)
         n_hero = len(hero_hands)
 
-        # Tree from opponent's perspective: equal bets (pre-bet state)
-        # Opponent decides to check or bet
+        # Compact tree for narrowing (lighter weight)
         pre_bet = min(my_bet, opp_bet)
-        tree = self._get_tree(pre_bet, pre_bet, min_raise, 100)
+        tree = self._get_tree(pre_bet, pre_bet, min_raise, 100,
+                              compact=True)
         if tree.size < 2:
             return None
 
-        # Equity from opponent's perspective
-        eq_matrix = self._compute_equity_matrix(
+        eq_matrix, nb_mask = self._compute_equity_and_mask(
             opp_hands, hero_hands, board, dead_cards, street)
 
-        # Terminal values from opponent's perspective
-        tv = self._compute_terminal_values(tree, eq_matrix, n_opp, n_hero)
+        tv = self._compute_terminal_values(tree, eq_matrix, nb_mask)
 
-        # Solve: opponent is "hero", we are "opp"
-        strat = self._run_range_cfr(tree, hero_w, tv, n_opp, n_hero, iterations)
+        strat = self._run_dcfr(tree, hero_w, tv, n_opp, n_hero, iterations)
 
-        # Extract P(bet|hand): sum of all non-check actions
         children = tree.children[0]
-        bet_indices = [a for a, (act_type, _) in enumerate(children) if act_type != 1]
+        bet_indices = [a for a, (act_type, _) in enumerate(children)
+                       if act_type != ACT_CHECK]
 
         result = {}
         for oi, hand in enumerate(opp_hands):
@@ -205,70 +176,218 @@ class RangeSolver:
 
         return result
 
-    def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet):
-        # Compact tree: 2 bet sizes + 1 raise max → ~6x smaller
-        key = (hero_bet, opp_bet, min_raise, max_bet, True, True)
+    def compute_opp_call_probs(self, board, opp_range, hero_range,
+                                dead_cards, hero_bet, opp_bet_before,
+                                street, min_raise=2, iterations=200):
+        """Compute P(continue|hand) for each opponent hand when FACING our bet.
+
+        Unlike compute_opp_bet_probs (which solves acting-first check/bet),
+        this solves from the opponent's perspective at the FACING-BET node:
+        they see our raise and decide fold/call/raise.
+
+        P(continue|hand) = P(call|hand) + P(raise|hand) = 1 - P(fold|hand).
+
+        Args:
+            board: community cards
+            opp_range: opponent's current narrowed range
+            hero_range: our range (from opponent's perspective)
+            dead_cards: discards
+            hero_bet: our total bet (the bet opponent faces)
+            opp_bet_before: opponent's bet before our raise
+            street: 1-3
+            min_raise: minimum raise increment
+            iterations: DCFR iterations
+
+        Returns:
+            dict {(c1,c2): p_continue} or None
+        """
+        known = set(board) | set(dead_cards)
+
+        opp_hands = []
+        opp_weights = []
+        for hand, w in opp_range.items():
+            if w > 0.001 and not (set(hand) & known):
+                opp_hands.append(hand)
+                opp_weights.append(w)
+
+        hero_hands = []
+        hero_weights = []
+        for hand, w in hero_range.items():
+            if w > 0.001 and not (set(hand) & known):
+                hero_hands.append(hand)
+                hero_weights.append(w)
+
+        if len(opp_hands) < 3 or len(hero_hands) < 3:
+            return None
+
+        opp_w = np.array(opp_weights, dtype=np.float64)
+        opp_w /= opp_w.sum()
+        hero_w = np.array(hero_weights, dtype=np.float64)
+        hero_w /= hero_w.sum()
+
+        n_opp = len(opp_hands)
+        n_hero = len(hero_hands)
+
+        # Build tree from OPPONENT's perspective facing our bet.
+        # Opponent is "hero" in the tree with opp_bet_before chips in.
+        # They face our raise (hero_bet > opp_bet_before).
+        # Tree root: opponent decides fold/call/raise.
+        tree = self._get_tree(opp_bet_before, hero_bet, min_raise, 100,
+                              compact=True)
+        if tree.size < 2:
+            return None
+
+        # Equity from opponent's perspective
+        eq_matrix, nb_mask = self._compute_equity_and_mask(
+            opp_hands, hero_hands, board, dead_cards, street)
+
+        tv = self._compute_terminal_values(tree, eq_matrix, nb_mask)
+
+        # Solve: opponent is "hero", we are "opp"
+        strat = self._run_dcfr(tree, hero_w, tv, n_opp, n_hero, iterations)
+
+        # Extract P(continue|hand) = 1 - P(fold|hand)
+        # At root, opponent faces our bet: actions are fold/call/raise
+        children = tree.children[0]
+        fold_idx = None
+        for a, (act_type, _) in enumerate(children):
+            if act_type == ACT_FOLD:
+                fold_idx = a
+                break
+
+        result = {}
+        for oi, hand in enumerate(opp_hands):
+            if fold_idx is not None and fold_idx < strat.shape[1]:
+                p_fold = float(strat[oi, fold_idx])
+                p_continue = 1.0 - p_fold
+            else:
+                p_continue = 1.0  # no fold action → always continues
+            key = (min(hand[0], hand[1]), max(hand[0], hand[1]))
+            result[key] = p_continue
+
+        return result
+
+    def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet, compact):
+        key = (hero_bet, opp_bet, min_raise, max_bet, True, compact)
         if key not in self._tree_cache:
             self._tree_cache[key] = GameTree(
-                hero_bet, opp_bet, min_raise, max_bet, True, compact=True)
+                hero_bet, opp_bet, min_raise, max_bet, True, compact=compact)
         return self._tree_cache[key]
 
-    def _compute_equity_matrix(self, hero_hands, opp_hands, board, dead_cards, street):
-        """Compute equity[h][o] = hero hand h's equity vs opp hand o."""
+    def _compute_equity_and_mask(self, hero_hands, opp_hands, board,
+                                  dead_cards, street):
+        """Compute equity matrix and not-blocked mask using vectorized numpy.
+
+        Returns (equity, not_blocked) where:
+        - equity[h][o] = hero hand h's equity vs opp hand o (0 if blocked)
+        - not_blocked[h][o] = 1.0 if hands don't share cards, 0.0 if they do
+
+        Uses numpy broadcasting instead of nested Python loops:
+        - River: 272 lookups + 1 broadcast vs 18,496 loop iterations
+        - Turn: 17 × 272 lookups + 17 broadcasts vs 258,944 loop iterations
+        - Flop: 91 × 272 lookups + 91 broadcasts vs ~1M loop iterations
+        """
         n_hero = len(hero_hands)
         n_opp = len(opp_hands)
-        equity = np.zeros((n_hero, n_opp), dtype=np.float32)
-
         known_base = set(board) | set(dead_cards)
         board_list = list(board)
+        seven = self.engine._seven
+
+        # Build not-blocked mask: 1 where hands don't share cards
+        # Use bitmask representation for fast overlap detection
+        hero_masks = np.array([(1 << h[0]) | (1 << h[1]) for h in hero_hands],
+                              dtype=np.int64)
+        opp_masks = np.array([(1 << o[0]) | (1 << o[1]) for o in opp_hands],
+                             dtype=np.int64)
+        # Blocked if any bit overlaps: (hero_mask & opp_mask) != 0
+        overlap = hero_masks[:, None] & opp_masks[None, :]  # (n_hero, n_opp)
+        not_blocked = (overlap == 0).astype(np.float64)
+
+        # Also zero out hero hands that overlap with known cards
+        known_mask = 0
+        for c in known_base:
+            known_mask |= 1 << c
+        for hi in range(n_hero):
+            if hero_masks[hi] & known_mask:
+                not_blocked[hi, :] = 0.0
+
+        board_mask = 0
+        for c in board_list:
+            board_mask |= 1 << c
 
         if len(board) == 5:
-            # River: deterministic
-            for hi, hh in enumerate(hero_hands):
-                if set(hh) & known_base:
-                    continue
-                hr = self.engine.lookup_seven(list(hh) + board_list)
-                for oi, oh in enumerate(opp_hands):
-                    if set(oh) & set(hh):
-                        continue
-                    opr = self.engine.lookup_seven(list(oh) + board_list)
-                    if hr < opr:
-                        equity[hi, oi] = 1.0
-                    elif hr == opr:
-                        equity[hi, oi] = 0.5
+            # River: deterministic. Precompute all ranks, then broadcast.
+            hero_keys = np.array([hero_masks[hi] | board_mask
+                                  for hi in range(n_hero)], dtype=np.int64)
+            opp_keys = np.array([opp_masks[oi] | board_mask
+                                 for oi in range(n_opp)], dtype=np.int64)
+            hero_ranks = np.array([seven.get(int(k), 9999)
+                                   for k in hero_keys], dtype=np.int32)
+            opp_ranks = np.array([seven.get(int(k), 9999)
+                                  for k in opp_keys], dtype=np.int32)
+
+            # Broadcasting: (n_hero, 1) vs (1, n_opp)
+            equity = np.where(
+                hero_ranks[:, None] < opp_ranks[None, :], 1.0,
+                np.where(hero_ranks[:, None] == opp_ranks[None, :], 0.5, 0.0))
+            equity *= not_blocked
+
         else:
-            # Turn: enumerate 1 remaining card
+            # Turn/Flop: enumerate runout cards, vectorize per-card comparison.
+            # For each possible runout, compute ranks for all hands at once.
+            remaining_cards = [c for c in range(27) if c not in known_base]
             board_needed = 5 - len(board)
-            for hi, hh in enumerate(hero_hands):
-                hh_set = set(hh)
-                if hh_set & known_base:
-                    continue
-                known_h = known_base | hh_set
-                for oi, oh in enumerate(opp_hands):
-                    oh_set = set(oh)
-                    if oh_set & hh_set:
-                        continue
-                    known_ho = known_h | oh_set
-                    remaining = [c for c in range(27) if c not in known_ho]
-                    wins = 0.0
-                    total = 0
-                    for runout in itertools.combinations(remaining, board_needed):
-                        full_board = board_list + list(runout)
-                        hr = self.engine.lookup_seven(list(hh) + full_board)
-                        opr = self.engine.lookup_seven(list(oh) + full_board)
-                        if hr < opr:
-                            wins += 1.0
-                        elif hr == opr:
-                            wins += 0.5
-                        total += 1
-                    equity[hi, oi] = wins / total if total > 0 else 0.5
+            equity = np.zeros((n_hero, n_opp), dtype=np.float64)
+            count = np.zeros((n_hero, n_opp), dtype=np.float64)
 
-        return equity
+            for runout in itertools.combinations(remaining_cards, board_needed):
+                runout_mask = 0
+                for c in runout:
+                    runout_mask |= 1 << c
+                full_board_mask = board_mask | runout_mask
 
-    def _compute_terminal_values(self, tree, equity_matrix, n_hero, n_opp):
-        """Compute terminal values for all (hero, opp) pairs.
+                # Mask out hands that contain a runout card
+                runout_set_mask = runout_mask
+                hero_valid = np.array(
+                    [(hero_masks[hi] & runout_set_mask) == 0
+                     for hi in range(n_hero)], dtype=bool)
+                opp_valid = np.array(
+                    [(opp_masks[oi] & runout_set_mask) == 0
+                     for oi in range(n_opp)], dtype=bool)
 
-        Returns dict: node_id -> np.array of shape (n_hero, n_opp)
+                # Valid pair matrix
+                valid_pairs = (hero_valid[:, None] & opp_valid[None, :]).astype(
+                    np.float64) * not_blocked
+
+                # Compute ranks for all hands on this full board
+                hero_ranks = np.array(
+                    [seven.get(int(hero_masks[hi] | full_board_mask), 9999)
+                     if hero_valid[hi] else 9999
+                     for hi in range(n_hero)], dtype=np.int32)
+                opp_ranks = np.array(
+                    [seven.get(int(opp_masks[oi] | full_board_mask), 9999)
+                     if opp_valid[oi] else 9999
+                     for oi in range(n_opp)], dtype=np.int32)
+
+                # Vectorized comparison
+                wins = (hero_ranks[:, None] < opp_ranks[None, :]).astype(
+                    np.float64) * valid_pairs
+                ties = (hero_ranks[:, None] == opp_ranks[None, :]).astype(
+                    np.float64) * valid_pairs
+
+                equity += wins + 0.5 * ties
+                count += valid_pairs
+
+            # Average equity across runouts
+            equity = np.where(count > 0, equity / np.maximum(count, 1), 0.0)
+
+        return equity, not_blocked
+
+    def _compute_terminal_values(self, tree, equity_matrix, not_blocked):
+        """Terminal values with proper card blocking.
+
+        All terminal values are multiplied by not_blocked so that
+        impossible hand matchups (sharing cards) contribute 0.
         """
         values = {}
         for node_id in tree.terminal_node_ids:
@@ -277,20 +396,21 @@ class RangeSolver:
             opp_pot = tree.opp_pot[node_id]
 
             if term_type == TERM_FOLD_HERO:
-                values[node_id] = np.full((n_hero, n_opp), -hero_pot, dtype=np.float32)
+                values[node_id] = -hero_pot * not_blocked
             elif term_type == TERM_FOLD_OPP:
-                values[node_id] = np.full((n_hero, n_opp), opp_pot, dtype=np.float32)
+                values[node_id] = opp_pot * not_blocked
             elif term_type == TERM_SHOWDOWN:
                 pot_won = min(hero_pot, opp_pot)
-                values[node_id] = (2.0 * equity_matrix - 1.0) * pot_won
+                values[node_id] = (2.0 * equity_matrix - 1.0) * pot_won * not_blocked
 
         return values
 
-    def _run_range_cfr(self, tree, opp_weights, terminal_values,
-                        n_hero, n_opp, iterations):
-        """Run CFR+ with full hero range.
+    def _run_dcfr(self, tree, opp_weights, terminal_values,
+                   n_hero, n_opp, iterations):
+        """Run DCFR with Noam Brown's parameters.
 
-        Returns np.array of shape (n_hero, n_root_actions) — strategy per hand.
+        DCFR discounts early iterations so the average strategy
+        converges faster. Parameters: alpha=1.5, beta=0, gamma=2.
         """
         n_hero_nodes = len(tree.hero_node_ids)
         n_opp_nodes = len(tree.opp_node_ids)
@@ -301,50 +421,48 @@ class RangeSolver:
         max_act = max(
             max((tree.num_actions[nid] for nid in tree.hero_node_ids), default=1),
             max((tree.num_actions[nid] for nid in tree.opp_node_ids), default=1),
-            1
-        )
+            1)
 
-        # Hero: regrets and strategy sum per hand per node
-        hero_regrets = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float32)
-        hero_strat_sum = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float32)
+        hero_regrets = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float64)
+        hero_strat_sum = np.zeros((n_hero_nodes, n_hero, max_act), dtype=np.float64)
+        opp_regrets = np.zeros((n_opp_nodes, n_opp, max_act), dtype=np.float64)
 
-        # Opponent: regrets per hand per node (same as one-hand solver)
-        opp_regrets = np.zeros((n_opp_nodes, n_opp, max_act), dtype=np.float32)
+        hero_reach_init = np.ones(n_hero, dtype=np.float64) / n_hero
 
-        # Initial hero reach: uniform (each hand equally likely)
-        hero_reach_init = np.ones(n_hero, dtype=np.float32) / n_hero
+        # DCFR parameters (from Noam Brown's poker solver)
+        alpha, beta, gamma = 1.5, 0.0, 2.0
 
-        for t in range(iterations):
+        for t in range(1, iterations + 1):
+            if t > 1:
+                pos_w = fpow(t - 1, alpha) / (fpow(t - 1, alpha) + 1.0)
+                neg_w = fpow(t - 1, beta) / (fpow(t - 1, beta) + 1.0)
+                strat_w = fpow((t - 1) / t, gamma)
+
+                hero_regrets *= np.where(hero_regrets > 0, pos_w, neg_w)
+                opp_regrets *= np.where(opp_regrets > 0, pos_w, neg_w)
+                hero_strat_sum *= strat_w
+
             self._range_cfr_traverse(
                 tree, 0, hero_reach_init.copy(), opp_weights.copy(),
                 hero_regrets, hero_strat_sum, opp_regrets,
                 hero_node_idx, opp_node_idx, terminal_values,
                 n_hero, n_opp, max_act)
 
-        # Extract average strategy at root for each hero hand
+        # Extract average strategy at root
         root = 0
         if root not in hero_node_idx:
             return np.ones((n_hero, 1)) / 1
 
         idx = hero_node_idx[root]
         n_act = tree.num_actions[root]
-        strat_slice = hero_strat_sum[idx, :, :n_act]  # (n_hero, n_act)
-        totals = strat_slice.sum(axis=1, keepdims=True)  # (n_hero, 1)
+        strat_slice = hero_strat_sum[idx, :, :n_act]
+        totals = strat_slice.sum(axis=1, keepdims=True)
         result = np.where(totals > 0, strat_slice / np.maximum(totals, 1e-10),
                          np.full_like(strat_slice, 1.0 / n_act))
         return result
 
     @staticmethod
     def _regret_match_batch(regrets, n_act):
-        """Vectorized regret matching for all hands at once.
-
-        Args:
-            regrets: (n_hands, max_act) array
-            n_act: number of valid actions
-
-        Returns:
-            (n_hands, n_act) strategy array
-        """
         pos = np.maximum(regrets[:, :n_act], 0)
         totals = pos.sum(axis=1, keepdims=True)
         return np.where(totals > 0, pos / np.maximum(totals, 1e-10),
@@ -354,10 +472,6 @@ class RangeSolver:
                              hero_regrets, hero_strat_sum, opp_regrets,
                              hero_node_idx, opp_node_idx, terminal_values,
                              n_hero, n_opp, max_act):
-        """Vectorized range-based CFR traversal.
-
-        Returns np.array of shape (n_hero, n_opp) — utility matrix.
-        """
         if tree.terminal[node_id] != TERM_NONE:
             return terminal_values[node_id]
 
@@ -365,14 +479,12 @@ class RangeSolver:
         children = tree.children[node_id]
         player = tree.player[node_id]
 
-        if player == 0:  # Hero node
+        if player == 0:  # Hero
             idx = hero_node_idx[node_id]
-
-            # Vectorized regret matching for all hero hands
             strategies = self._regret_match_batch(hero_regrets[idx], n_act)
 
-            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float32)
-            node_value = np.zeros((n_hero, n_opp), dtype=np.float32)
+            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
+            node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
 
             for a in range(n_act):
                 _, child_id = children[a]
@@ -384,26 +496,19 @@ class RangeSolver:
                     n_hero, n_opp, max_act)
                 node_value += strategies[:, a:a+1] * action_values[a]
 
-            # Vectorized regret update: (n_act, n_hero, n_opp) -> (n_hero, n_act)
-            # cf_regret[h,a] = dot(action_values[a,h,:] - node_value[h,:], opp_reach)
-            diff = action_values - node_value[np.newaxis, :, :]  # (n_act, n_hero, n_opp)
-            cf_regrets = np.tensordot(diff, opp_reach, axes=([2], [0]))  # (n_act, n_hero)
-            hero_regrets[idx, :, :n_act] = np.maximum(
-                0, hero_regrets[idx, :, :n_act] + cf_regrets.T)
+            diff = action_values - node_value[np.newaxis, :, :]
+            cf_regrets = np.tensordot(diff, opp_reach, axes=([2], [0]))
+            hero_regrets[idx, :, :n_act] += cf_regrets.T
 
-            # Vectorized strategy sum update
             hero_strat_sum[idx, :, :n_act] += hero_reach[:, np.newaxis] * strategies
-
             return node_value
 
-        else:  # Opponent node
+        else:  # Opponent
             idx = opp_node_idx[node_id]
-
-            # Vectorized regret matching for all opp hands
             strategies = self._regret_match_batch(opp_regrets[idx], n_act)
 
-            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float32)
-            node_value = np.zeros((n_hero, n_opp), dtype=np.float32)
+            action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
+            node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
 
             for a in range(n_act):
                 _, child_id = children[a]
@@ -415,19 +520,22 @@ class RangeSolver:
                     n_hero, n_opp, max_act)
                 node_value += strategies[:, a:a+1].T * action_values[a]
 
-            # Vectorized opp regret update: (n_opp, n_act)
-            # cf_regret[o,a] = dot(hero_reach, node_value[:,o] - action_values[a,:,o])
-            diff = node_value[np.newaxis, :, :] - action_values  # (n_act, n_hero, n_opp)
-            cf_regrets = np.tensordot(diff, hero_reach, axes=([1], [0]))  # (n_act, n_opp)
-            opp_regrets[idx, :, :n_act] = np.maximum(
-                0, opp_regrets[idx, :, :n_act] + cf_regrets.T)
+            diff = node_value[np.newaxis, :, :] - action_values
+            cf_regrets = np.tensordot(diff, hero_reach, axes=([1], [0]))
+            opp_regrets[idx, :, :n_act] += cf_regrets.T
 
             return node_value
 
     def _strategy_to_action(self, tree, strategy, my_bet, opp_bet,
                              min_raise, max_raise, valid_actions):
-        """Convert strategy to concrete engine action."""
         root_children = tree.children[0]
+
+        strategy = np.maximum(strategy, 0)
+        total = strategy.sum()
+        if total > 0:
+            strategy = strategy / total
+        else:
+            strategy = np.ones(len(strategy)) / len(strategy)
 
         action_idx = int(np.random.choice(len(strategy), p=strategy))
         act_type, child_id = root_children[action_idx]
@@ -438,7 +546,8 @@ class RangeSolver:
             return (CHECK, 0, 0, 0)
         elif act_type == ACT_CALL:
             return (CALL, 0, 0, 0)
-        elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
+        elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT,
+                          ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
             child_hero_pot = tree.hero_pot[child_id]
             child_opp_pot = tree.opp_pot[child_id]
             new_bet = max(child_hero_pot, child_opp_pot)

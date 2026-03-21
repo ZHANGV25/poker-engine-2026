@@ -27,6 +27,7 @@ from equity import ExactEquityEngine
 from inference import DiscardInference
 from solver import SubgameSolver
 from range_solver import RangeSolver
+from depth_limited_solver import DepthLimitedSolver
 from game_tree import (
     ACT_FOLD, ACT_CHECK, ACT_CALL,
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
@@ -36,7 +37,7 @@ from game_tree import (
 # Phase 1 (synchronous): load flop from npz (fast, ~4s)
 # Phase 2 (background): decompress turn+opp from LZMA (slow, ~10s)
 import threading
-_PRELOAD = {'multi_street': None, 'done': False, 'deferred_done': False}
+_PRELOAD = {'multi_street': None, 'river_data': None, 'done': False, 'deferred_done': False}
 _data_dir = os.path.join(_dir, "data", "multi_street")
 try:
     _pre_engine = ExactEquityEngine()
@@ -55,6 +56,15 @@ def _deferred_load():
         if _PRELOAD['multi_street'] and os.path.isdir(_data_dir):
             _PRELOAD['multi_street']._load_lzma_deferred(_data_dir)
             _PRELOAD['multi_street']._build_all_node_maps()
+    except Exception:
+        pass
+    # Load river precomputed P(bet|hand) data
+    try:
+        import lzma as _lzma2, pickle as _pkl2
+        river_path = os.path.join(_data_dir, 'river.pkl.lzma')
+        if os.path.isfile(river_path):
+            with _lzma2.open(river_path, 'rb') as _f:
+                _PRELOAD['river_data'] = _pkl2.load(_f)
     except Exception:
         pass
     _PRELOAD['deferred_done'] = True
@@ -103,12 +113,14 @@ class PlayerAgent(Agent):
         self.inference = DiscardInference(self.engine)
         self.solver = SubgameSolver(self.engine)
         self.range_solver = RangeSolver(self.engine)
+        self.depth_limited_solver = DepthLimitedSolver(self.engine, self.range_solver)
 
         self._preflop_table = self._load_preflop_table()
         self._preflop_strategy = self._load_preflop_strategy()
         # Use preloaded data from module-level (loaded before server starts).
         self._multi_street = _PRELOAD.get('multi_street')
         self._multi_street_loaded = _PRELOAD.get('done', False)
+        self._river_data = _PRELOAD.get('river_data')  # precomputed P(bet|hand)
         self._blueprints = self._load_blueprints() if self._multi_street_loaded else {}
 
         self._current_hand = -1
@@ -126,6 +138,7 @@ class PlayerAgent(Agent):
         self._last_hero_bet = 0     # track our bet size for MDF narrowing
         self._last_pot_before = 0   # pot before our bet
         self._opp_bet_at_raise = 0  # opponent's bet when we last raised (for re-raise MDF)
+        self._street_start_bet = 0  # both players' bet level at start of current street
 
         # Track opponent betting patterns per street for adaptive narrowing
         self._opp_bets_by_street = {1: 0, 2: 0, 3: 0}   # flop, turn, river
@@ -186,25 +199,6 @@ class PlayerAgent(Agent):
             'node_bet_bb': data['node_bet_bb'],
             'children_map': children_map,
         }
-
-    def _load_multi_street(self):
-        """Load multi-street backward-induction blueprint."""
-        if not _MULTI_STREET_AVAILABLE:
-            return None
-        data_dir = os.path.join(_dir, "data", "multi_street")
-        if not os.path.isdir(data_dir):
-            # Try single merged file
-            merged = os.path.join(_dir, "data", "multi_street_blueprint.npz")
-            if os.path.isfile(merged):
-                try:
-                    return MultiStreetLookup(merged, equity_engine=self.engine)
-                except Exception:
-                    return None
-            return None
-        try:
-            return MultiStreetLookup(data_dir, equity_engine=self.engine)
-        except Exception:
-            return None
 
     def _load_blueprints(self):
         """Load single-street blueprint files (fallback after multi-street)."""
@@ -307,6 +301,7 @@ class PlayerAgent(Agent):
             self._we_folded_this_hand = False
             self._narrowed_this_street = False
             self._opp_bet_at_raise = 0
+            self._street_start_bet = 0
 
     def _parse_cards(self, observation):
         my = [c for c in observation["my_cards"] if c != -1]
@@ -561,7 +556,7 @@ class PlayerAgent(Agent):
                     p_blueprint = float(p_bet_per_hand[hand_idx])
                     # P(bet|hand) = α × P_blueprint + (1-α) × f_tracked
                     p_blended = alpha * p_blueprint + (1.0 - alpha) * uniform_bet
-                    self._opp_weights[pair] *= max(p_blended, 0.10)
+                    self._opp_weights[pair] *= max(p_blended, 0.02)
                     updated = True
 
             if not updated:
@@ -577,112 +572,6 @@ class PlayerAgent(Agent):
 
         except Exception:
             return False
-
-    def _cap_range_on_check(self, board, dead_cards, street):
-        """Cap opponent range when they CHECK — downweight strong hands.
-
-        When opponent checks, they reveal they don't have a hand strong
-        enough to bet. Strong hands get reduced weight, weak hands keep
-        full weight. This is the inverse of polarized narrowing.
-
-        On flop: uses blueprint P(check|hand) = 1 - P(bet|hand) if available.
-        On turn/river: heuristic — downweight top 30% of hands by strength.
-        """
-        if self._opp_weights is None:
-            return
-
-        if street == 1 and self._multi_street is not None:
-            # Flop: Bayesian update with P(check|hand) from blueprint
-            try:
-                ms = self._multi_street
-                flop = tuple(sorted(int(c) for c in board[:3]))
-                board_id = ms._find_board(flop)
-                if board_id is None:
-                    return
-
-                bd = ms._boards[board_id]
-                if 'opp_strategies' not in bd:
-                    return
-
-                # Use pot (2,2) as default for check scenario
-                pot_idx = ms._find_pot((2, 2), bd['pot_sizes'])
-                opp_node_idx = ms._find_opp_node(2, 2, board_id, pot_idx)
-                opp_strats = bd['opp_strategies']
-
-                if pot_idx >= opp_strats.shape[0] or opp_node_idx >= opp_strats.shape[2]:
-                    return
-
-                node_strats = opp_strats[pot_idx, :, opp_node_idx, :]
-                node_acts = bd['opp_action_types'][pot_idx, opp_node_idx, :]
-
-                # Sum P(bet|hand) across all aggressive actions
-                p_bet = np.zeros(node_strats.shape[0], dtype=np.float64)
-                for a_idx in range(len(node_acts)):
-                    act = int(node_acts[a_idx])
-                    if act in (3, 4, 5, 6):  # ACT_RAISE_*
-                        p_bet += node_strats[:, a_idx].astype(np.float64) / 255.0
-
-                # P(check|hand) = 1 - P(bet|hand)
-                p_check = np.maximum(1.0 - p_bet, 0.05)
-
-                hands = bd['hands']
-                hand_map = ms._hand_maps.get(board_id, {})
-
-                for pair, weight in list(self._opp_weights.items()):
-                    if weight <= 0:
-                        continue
-                    key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
-                    hand_idx = hand_map.get(key)
-                    if hand_idx is not None and hand_idx < len(p_check):
-                        self._opp_weights[pair] *= max(p_check[hand_idx], 0.10)
-
-                total = sum(self._opp_weights.values())
-                if total > 0:
-                    for k in self._opp_weights:
-                        self._opp_weights[k] /= total
-                return
-            except Exception:
-                pass
-
-        # Turn/River: heuristic cap — downweight top 30% by hand strength
-        board_set = set(board)
-        strengths = {}
-        for pair in self._opp_weights:
-            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
-                continue
-            try:
-                if len(board) >= 5:
-                    r = self.engine.lookup_seven(list(pair) + list(board))
-                elif len(board) == 4:
-                    import itertools as _it
-                    cards_6 = list(pair) + list(board)
-                    r = min(self.engine.lookup_five(list(c))
-                            for c in _it.combinations(cards_6, 5))
-                elif len(board) >= 3:
-                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
-                else:
-                    continue
-            except Exception:
-                continue
-            strengths[pair] = r
-
-        if not strengths:
-            return
-
-        ranked = sorted(strengths.items(), key=lambda x: x[1])  # best first
-        n = len(ranked)
-        # Top 30% of hands get reduced weight (they would have bet)
-        cap_count = int(n * 0.30)
-        for i, (hand, _) in enumerate(ranked):
-            if i < cap_count:
-                # Strong hand that checked — reduce weight (wouldn't usually check)
-                self._opp_weights[hand] *= 0.30
-            # Weak/medium hands keep full weight (checking is expected)
-
-        total = sum(self._opp_weights.values())
-        if total > 0:
-            for k in self._opp_weights:
-                self._opp_weights[k] /= total
 
     def _turn_check_bayesian_narrow(self, board, street):
         """Bayesian narrowing when opponent CHECKS, using blueprint P(check|hand).
@@ -777,7 +666,7 @@ class PlayerAgent(Agent):
                     # (everyone checks, so check is less informative)
                     p_check_uniform = 1.0 - (tracked_freq if tracked_freq else blueprint_avg)
                     p_check = alpha * p_check_blueprint + (1.0 - alpha) * p_check_uniform
-                    self._opp_weights[pair] *= max(p_check, 0.10)
+                    self._opp_weights[pair] *= max(p_check, 0.02)
 
             total = sum(self._opp_weights.values())
             if total > 0:
@@ -786,116 +675,6 @@ class PlayerAgent(Agent):
 
         except Exception:
             pass
-
-    def _river_solve_narrow(self, board, dead_cards, my_bet, opp_bet):
-        """Narrow opponent range on river using solved P(bet|hand).
-
-        Solves the game from opponent's perspective via range-balanced CFR.
-        Returns exact equilibrium P(bet|hand) for each hand — board-specific,
-        range-specific, accounts for bluff ratios and range composition.
-
-        Cost: ~0.7s ARM. Replaces heuristic polarized narrowing.
-        Returns True if applied, False on failure (falls back to polarized).
-        """
-        if self._opp_weights is None:
-            return False
-
-        try:
-            import time as _time
-            t_start = _time.time()
-
-            # Build our range weighted by equity (not uniform).
-            # Hands with higher equity are more likely in our range
-            # because we bet/called with them on previous streets.
-            known = set(board) | set(dead_cards)
-            hero_range = {}
-            import itertools as _it
-            remaining = [c for c in range(27) if c not in known]
-            for h in _it.combinations(remaining, 2):
-                eq = self.engine.compute_equity(list(h), board, dead_cards)
-                hero_range[h] = max(eq, 0.1)
-
-            p_bet = self.range_solver.compute_opp_bet_probs(
-                board=board, opp_range=self._opp_weights,
-                hero_range=hero_range, dead_cards=dead_cards,
-                my_bet=my_bet, opp_bet=opp_bet, street=3,
-                min_raise=max(2, opp_bet - my_bet),
-                iterations=1000)
-
-            if p_bet is None or len(p_bet) < 3:
-                return False
-
-            # Iterative refinement: if time allows, re-solve with
-            # the narrowed range for a tighter P(bet|hand).
-            # Second pass uses updated opp weights → better answer.
-            elapsed = _time.time() - t_start
-            if elapsed < 1.5:  # leave room for the decision solve
-                # Apply first-pass narrowing temporarily
-                import copy
-                temp_weights = copy.copy(self._opp_weights)
-                self._apply_bet_narrowing(p_bet)
-
-                # Re-solve with narrowed range
-                p_bet2 = self.range_solver.compute_opp_bet_probs(
-                    board=board, opp_range=self._opp_weights,
-                    hero_range=hero_range, dead_cards=dead_cards,
-                    my_bet=my_bet, opp_bet=opp_bet, street=3,
-                    min_raise=max(2, opp_bet - my_bet),
-                    iterations=500)  # fewer iters for refinement
-
-                # Restore original weights and use refined P(bet)
-                self._opp_weights = temp_weights
-                if p_bet2 is not None and len(p_bet2) >= 3:
-                    p_bet = p_bet2
-
-            # Bayesian update: weight *= P(bet|hand)
-            # With trust blending for non-GTO opponents
-            blueprint_avg = sum(p_bet.values()) / len(p_bet)
-            obs_street = 3
-            tracked_freq = None
-            if self._opp_actions_by_street.get(obs_street, 0) > 15:
-                tracked_freq = (self._opp_bets_by_street[obs_street] /
-                                self._opp_actions_by_street[obs_street])
-
-            if tracked_freq is not None and max(tracked_freq, blueprint_avg) > 0.01:
-                alpha = max(0.1, 1.0 - abs(tracked_freq - blueprint_avg) /
-                            max(tracked_freq, blueprint_avg, 0.01))
-                uniform_bet = tracked_freq
-            else:
-                alpha = 1.0
-                uniform_bet = blueprint_avg
-
-            for pair, weight in list(self._opp_weights.items()):
-                if weight <= 0:
-                    continue
-                key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
-                p = p_bet.get(key)
-                if p is not None:
-                    p_blended = alpha * p + (1.0 - alpha) * uniform_bet
-                    self._opp_weights[pair] *= max(p_blended, 0.05)
-
-            total = sum(self._opp_weights.values())
-            if total > 0:
-                for k in self._opp_weights:
-                    self._opp_weights[k] /= total
-            return True
-
-        except Exception:
-            return False
-
-    def _apply_bet_narrowing(self, p_bet):
-        """Apply P(bet|hand) Bayesian update to opponent weights."""
-        for pair, weight in list(self._opp_weights.items()):
-            if weight <= 0:
-                continue
-            key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
-            p = p_bet.get(key)
-            if p is not None:
-                self._opp_weights[pair] *= max(p, 0.05)
-        total = sum(self._opp_weights.values())
-        if total > 0:
-            for k in self._opp_weights:
-                self._opp_weights[k] /= total
 
     def _turn_bayesian_narrow(self, board, my_bet, opp_bet):
         """Bayesian narrowing on turn using precomputed P(bet|hand).
@@ -950,7 +729,7 @@ class PlayerAgent(Agent):
                 p_blueprint = p_bet_map.get(key)
                 if p_blueprint is not None:
                     p_blended = alpha * p_blueprint + (1.0 - alpha) * uniform_bet
-                    self._opp_weights[pair] *= max(p_blended, 0.10)
+                    self._opp_weights[pair] *= max(p_blended, 0.02)
                     updated = True
 
             if not updated:
@@ -960,66 +739,6 @@ class PlayerAgent(Agent):
             if total > 0:
                 for k in self._opp_weights:
                     self._opp_weights[k] /= total
-            return True
-
-        except Exception:
-            return False
-
-    def _cfr_bayesian_narrow(self, board, dead_cards, my_bet, opp_bet, street):
-        """Narrow opponent range using real-time CFR-computed P(bet|hand).
-
-        Solves the game from opponent's perspective: for each hand in their
-        range, computes the equilibrium probability of betting. Hands that
-        would bet get full weight, hands that wouldn't get reduced weight.
-
-        This replaces heuristic polarized narrowing with game-theoretic
-        Bayesian narrowing. ~400ms per call, well within budget.
-
-        Returns True if narrowing was applied, False on failure.
-        """
-        if self._opp_weights is None:
-            return False
-
-        try:
-            # Build hero range (what opponent thinks we have)
-            # Use uniform over non-conflicting hands
-            known = set(board) | set(dead_cards)
-            hero_range = {}
-            import itertools as _it
-            remaining = [c for c in range(27) if c not in known]
-            for h in _it.combinations(remaining, 2):
-                hero_range[h] = 1.0
-
-            # Skip if ranges are too large (would be too slow)
-            n_opp = sum(1 for w in self._opp_weights.values() if w > 0.001)
-            n_hero = len(hero_range)
-            if n_opp * n_hero > 10000:
-                return False  # fall back to heuristic
-
-            p_bet = self.solver.compute_opponent_bet_probs(
-                board=board, dead_cards=dead_cards,
-                opp_range=self._opp_weights,
-                hero_range=hero_range,
-                my_bet=my_bet, opp_bet=opp_bet,
-                street=street,
-                min_raise=max(2, opp_bet - my_bet),
-                iterations=50)
-
-            if p_bet is None or len(p_bet) < 3:
-                return False
-
-            # Bayesian update: multiply each hand's weight by P(bet|hand)
-            # Floor at 0.05 to avoid zeroing out hands that deviate from GTO
-            for hand in list(self._opp_weights.keys()):
-                if hand in p_bet:
-                    self._opp_weights[hand] *= max(p_bet[hand], 0.05)
-
-            # Renormalize
-            total = sum(self._opp_weights.values())
-            if total > 0:
-                for k in self._opp_weights:
-                    self._opp_weights[k] /= total
-
             return True
 
         except Exception:
@@ -1036,7 +755,7 @@ class PlayerAgent(Agent):
             return
 
         raise_amt = opp_bet - my_bet
-        pot_before = my_bet * 2
+        pot_before = my_bet + self._street_start_bet
         if raise_amt <= 0 or pot_before <= 0:
             return
 
@@ -1100,7 +819,7 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1203,12 +922,152 @@ class PlayerAgent(Agent):
 
         for i, (hand, _) in enumerate(ranked):
             if i not in keep_indices:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
             for k in self._opp_weights:
                 self._opp_weights[k] /= total
+
+    def _bayesian_call_narrow(self, board, hero_bet, pot_before, prev_street, dead_cards=None):
+        """Bayesian narrowing when opponent CALLS our bet at street transition.
+
+        Uses P(call|hand) from the blueprint instead of crude MDF.
+        Blueprint knows board-specific calling patterns — draws call,
+        dominated hands fold, trapping hands sometimes raise.
+
+        Falls back to MDF if blueprint data unavailable.
+
+        Args:
+            board: the PREVIOUS street's board (before new card dealt)
+            hero_bet: our bet amount that opponent called
+            pot_before: pot before our bet
+            prev_street: which street the call happened on (1=flop, 2=turn)
+        """
+        if self._opp_weights is None:
+            return self._mdf_narrow_range(board, [], 1.0 / (1.0 + hero_bet / max(pot_before, 1)))
+
+        try:
+            if prev_street == 1 and self._multi_street is not None:
+                ms = self._multi_street
+                flop = tuple(sorted(int(c) for c in board[:3]))
+                board_id = ms._find_board(flop)
+                if board_id is None:
+                    return self._mdf_narrow_range(board, [], 1.0 / (1.0 + hero_bet / max(pot_before, 1)))
+
+                bd = ms._boards[board_id]
+                # Flop call: use flop opp_strategies
+                if 'opp_strategies' not in bd:
+                    return self._mdf_narrow_range(board, [], 1.0 / (1.0 + hero_bet / max(pot_before, 1)))
+
+                # The opponent faced our bet. Find the node where they face it.
+                # Our bet put us at (opp_bet_at_raise + hero_bet) vs opp_bet_at_raise
+                # From opp's view: they see hero_pot > opp_pot
+                facing_bet = self._opp_bet_at_raise  # their bet level when we raised
+                our_total = facing_bet + hero_bet  # our bet after raising
+                pot_idx = ms._find_pot((our_total, facing_bet), bd['pot_sizes'])
+
+                # Find opp node where they face our bet
+                opp_node_idx = ms._find_opp_node(facing_bet, our_total, board_id, pot_idx)
+
+                opp_strats = bd['opp_strategies']
+                opp_acts = bd['opp_action_types']
+
+                if pot_idx >= opp_strats.shape[0] or opp_node_idx >= opp_strats.shape[2]:
+                    return self._mdf_narrow_range(board, [], 1.0 / (1.0 + hero_bet / max(pot_before, 1)))
+
+                node_strats = opp_strats[pot_idx, :, opp_node_idx, :]
+                node_acts = opp_acts[pot_idx, opp_node_idx, :]
+
+                # Find the CALL action index
+                call_act_idx = None
+                for a_idx in range(len(node_acts)):
+                    if int(node_acts[a_idx]) == 2:  # ACT_CALL = 2
+                        call_act_idx = a_idx
+                        break
+
+                if call_act_idx is None:
+                    return self._mdf_narrow_range(board, [], 1.0 / (1.0 + hero_bet / max(pot_before, 1)))
+
+                p_call_per_hand = node_strats[:, call_act_idx].astype(np.float64) / 255.0
+
+                # Also include raise as "continuing" (they didn't fold)
+                # P(continue|hand) = P(call|hand) + P(raise|hand)
+                for a_idx in range(len(node_acts)):
+                    act = int(node_acts[a_idx])
+                    if act in (3, 4, 5, 6):  # ACT_RAISE_*
+                        p_call_per_hand += node_strats[:, a_idx].astype(np.float64) / 255.0
+
+                # Clamp to [0, 1]
+                p_call_per_hand = np.minimum(p_call_per_hand, 1.0)
+
+                # Apply Bayesian update
+                hand_map = ms._hand_maps.get(board_id, {})
+                updated = False
+                for pair, weight in list(self._opp_weights.items()):
+                    if weight <= 0:
+                        continue
+                    key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
+                    hand_idx = hand_map.get(key)
+                    if hand_idx is not None and hand_idx < len(p_call_per_hand):
+                        p_cont = float(p_call_per_hand[hand_idx])
+                        self._opp_weights[pair] *= max(p_cont, 0.02)
+                        updated = True
+
+                if updated:
+                    total = sum(self._opp_weights.values())
+                    if total > 0:
+                        for k in self._opp_weights:
+                            self._opp_weights[k] /= total
+                    return
+
+            if prev_street == 2:
+                # Turn→River: runtime solve P(continue|hand) at facing-bet node.
+                # Uses compute_opp_call_probs which builds the correct tree
+                # (opponent faces our bet, decides fold/call/raise).
+                import itertools as _it3
+                _dead = dead_cards or []
+                _known = set(board) | set(_dead)
+                _hero_range = {}
+                for _h in _it3.combinations(range(27), 2):
+                    if not (set(_h) & _known):
+                        _hero_range[_h] = 1.0
+                _hr_total = sum(_hero_range.values())
+                for _k in _hero_range:
+                    _hero_range[_k] /= _hr_total
+
+                facing_bet = self._opp_bet_at_raise
+                our_total = facing_bet + hero_bet
+                _p_cont = self.range_solver.compute_opp_call_probs(
+                    board=board, opp_range=self._opp_weights,
+                    hero_range=_hero_range, dead_cards=_dead,
+                    hero_bet=our_total, opp_bet_before=facing_bet,
+                    street=2, min_raise=2, iterations=200)
+
+                if _p_cont and len(_p_cont) >= 3:
+                    updated = False
+                    for _pair, _w in list(self._opp_weights.items()):
+                        if _w <= 0:
+                            continue
+                        _key = (min(_pair[0], _pair[1]), max(_pair[0], _pair[1]))
+                        _p = _p_cont.get(_key)
+                        if _p is not None:
+                            self._opp_weights[_pair] *= max(float(_p), 0.02)
+                            updated = True
+                    if updated:
+                        total = sum(self._opp_weights.values())
+                        if total > 0:
+                            for k in self._opp_weights:
+                                self._opp_weights[k] /= total
+                        return
+
+            # Fallback: MDF
+            mdf = 1.0 / (1.0 + hero_bet / max(pot_before, 1))
+            self._mdf_narrow_range(board, [], mdf)
+
+        except Exception:
+            mdf = 1.0 / (1.0 + hero_bet / max(pot_before, 1))
+            self._mdf_narrow_range(board, [], mdf)
 
     def _mdf_narrow_range(self, board, dead_cards, keep_fraction):
         """Narrow opponent range by keeping top X% of hands.
@@ -1248,7 +1107,7 @@ class PlayerAgent(Agent):
         cutoff = int(len(ranked) * keep_fraction)
         if cutoff < len(ranked):
             for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.05
+                self._opp_weights[hand] *= 0.02
 
         total = sum(self._opp_weights.values())
         if total > 0:
@@ -1270,7 +1129,7 @@ class PlayerAgent(Agent):
             return
 
         raise_amt = opp_bet - my_bet
-        pot_before = my_bet * 2
+        pot_before = my_bet + self._street_start_bet
         if raise_amt <= 0 or pot_before <= 0:
             return
 
@@ -1313,57 +1172,9 @@ class PlayerAgent(Agent):
             position = i / n  # 0.0 = strongest, 1.0 = weakest
             # Weight multiplier: strong hands → 1.0, weak hands → (1 - strength)
             multiplier = 1.0 - strength * position
-            self._opp_weights[hand] *= max(multiplier, 0.1)  # floor at 10%
+            self._opp_weights[hand] *= max(multiplier, 0.02)  # 2% floor
 
         # Renormalize
-        total = sum(self._opp_weights.values())
-        if total > 0:
-            for k in self._opp_weights:
-                self._opp_weights[k] /= total
-
-    def _narrow_range_by_bet(self, my_bet, opp_bet, board, dead_cards):
-        """Narrow opponent range based on bet-to-pot ratio."""
-        if self._opp_weights is None:
-            return
-        raise_amt = opp_bet - my_bet
-        pot_before = my_bet * 2
-        if raise_amt <= 0 or pot_before <= 0:
-            return
-
-        ratio = raise_amt / max(pot_before, 1)
-        if ratio <= 0.5:
-            keep = 0.85
-        elif ratio <= 1.0:
-            keep = 0.70
-        elif ratio <= 3.0:
-            keep = 0.50
-        else:
-            keep = 0.30
-
-        board_set = set(board)
-        strengths = {}
-        for pair in self._opp_weights:
-            if self._opp_weights[pair] <= 0 or set(pair) & board_set:
-                continue
-            try:
-                if len(board) >= 5:
-                    r = self.engine.lookup_seven(list(pair) + list(board))
-                elif len(board) >= 3:
-                    r = self.engine.lookup_five(list(pair) + list(board[:3]))
-                else:
-                    r = 999999
-            except Exception:
-                r = 999999
-            strengths[pair] = r
-
-        if not strengths:
-            return
-        ranked = sorted(strengths.items(), key=lambda x: x[1])
-        cutoff = int(len(ranked) * keep)
-        if cutoff < len(ranked):
-            for hand, _ in ranked[cutoff:]:
-                self._opp_weights[hand] *= 0.05
-
         total = sum(self._opp_weights.values())
         if total > 0:
             for k in self._opp_weights:
@@ -1393,15 +1204,15 @@ class PlayerAgent(Agent):
         if street != self._current_street:
             # New street — opponent continued (didn't fold)
             if self._current_street >= 1 and self._opp_weights is not None:
-                # MDF-based narrowing: use our last bet size to compute
-                # how tight the opponent's calling range should be.
+                # Bayesian call narrowing: use P(call|hand) from blueprint
+                # instead of crude MDF. Blueprint knows draws, traps, etc.
                 # Use PREVIOUS street's board (what opponent saw when deciding
                 # to call). Current board already has the new card dealt.
                 prev_board = board[:len(board) - 1] if len(board) > 3 else board
                 if self._last_hero_bet > 0 and self._last_pot_before > 0:
-                    bet_frac = self._last_hero_bet / self._last_pot_before
-                    mdf = 1.0 / (1.0 + bet_frac)  # game theory MDF
-                    self._mdf_narrow_range(prev_board, dead, mdf)
+                    self._bayesian_call_narrow(
+                        prev_board, self._last_hero_bet,
+                        self._last_pot_before, self._current_street, dead)
                 # else: check-check — both showed weakness, range stays wide.
                 # Don't narrow: opponent chose not to bet strong hands.
             self._current_street = street
@@ -1410,6 +1221,7 @@ class PlayerAgent(Agent):
             self._last_hero_bet = 0
             self._last_pot_before = 0
             self._opp_bet_at_raise = 0
+            self._street_start_bet = my_bet  # both bets equal at street start
 
         # Determine hero's position from cached blind_pos (detected at preflop)
         blind_pos = self._blind_pos
@@ -1438,10 +1250,12 @@ class PlayerAgent(Agent):
                     if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
                         self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
-                    # River + fallback: polarized narrowing with per-street tracking.
-                    # River solve-narrow was too aggressive — made us bet 34-48%
-                    # on river (was 16-25% at 55% WR). Reverted to polarized.
-                    self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                    # River: no pre-narrowing needed. The range solver in
+                    # solve_and_act already models opponent's betting behavior
+                    # within its equilibrium computation. Pre-narrowing here
+                    # would double-count the "opponent bet" information,
+                    # over-narrowing toward value and making us fold too much.
+                    pass
             elif opp_bet == my_bet and not hero_is_first and street in (1, 2):
                 # Opponent CHECKED: Bayesian update with P(check|hand) from
                 # blueprint. Board-specific — accounts for slow-playing
@@ -1456,7 +1270,11 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
-        # 1. Flop: multi-street blueprint (backward induction)
+        # 1. Flop: multi-street blueprint for ALL decisions.
+        #    Blueprint uses backward induction (river→turn→flop) with
+        #    continuation values — accounts for future street betting.
+        #    Runtime solver only sees current-street equity (no future streets)
+        #    which caused turn to regress from +6.4 to 0.0/hand.
         if street == 1 and self._multi_street is not None:
             try:
                 strat = self._multi_street.get_strategy(
@@ -1464,8 +1282,23 @@ class PlayerAgent(Agent):
                     hero_position=hero_position)
                 action = self._try_strategy(strat, observation)
                 if action is not None:
+                    # Equity gate: blueprint was solved against uniform range.
+                    # If it says CALL but our equity vs the NARROWED range
+                    # is below pot odds, override to FOLD. This catches
+                    # overcalls against value-heavy opponents that the
+                    # blueprint can't detect.
+                    if (action[0] == CALL and self._opp_weights is not None
+                            and opp_bet > my_bet):
+                        continue_cost = opp_bet - my_bet
+                        pot = my_bet + opp_bet
+                        pot_odds = continue_cost / (continue_cost + pot)
+                        eq = self.engine.compute_equity(
+                            my_cards, board, dead, self._opp_weights)
+                        if eq < pot_odds:
+                            self._we_folded_this_hand = True
+                            return (FOLD, 0, 0, 0)
+
                     self._path_counts['ms_flop'] += 1
-                    # Track our bet for MDF narrowing on next street
                     if action[0] == RAISE:
                         self._last_hero_bet = action[1]
                         self._last_pot_before = pot_state[0] + pot_state[1]
@@ -1474,13 +1307,38 @@ class PlayerAgent(Agent):
             except Exception:
                 pass
 
-        # 2. Turn: blueprint lookup (depth-limited solving reverted —
-        #    75-iter river continuation values had ~65 chip error bound,
-        #    causing overcalling that lost every match at v10).
+        # 2. Turn: blueprint for ALL decisions.
+        #    Same reason as flop: backward induction accounts for river
+        #    continuation values. Runtime solver regressed turn from +6.4 to 0.0/hand.
         if street == 2:
             self._path_counts['ms_turn'] += 1
 
-            # Blueprint lookup
+            facing_bet = opp_bet > my_bet
+
+            # Facing a bet: depth-limited solver (narrowed range + continuation values)
+            # v32 architecture (70% WR). The solver accounts for the narrowed
+            # opponent range that the blueprint ignores.
+            if facing_bet and time_left > 100 and self._opp_weights is not None:
+                self._path_counts['range_solver'] += 1
+                result = self.depth_limited_solver.solve_turn_facing_bet(
+                    hero_cards=my_cards, board=board,
+                    opp_range=self._opp_weights, dead_cards=dead,
+                    my_bet=my_bet, opp_bet=opp_bet,
+                    min_raise=observation["min_raise"],
+                    max_raise=observation["max_raise"],
+                    valid_actions=valid, time_remaining=time_left,
+                    hero_position=hero_position)
+                if result is not None:
+                    if result[0] == RAISE:
+                        self._raised_this_street = True
+                        self._streets_raised += 1
+                        self._last_hero_bet = result[1]
+                        self._last_pot_before = pot_state[0] + pot_state[1]
+                        self._opp_bet_at_raise = opp_bet
+                    return result
+
+            # Acting first or fallback: blueprint (backward induction, multi-street)
+            # Adding acting-first solver regressed from 70% to 33% (v33/v34).
             if self._multi_street is not None:
                 try:
                     strat = self._multi_street.get_turn_strategy(
@@ -1488,6 +1346,19 @@ class PlayerAgent(Agent):
                         hero_position=hero_position)
                     action = self._try_strategy(strat, observation)
                     if action is not None:
+                        # Equity gate (same as flop): veto blueprint calls
+                        # that are bad against the narrowed range
+                        if (action[0] == CALL and self._opp_weights is not None
+                                and opp_bet > my_bet):
+                            continue_cost = opp_bet - my_bet
+                            pot = my_bet + opp_bet
+                            pot_odds = continue_cost / (continue_cost + pot)
+                            eq = self.engine.compute_equity(
+                                my_cards, board, dead, self._opp_weights)
+                            if eq < pot_odds:
+                                self._we_folded_this_hand = True
+                                return (FOLD, 0, 0, 0)
+
                         if action[0] == RAISE:
                             self._raised_this_street = True
                             self._streets_raised += 1
@@ -1498,52 +1369,70 @@ class PlayerAgent(Agent):
                 except Exception:
                     pass
 
-            # Fallback 2: equity thresholds + exploit layer
+            # Fallback: equity thresholds
             result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
-            if (result[0] == CHECK and valid[RAISE] and
-                    opp_bet == my_bet):
-                result = self._maybe_exploit_bluff(
-                    result, my_cards, board, dead, observation, street)
             return result
 
-        # 3. River: equity thresholds acting first + range solver facing bets
-        #    Range solver can't find correct acting-first frequency:
-        #      compact tree (no re-raise) → 49% (too aggressive)
-        #      medium/full tree (re-raise) → 11-13% (too passive)
-        #    Equity thresholds land at 20-25% — closest to GTO (17%).
-        #    Range solver is correct for facing bets (coordinated call/fold).
+        # 3. River: full-tree range solver for BOTH acting first and facing bets.
+        #    When facing a bet, apply polarized narrowing first:
+        #    opponent's betting range = top 30% (value) + bottom 10% (bluffs),
+        #    middle hands downweighted. This is NOT double-counting — the
+        #    solver tree starts after the bet decision (fold/call/raise),
+        #    so narrowing for "opponent bet" provides new information.
+        #    Tested: +552 chips over no-narrow across 80 match decisions.
         if street == 3:
-            facing_bet = opp_bet > my_bet
-
-            if facing_bet and time_left > 50 and self._opp_weights is not None:
+            if time_left > 50 and self._opp_weights is not None:
                 self._path_counts['range_solver'] += 1
+
+                # Polarized bet-narrowing for facing bets
+                solve_range = self._opp_weights
+                if opp_bet > my_bet:
+                    board_set = set(board)
+                    hand_strengths = []
+                    for oh, w in self._opp_weights.items():
+                        if w > 0.001 and not (set(oh) & board_set):
+                            try:
+                                rank = self.engine.lookup_seven(
+                                    list(oh) + list(board))
+                                hand_strengths.append((oh, w, rank))
+                            except Exception:
+                                pass
+
+                    if hand_strengths:
+                        hand_strengths.sort(key=lambda x: x[2])
+                        n = len(hand_strengths)
+                        narrowed = {}
+                        for i, (oh, w, r) in enumerate(hand_strengths):
+                            if i < n * 0.30 or i >= n * 0.90:
+                                narrowed[oh] = w
+                            else:
+                                narrowed[oh] = w * 0.15
+                        total_w = sum(narrowed.values())
+                        if total_w > 0:
+                            solve_range = {k: v / total_w
+                                           for k, v in narrowed.items()}
+
                 result = self.range_solver.solve_and_act(
                     hero_cards=my_cards, board=board,
-                    opp_range=self._opp_weights, dead_cards=dead,
+                    opp_range=solve_range, dead_cards=dead,
                     my_bet=my_bet, opp_bet=opp_bet, street=street,
                     min_raise=observation["min_raise"],
                     max_raise=observation["max_raise"],
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
-                    # Opponent profiling: if they don't bluff enough,
-                    # fold even when solver says call.
-                    # Derived: need P(bluff) ≥ pot_odds to justify calling.
-                    if result[0] == CALL and self._opp_bet_showdown_total > 10:
-                        opp_bluff_rate = 1.0 - (self._opp_bet_showdown_wins /
-                                                 self._opp_bet_showdown_total)
-                        pot_odds_here = (opp_bet - my_bet) / (my_bet + opp_bet)
-                        if opp_bluff_rate < pot_odds_here * 0.8:
-                            # They don't bluff enough to justify calling
-                            result = (FOLD, 0, 0, 0)
+                    # Track raise for re-raise narrowing and pot control
+                    if result[0] == RAISE:
+                        self._raised_this_street = True
+                        self._streets_raised += 1
+                        self._last_hero_bet = result[1]
+                        self._last_pot_before = my_bet + opp_bet
+                        self._opp_bet_at_raise = opp_bet
                     return result
 
-            # Acting first or fallback: equity thresholds + exploit layer
+            # Fallback: equity thresholds if range solver fails or time is low
             result = self._equity_threshold_play(
                 my_cards, board, dead, observation, valid, street)
-            if (result[0] == CHECK and valid[RAISE] and opp_bet == my_bet):
-                result = self._maybe_exploit_bluff(
-                    result, my_cards, board, dead, observation, street)
             return result
 
         # 4. Flop fallback: equity thresholds (if blueprint missed)
@@ -1563,60 +1452,6 @@ class PlayerAgent(Agent):
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
         return (FOLD, 0, 0, 0)
-
-    def _equity_threshold_play(self, my_cards, board, dead, observation, valid, street):
-        """Equity thresholds + pot control for turn and river.
-
-        Simple, consistent, no solver convergence issues.
-        Proven to beat the complex solver approach by +3464 chips in self-play.
-        """
-        import random as _random
-
-    def _maybe_exploit_bluff(self, default_result, my_cards, board, dead,
-                              observation, street):
-        """Override CHECK with a bluff if opponent over-folds.
-
-        If opponent folds > 50% to our bets on this street (tracked),
-        any bluff is +EV. Bluff with weak hands (equity < 0.30).
-        Only fires after 20+ observations to avoid noise.
-        """
-        import random as _random
-
-        obs_street = street
-        faces = self._opp_faces_bet.get(obs_street, 0)
-        if faces < 20:
-            return default_result
-
-        fold_rate = self._opp_folds_to_bet[obs_street] / faces
-        if fold_rate <= 0.50:
-            return default_result  # defending correctly, don't bluff extra
-
-        # Respect pot control — don't bluff on 3rd+ street of aggression
-        if self._streets_raised >= 2:
-            return default_result
-
-        # Only bluff with weak hands (strong hands should value bet,
-        # which the solver/thresholds already handle)
-        equity = self.engine.compute_equity(my_cards, board, dead, self._opp_weights)
-        if equity > 0.30:
-            return default_result  # not a bluff candidate
-
-        # Bluff frequency scales with how much they over-fold
-        # fold_rate=60%: bluff 30% of weak hands
-        # fold_rate=80%: bluff 70% of weak hands
-        bluff_prob = min(1.0, (fold_rate - 0.50) * 3.0)
-        if _random.random() >= bluff_prob:
-            return default_result
-
-        min_raise = observation["min_raise"]
-        max_raise = observation["max_raise"]
-        pot = observation["my_bet"] + observation["opp_bet"]
-        amt = max(int(pot * 0.6), min_raise)
-        amt = min(amt, max_raise)
-
-        if observation["valid_actions"][RAISE]:
-            return (RAISE, amt, 0, 0)
-        return default_result
 
     def _equity_threshold_play(self, my_cards, board, dead, observation, valid, street):
         """Equity thresholds + pot control for turn and river.
@@ -1655,17 +1490,8 @@ class PlayerAgent(Agent):
         # Pot control: can only raise on 2 streets max unless near-nuts
         can_raise = self._streets_raised < 2 or bet_eq > 0.92
 
-        # Bankroll-aware thresholds: when ahead, require more equity to bet.
-        # When behind, bet with less equity (seek variance).
-        rf = getattr(self, '_risk_factor', 1.0)
-        # rf=0.6 (ahead): thresholds go UP (0.92→0.95, 0.82→0.88, 0.72→0.80)
-        # rf=1.4 (behind): thresholds go DOWN (0.92→0.88, 0.82→0.75, 0.72→0.63)
-        thresh_nuts = min(0.98, 0.92 + (1.0 - rf) * 0.08)
-        thresh_strong = min(0.95, 0.82 + (1.0 - rf) * 0.15)
-        thresh_medium = min(0.90, 0.72 + (1.0 - rf) * 0.20)
-
         # All-in with near-nuts (vs calling range)
-        if bet_eq > thresh_nuts and valid[RAISE]:
+        if bet_eq > 0.92 and valid[RAISE]:
             self._raised_this_street = True
             self._streets_raised += 1
             self._last_hero_bet = max_raise
@@ -1674,7 +1500,7 @@ class PlayerAgent(Agent):
             return (RAISE, max_raise, 0, 0)
 
         # Strong value raise (vs calling range)
-        if bet_eq > thresh_strong and valid[RAISE] and can_raise:
+        if bet_eq > 0.82 and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.65), min_raise)
@@ -1685,7 +1511,7 @@ class PlayerAgent(Agent):
             return (RAISE, amt, 0, 0)
 
         # Medium value raise (vs calling range)
-        if bet_eq > thresh_medium and valid[RAISE] and can_raise:
+        if bet_eq > 0.72 and valid[RAISE] and can_raise:
             self._raised_this_street = True
             self._streets_raised += 1
             amt = max(int(pot * 0.4), min_raise)
@@ -1713,27 +1539,14 @@ class PlayerAgent(Agent):
             if street_bluff_scale > 0:
                 bet_size = max(int(pot * 0.6), min_raise)
                 bluff_freq = bet_size / (bet_size + pot) if pot > 0 else 0.1
-                # When ahead: bluff less (protect lead). Behind: bluff more.
-                bluff_freq *= rf
                 if _random.random() < bluff_freq * street_bluff_scale:
                     self._raised_this_street = True
                     self._streets_raised += 1
                     self._opp_bet_at_raise = opp_bet
                     return (RAISE, min(bet_size, max_raise), 0, 0)
 
-        # Call if equity justifies.
-        # Derived: call when P(opponent bluffing) ≥ pot_odds.
-        # P(bluff) = 1 - opp_showdown_wr. If opp wins 80% at showdown
-        # when betting, they bluff 20%. Pot-sized bet needs 33% → fold.
-        call_threshold = pot_odds + (1.0 - rf) * 0.05  # bankroll adjustment
-        if self._opp_bet_showdown_total > 10:
-            opp_bluff_rate = 1.0 - (self._opp_bet_showdown_wins /
-                                     self._opp_bet_showdown_total)
-            # Need: equity ≥ pot_odds AND opp_bluff_rate ≥ pot_odds
-            # If opponent doesn't bluff enough, folding is correct regardless of equity
-            if opp_bluff_rate < pot_odds * 0.8:  # 80% of needed bluff rate
-                call_threshold = max(call_threshold, 1.0 - opp_bluff_rate)
-        if valid[CALL] and equity >= call_threshold:
+        # Call if equity justifies (against polarized-narrowed range)
+        if valid[CALL] and equity >= pot_odds:
             return (CALL, 0, 0, 0)
 
         # Check
@@ -1741,142 +1554,6 @@ class PlayerAgent(Agent):
             return (CHECK, 0, 0, 0)
 
         return (FOLD, 0, 0, 0)
-
-    def _solve_turn_with_river(self, my_cards, board, dead, my_bet, opp_bet,
-                               observation, valid, hero_is_first, time_left):
-        """Solve turn with backward induction from river sub-games.
-
-        For each possible river card, solve the river betting game to get
-        correct continuation values. This accounts for river betting —
-        weak hands get lower EV (face bets, fold), strong hands get higher
-        EV (value bet, get called).
-        """
-        from game_tree import GameTree, TERM_NONE, TERM_FOLD_HERO, TERM_FOLD_OPP, TERM_SHOWDOWN
-
-        if self._opp_weights is None:
-            return self._solve_street(
-                my_cards, board, dead, my_bet, opp_bet, 2,
-                observation, valid, hero_is_first, time_left)
-
-        known = set(my_cards) | set(board) | set(dead)
-        opp_hands = []
-        opp_weights_list = []
-        for hand, weight in self._opp_weights.items():
-            if weight > 0.001 and not (set(hand) & known):
-                opp_hands.append(hand)
-                opp_weights_list.append(weight)
-
-        if not opp_hands:
-            return self._solve_street(
-                my_cards, board, dead, my_bet, opp_bet, 2,
-                observation, valid, hero_is_first, time_left)
-
-        opp_w = np.array(opp_weights_list, dtype=np.float64)
-        opp_w /= opp_w.sum()
-        n_opp = len(opp_hands)
-
-        # Build river tree (cached by pot)
-        river_tree = self.solver._get_tree(my_bet, opp_bet, 2, 100, hero_is_first)
-
-        # Set up CFR arrays for river tree
-        hero_idx = {nid: i for i, nid in enumerate(river_tree.hero_node_ids)}
-        opp_idx = {nid: i for i, nid in enumerate(river_tree.opp_node_ids)}
-        max_act = max(
-            max((river_tree.num_actions[nid] for nid in river_tree.hero_node_ids), default=1),
-            max((river_tree.num_actions[nid] for nid in river_tree.opp_node_ids), default=1), 1)
-        n_hero_r = len(river_tree.hero_node_ids)
-        n_opp_r = len(river_tree.opp_node_ids)
-
-        # Solve each river card
-        remaining = [c for c in range(27) if c not in known]
-        river_cards = [c for c in remaining if c not in my_cards]
-        river_ev_sum = np.zeros(n_opp, dtype=np.float64)
-        n_river = 0
-
-        for rc in river_cards:
-            board_5 = list(board) + [rc]
-
-            # Compute river equity (deterministic)
-            hero_rank = self.engine.lookup_seven(list(my_cards) + board_5)
-            equity_vec = np.zeros(n_opp, dtype=np.float64)
-            for i, oh in enumerate(opp_hands):
-                if rc in oh:
-                    continue
-                opp_rank = self.engine.lookup_seven(list(oh) + board_5)
-                if hero_rank < opp_rank:
-                    equity_vec[i] = 1.0
-                elif hero_rank == opp_rank:
-                    equity_vec[i] = 0.5
-
-            # Build terminal values
-            tv = {}
-            for nid in river_tree.terminal_node_ids:
-                tt = river_tree.terminal[nid]
-                hp, op = river_tree.hero_pot[nid], river_tree.opp_pot[nid]
-                if tt == TERM_FOLD_HERO:
-                    tv[nid] = np.full(n_opp, -hp, dtype=np.float64)
-                elif tt == TERM_FOLD_OPP:
-                    tv[nid] = np.full(n_opp, op, dtype=np.float64)
-                elif tt == TERM_SHOWDOWN:
-                    pot_won = min(hp, op)
-                    tv[nid] = (2.0 * equity_vec - 1.0) * pot_won
-
-            # Run 75 CFR iterations for each river card — decent convergence
-            # while staying under 5s per-action ARM limit.
-            hero_reg = np.zeros((n_hero_r, max_act), dtype=np.float64)
-            hero_ss = np.zeros((n_hero_r, max_act), dtype=np.float64)
-            opp_reg = np.zeros((n_opp_r, n_opp, max_act), dtype=np.float64)
-
-            root_val = None
-            for t in range(75):
-                root_val = self.solver._cfr_traverse(
-                    river_tree, 0, 1.0, opp_w,
-                    hero_reg, hero_ss, opp_reg,
-                    hero_idx, opp_idx, tv, n_opp, max_act, t)
-
-            river_ev_sum += root_val
-            n_river += 1
-
-        # Average → turn continuation values
-        continuation_ev = river_ev_sum / max(n_river, 1)
-
-        # Solve turn with continuation values at showdown terminals
-        turn_tree = self.solver._get_tree(my_bet, opp_bet, 2, 100, hero_is_first)
-
-        # Find reference pot (check-check = min showdown pot)
-        sd_pots = [turn_tree.hero_pot[nid] + turn_tree.opp_pot[nid]
-                   for nid in turn_tree.terminal_node_ids
-                   if turn_tree.terminal[nid] == TERM_SHOWDOWN]
-        ref_pot = min(sd_pots) if sd_pots else (my_bet + opp_bet)
-
-        turn_tv = {}
-        for nid in turn_tree.terminal_node_ids:
-            tt = turn_tree.terminal[nid]
-            hp, op = turn_tree.hero_pot[nid], turn_tree.opp_pot[nid]
-            if tt == TERM_FOLD_HERO:
-                turn_tv[nid] = np.full(n_opp, -hp, dtype=np.float64)
-            elif tt == TERM_FOLD_OPP:
-                turn_tv[nid] = np.full(n_opp, op, dtype=np.float64)
-            elif tt == TERM_SHOWDOWN:
-                actual_pot = hp + op
-                scale = actual_pot / ref_pot if ref_pot > 0 else 1.0
-                turn_tv[nid] = continuation_ev * scale
-
-        # Determine iterations based on time
-        if time_left > 800:
-            turn_iters = 400
-        elif time_left > 500:
-            turn_iters = 200
-        else:
-            turn_iters = 100
-
-        turn_strategy = self.solver._run_cfr(
-            turn_tree, opp_w, turn_tv, n_opp, turn_iters)
-
-        return self.solver._strategy_to_action(
-            turn_tree, turn_strategy, my_bet, opp_bet,
-            observation["min_raise"], observation["max_raise"],
-            valid)
 
     def _solve_street(self, my_cards, board, dead, my_bet, opp_bet,
                       street, observation, valid, hero_is_first, time_left):
@@ -1920,31 +1597,20 @@ class PlayerAgent(Agent):
         if not self._multi_street_loaded and _PRELOAD.get('done'):
             self._multi_street = _PRELOAD.get('multi_street')
             self._multi_street_loaded = True
+        if self._river_data is None and _PRELOAD.get('river_data') is not None:
+            self._river_data = _PRELOAD['river_data']
 
         # Turn data loaded lazily per-board — no stalling needed.
 
-        # Bankroll-aware: only CONSERVATIVE when ahead. Never more aggressive.
-        # Being behind and playing aggressive creates death spiral:
-        # lower thresholds → bet weak hands → lose more → lower thresholds.
-        hands_remaining = self._total_hands - hand_number
-        if hands_remaining > 10:
-            sigma_per_hand = 20.0
-            z_score = self._bankroll / (sigma_per_hand * (hands_remaining ** 0.5))
-            if z_score > 2.0:
-                self._risk_factor = 0.7  # way ahead: conserve
-            elif z_score > 1.0:
-                self._risk_factor = 0.85  # ahead: slightly conservative
-            else:
-                self._risk_factor = 1.0  # even or behind: standard GTO
-        else:
-            self._risk_factor = 1.0
 
-        # Lead protection — mathematically guaranteed win.
-        # If we fold every remaining hand, we lose 1.5 chips/hand (avg of SB+BB).
-        # Auto-fold when bankroll > max possible blind loss + 1 chip margin.
+
+
+        # Lead protection — if we can survive on blinds alone, fold everything
+        # Binary ELO: winning by 1 chip = winning by 1000. Protect guaranteed wins.
+        actual_bankroll = self._bankroll
         hands_remaining = self._total_hands - hand_number
         blind_cost = hands_remaining * 1.5
-        if hands_remaining > 0 and self._bankroll > blind_cost + 1:
+        if actual_bankroll > blind_cost + 10:
             valid = observation["valid_actions"]
             if valid[CHECK]:
                 return (CHECK, 0, 0, 0)
