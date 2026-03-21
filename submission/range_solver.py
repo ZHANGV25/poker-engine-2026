@@ -405,12 +405,261 @@ class RangeSolver:
 
         return values
 
+    def _build_locked_strategy(self, tree, opp_hands, opp_weights,
+                                equity_matrix, not_blocked):
+        """Build equity-proportional locked strategy for all opponent nodes.
+
+        For each opponent decision node, assigns a fixed strategy based on
+        hand strength (equity). This models the opponent playing their
+        narrowed range "honestly" -- strong hands bet/raise, weak hands
+        check/fold.
+
+        At check-or-bet nodes (opp_bet == hero_bet):
+            - P(check) = 1 - equity, P(bet) = equity (split across bet sizes)
+            - Strong hands bet more, weak hands check more
+
+        At facing-bet nodes (hero_bet > opp_bet):
+            - P(fold) = 1 - equity, P(call) proportional to equity,
+              P(raise) for top hands
+            - Weak hands fold, medium call, strong raise
+
+        The equity used is each opponent hand's equity vs the hero range
+        (approximated from the equity_matrix, weighted by hero reach).
+
+        Args:
+            tree: GameTree
+            opp_hands: list of opponent hand tuples
+            opp_weights: np.array of opponent range weights
+            equity_matrix: (n_hero, n_opp) equity matrix
+            not_blocked: (n_hero, n_opp) card-blocking mask
+
+        Returns:
+            dict {opp_node_id: np.array (n_opp, max_act)} of fixed strategies
+        """
+        n_opp = len(opp_hands)
+        n_hero = equity_matrix.shape[0]
+
+        # Compute each opponent hand's equity vs the hero range.
+        # opp_equity[o] = E[equity of opp hand o vs random hero hand]
+        # Note: equity_matrix is hero's equity, so opp equity = 1 - hero equity.
+        hero_reach = np.ones(n_hero, dtype=np.float64) / n_hero
+        opp_equity = np.zeros(n_opp, dtype=np.float64)
+        for o in range(n_opp):
+            valid_w = hero_reach * not_blocked[:, o]
+            vw_sum = valid_w.sum()
+            if vw_sum > 0:
+                # Opponent's equity = 1 - hero's equity
+                opp_equity[o] = 1.0 - float(
+                    np.dot(equity_matrix[:, o], valid_w) / vw_sum)
+            else:
+                opp_equity[o] = 0.5
+
+        locked = {}
+
+        for node_id in tree.opp_node_ids:
+            n_act = tree.num_actions[node_id]
+            children = tree.children[node_id]
+            strat = np.zeros((n_opp, n_act), dtype=np.float64)
+
+            # Determine node type from available actions
+            hero_pot = tree.hero_pot[node_id]
+            opp_pot = tree.opp_pot[node_id]
+            facing_bet = (hero_pot > opp_pot)  # hero bet more, opp faces it
+
+            if facing_bet:
+                # Opponent faces hero's bet: fold/call/raise
+                fold_idx = None
+                call_idx = None
+                raise_indices = []
+                for ai, (act_type, _) in enumerate(children):
+                    if act_type == ACT_FOLD:
+                        fold_idx = ai
+                    elif act_type == ACT_CALL:
+                        call_idx = ai
+                    elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT,
+                                      ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
+                        raise_indices.append(ai)
+
+                for o in range(n_opp):
+                    eq = opp_equity[o]
+                    # Fold with probability proportional to weakness
+                    # Call with medium hands, raise with strong
+                    if fold_idx is not None:
+                        strat[o, fold_idx] = max(0.0, 1.0 - eq * 1.5)
+                    if call_idx is not None:
+                        strat[o, call_idx] = min(eq * 1.2, 1.0)
+                    if raise_indices:
+                        # Only very strong hands raise
+                        raise_prob = max(0.0, eq - 0.7) * 2.0
+                        per_raise = raise_prob / len(raise_indices)
+                        for ri in raise_indices:
+                            strat[o, ri] = per_raise
+
+            else:
+                # Opponent checks or bets (equal bets = check/bet node)
+                check_idx = None
+                bet_indices = []
+                for ai, (act_type, _) in enumerate(children):
+                    if act_type == ACT_CHECK:
+                        check_idx = ai
+                    elif act_type in (ACT_RAISE_HALF, ACT_RAISE_POT,
+                                      ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
+                        bet_indices.append(ai)
+
+                for o in range(n_opp):
+                    eq = opp_equity[o]
+                    # Check/bet proportional to equity
+                    if check_idx is not None:
+                        strat[o, check_idx] = max(0.05, 1.0 - eq)
+                    if bet_indices:
+                        # Bet probability scales with equity
+                        bet_prob = max(0.0, eq - 0.3) * 1.2
+                        bet_prob = min(bet_prob, 0.9)
+                        per_bet = bet_prob / len(bet_indices)
+                        for bi in bet_indices:
+                            strat[o, bi] = per_bet
+
+            # Normalize each hand's strategy to sum to 1
+            row_sums = strat.sum(axis=1, keepdims=True)
+            strat = np.where(row_sums > 0,
+                             strat / np.maximum(row_sums, 1e-10),
+                             np.full_like(strat, 1.0 / n_act))
+
+            locked[node_id] = strat
+
+        return locked
+
+    def solve_and_act_locked(self, hero_cards, board, opp_range, dead_cards,
+                              my_bet, opp_bet, street, min_raise, max_raise,
+                              valid_actions, time_remaining):
+        """Node-locked re-solve: best response against opponent's narrowed range.
+
+        Like solve_and_act, but locks the opponent's strategy to be
+        equity-proportional (strong hands bet, weak fold). This is
+        exploitative, not Nash equilibrium, and directly incorporates
+        the narrowed range into acting-first decisions.
+
+        Use this when:
+        - We have a meaningful opponent range narrowing (from discard inference)
+        - We are acting first (where the standard solver/blueprint doesn't
+          account for the narrowed range)
+        - The opponent's range is significantly narrowed from uniform
+
+        Falls back to standard solve_and_act if range is too uniform.
+        """
+        if opp_range is None:
+            return None
+
+        known = set(board) | set(dead_cards)
+        hero_hands = []
+        opp_hands = []
+        opp_weights = []
+
+        for hand, weight in opp_range.items():
+            if weight > 0.001 and not (set(hand) & known):
+                opp_hands.append(hand)
+                opp_weights.append(weight)
+
+        if not opp_hands:
+            return None
+
+        opp_weights_arr = np.array(opp_weights, dtype=np.float64)
+        opp_weights_arr /= opp_weights_arr.sum()
+
+        # Check if range is meaningfully narrowed.
+        # Entropy-based: if the range is close to uniform, node locking
+        # won't help (best response to uniform = Nash).
+        n_opp_live = len(opp_hands)
+        if n_opp_live < 5:
+            return None
+
+        # Normalized entropy: 1.0 = uniform, 0.0 = fully concentrated
+        entropy = -np.sum(opp_weights_arr * np.log(
+            np.maximum(opp_weights_arr, 1e-10)))
+        max_entropy = np.log(n_opp_live)
+        norm_entropy = entropy / max_entropy if max_entropy > 0 else 1.0
+
+        # Only use node locking if range is meaningfully narrowed
+        if norm_entropy > 0.92:
+            return None  # range too close to uniform, use standard solver
+
+        remaining = [c for c in range(27) if c not in known]
+        for h in itertools.combinations(remaining, 2):
+            hero_hands.append(h)
+
+        n_hero = len(hero_hands)
+        n_opp = len(opp_hands)
+
+        if n_hero == 0:
+            return None
+
+        hero_tuple = tuple(sorted(hero_cards))
+        hero_idx_in_list = None
+        for i, h in enumerate(hero_hands):
+            if tuple(sorted(h)) == hero_tuple:
+                hero_idx_in_list = i
+                break
+
+        if hero_idx_in_list is None:
+            return None
+
+        # Fewer iterations needed: hero converges faster against a fixed
+        # opponent (no moving target). 200 is plenty for best response.
+        if time_remaining > 600:
+            iterations = 300
+        elif time_remaining > 300:
+            iterations = 200
+        elif time_remaining > 100:
+            iterations = 150
+        else:
+            iterations = 50
+
+        # Full tree: 4 bet sizes, 2 raises max
+        max_bet = 100
+        tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet,
+                              compact=False)
+
+        if tree.size < 2:
+            return None
+
+        # Compute equity matrix AND not-blocked mask
+        equity_matrix, not_blocked = self._compute_equity_and_mask(
+            hero_hands, opp_hands, board, dead_cards, street)
+
+        # Terminal values with proper card blocking
+        terminal_values = self._compute_terminal_values(
+            tree, equity_matrix, not_blocked)
+
+        # Build locked opponent strategy from equity and narrowed range
+        opp_locked = self._build_locked_strategy(
+            tree, opp_hands, opp_weights_arr, equity_matrix, not_blocked)
+
+        # Run DCFR with node locking
+        hero_strategy = self._run_dcfr(
+            tree, opp_weights_arr, terminal_values,
+            n_hero, n_opp, iterations,
+            opp_locked_strategy=opp_locked)
+
+        our_strategy = hero_strategy[hero_idx_in_list]
+
+        return self._strategy_to_action(
+            tree, our_strategy, my_bet, opp_bet, min_raise, max_raise,
+            valid_actions)
+
     def _run_dcfr(self, tree, opp_weights, terminal_values,
-                   n_hero, n_opp, iterations):
+                   n_hero, n_opp, iterations, opp_locked_strategy=None):
         """Run DCFR with Noam Brown's parameters.
 
         DCFR discounts early iterations so the average strategy
         converges faster. Parameters: alpha=1.5, beta=0, gamma=2.
+
+        If opp_locked_strategy is provided, the opponent's strategy at
+        every opponent node is fixed (node-locked) to the given strategy
+        and opponent regrets are not updated. Hero's strategy converges
+        to the best response against the locked opponent.
+
+        opp_locked_strategy: dict {opp_node_id: np.array (n_opp, n_act)}
+            or None for standard two-player CFR.
         """
         n_hero_nodes = len(tree.hero_node_ids)
         n_opp_nodes = len(tree.opp_node_ids)
@@ -439,14 +688,16 @@ class RangeSolver:
                 strat_w = fpow((t - 1) / t, gamma)
 
                 hero_regrets *= np.where(hero_regrets > 0, pos_w, neg_w)
-                opp_regrets *= np.where(opp_regrets > 0, pos_w, neg_w)
+                if opp_locked_strategy is None:
+                    opp_regrets *= np.where(opp_regrets > 0, pos_w, neg_w)
                 hero_strat_sum *= strat_w
 
             self._range_cfr_traverse(
                 tree, 0, hero_reach_init.copy(), opp_weights.copy(),
                 hero_regrets, hero_strat_sum, opp_regrets,
                 hero_node_idx, opp_node_idx, terminal_values,
-                n_hero, n_opp, max_act)
+                n_hero, n_opp, max_act,
+                opp_locked_strategy=opp_locked_strategy)
 
         # Extract average strategy at root
         root = 0
@@ -471,7 +722,8 @@ class RangeSolver:
     def _range_cfr_traverse(self, tree, node_id, hero_reach, opp_reach,
                              hero_regrets, hero_strat_sum, opp_regrets,
                              hero_node_idx, opp_node_idx, terminal_values,
-                             n_hero, n_opp, max_act):
+                             n_hero, n_opp, max_act,
+                             opp_locked_strategy=None):
         if tree.terminal[node_id] != TERM_NONE:
             return terminal_values[node_id]
 
@@ -493,7 +745,8 @@ class RangeSolver:
                     tree, child_id, new_hero_reach, opp_reach,
                     hero_regrets, hero_strat_sum, opp_regrets,
                     hero_node_idx, opp_node_idx, terminal_values,
-                    n_hero, n_opp, max_act)
+                    n_hero, n_opp, max_act,
+                    opp_locked_strategy=opp_locked_strategy)
                 node_value += strategies[:, a:a+1] * action_values[a]
 
             diff = action_values - node_value[np.newaxis, :, :]
@@ -505,7 +758,16 @@ class RangeSolver:
 
         else:  # Opponent
             idx = opp_node_idx[node_id]
-            strategies = self._regret_match_batch(opp_regrets[idx], n_act)
+            locked = (opp_locked_strategy is not None
+                      and node_id in opp_locked_strategy)
+
+            if locked:
+                # NODE LOCKING: use fixed strategy, skip regret matching.
+                # The locked strategy directly encodes opponent tendencies
+                # derived from the narrowed range (equity-proportional).
+                strategies = opp_locked_strategy[node_id][:, :n_act]
+            else:
+                strategies = self._regret_match_batch(opp_regrets[idx], n_act)
 
             action_values = np.zeros((n_act, n_hero, n_opp), dtype=np.float64)
             node_value = np.zeros((n_hero, n_opp), dtype=np.float64)
@@ -517,12 +779,16 @@ class RangeSolver:
                     tree, child_id, hero_reach, new_opp_reach,
                     hero_regrets, hero_strat_sum, opp_regrets,
                     hero_node_idx, opp_node_idx, terminal_values,
-                    n_hero, n_opp, max_act)
+                    n_hero, n_opp, max_act,
+                    opp_locked_strategy=opp_locked_strategy)
                 node_value += strategies[:, a:a+1].T * action_values[a]
 
-            diff = node_value[np.newaxis, :, :] - action_values
-            cf_regrets = np.tensordot(diff, hero_reach, axes=([1], [0]))
-            opp_regrets[idx, :, :n_act] += cf_regrets.T
+            if not locked:
+                # Only accumulate opponent regrets when NOT locked.
+                # Locked nodes have a fixed strategy — no learning.
+                diff = node_value[np.newaxis, :, :] - action_values
+                cf_regrets = np.tensordot(diff, hero_reach, axes=([1], [0]))
+                opp_regrets[idx, :, :n_act] += cf_regrets.T
 
             return node_value
 

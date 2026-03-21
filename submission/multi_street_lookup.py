@@ -1122,3 +1122,221 @@ class MultiStreetLookup:
 def _sorted_permutations(t):
     """Return the canonical sorted form of a tuple."""
     return [tuple(sorted(t))]
+
+
+# ======================================================================
+# River Blueprint Lookup
+# ======================================================================
+
+# River pot sizes used during compute (hero_bet, opp_bet)
+_RIVER_POT_SIZES = [(2, 2), (6, 6), (14, 14), (30, 30), (50, 50)]
+
+
+class RiverBlueprintLookup:
+    """
+    Fast runtime lookup for precomputed river strategies and opponent P(bet|hand).
+
+    Loaded from a single LZMA-compressed pickle file produced by merge_river.py.
+    Provides:
+        - get_river_opp_bet_prob(board, pot_state): P(bet|hand) for Bayesian narrowing
+        - get_river_hero_strategy(board, pot_state): hero acting-first strategy
+
+    All arrays are uint8 (0-255), converted to float on lookup.
+    Board lookup: sort 5 cards, binary search in board_index.
+    """
+
+    def __init__(self, data_path):
+        """Load river data from LZMA-compressed pickle.
+
+        Args:
+            data_path: path to river.pkl.lzma file
+        """
+        self._loaded = False
+        self._board_index = None  # (N, 5) int8 — sorted board cards
+        self._opp_pb = None       # (N, 5, 231) uint8 — P(bet|hand) per pot
+        self._hero_s = None       # (N, 5, 231, 3) uint8 — hero strategy per pot
+        self._hands = None        # (N, 231, 2) int8 — hand card pairs per board
+        self._pot_sizes = _RIVER_POT_SIZES
+        self._n_boards = 0
+
+        # Hand map cache: board_idx -> {(c1,c2): hand_idx}
+        self._hand_map_cache = {}
+
+        if not os.path.isfile(data_path):
+            return
+
+        import lzma
+        import pickle as _pickle
+
+        with open(data_path, 'rb') as f:
+            data = _pickle.loads(lzma.decompress(f.read()))
+
+        self._board_index = data['board_index']
+        self._opp_pb = data['opp_pb']
+        self._hero_s = data['hero_s']
+        self._hands = data['hands']
+        self._n_boards = data['n_boards']
+        if 'pot_sizes' in data:
+            self._pot_sizes = data['pot_sizes']
+        self._loaded = True
+
+    @property
+    def is_loaded(self):
+        return self._loaded and self._n_boards > 0
+
+    def _find_board_idx(self, board):
+        """Find the row index for a sorted 5-card board via binary search.
+
+        Args:
+            board: tuple/list of 5 ints (will be sorted)
+
+        Returns:
+            int index into board_index, or None if not found
+        """
+        if not self._loaded:
+            return None
+
+        key = np.array(sorted(int(c) for c in board), dtype=np.int8)
+
+        # Binary search on first card, then narrow
+        lo, hi = 0, self._n_boards
+        bi = self._board_index
+
+        # Multi-column binary search: compare lexicographically
+        for col in range(5):
+            # Find range where column matches
+            col_vals = bi[lo:hi, col]
+            target = key[col]
+
+            # Find leftmost occurrence
+            left = np.searchsorted(col_vals, target, side='left')
+            right = np.searchsorted(col_vals, target, side='right')
+
+            if left >= right:
+                return None  # not found
+
+            lo = lo + left
+            hi = lo + (right - left)
+
+        if lo < self._n_boards:
+            return lo
+        return None
+
+    def _get_hand_map(self, board_idx):
+        """Build or retrieve hand map for a board.
+
+        Returns dict: (c1, c2) sorted -> hand_index
+        """
+        if board_idx in self._hand_map_cache:
+            return self._hand_map_cache[board_idx]
+
+        hands = self._hands[board_idx]  # (231, 2) int8
+        hmap = {}
+        for hi in range(len(hands)):
+            c1, c2 = int(hands[hi][0]), int(hands[hi][1])
+            if c1 == 0 and c2 == 0 and hi > 0:
+                # Past valid entries (shouldn't happen with 231 hands)
+                break
+            hmap[(min(c1, c2), max(c1, c2))] = hi
+        self._hand_map_cache[board_idx] = hmap
+
+        # Limit cache size
+        if len(self._hand_map_cache) > 100:
+            oldest = next(iter(self._hand_map_cache))
+            del self._hand_map_cache[oldest]
+
+        return hmap
+
+    def _find_pot_idx(self, pot_state):
+        """Find nearest pot index from the 5 precomputed pot sizes.
+
+        Args:
+            pot_state: (my_bet, opp_bet) tuple
+
+        Returns:
+            int pot index (0-4)
+        """
+        my_bet, opp_bet = pot_state
+        pot = my_bet + opp_bet
+        best_idx = 0
+        best_dist = float('inf')
+        for i, (hb, ob) in enumerate(self._pot_sizes):
+            dist = abs(hb + ob - pot)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        return best_idx
+
+    def get_river_opp_bet_prob(self, board, pot_state):
+        """Get P(bet|hand) for each opponent hand on this river board.
+
+        Used for Bayesian narrowing when opponent bets on river.
+        Replaces heuristic _polarized_narrow_range with equilibrium data.
+
+        Args:
+            board: list/tuple of 5 card ints
+            pot_state: (my_bet, opp_bet)
+
+        Returns:
+            dict {(c1, c2) sorted: float P(bet|hand)} or None
+        """
+        if not self._loaded or len(board) != 5:
+            return None
+
+        board_idx = self._find_board_idx(board)
+        if board_idx is None:
+            return None
+
+        pot_idx = self._find_pot_idx(pot_state)
+        hmap = self._get_hand_map(board_idx)
+
+        # opp_pb[board_idx, pot_idx, :] -> (231,) uint8
+        pb_arr = self._opp_pb[board_idx, pot_idx]
+
+        result = {}
+        for hand_pair, hi in hmap.items():
+            result[hand_pair] = float(pb_arr[hi]) / 255.0
+
+        return result
+
+    def get_river_hero_strategy(self, board, pot_state):
+        """Get hero acting-first strategy for this river board.
+
+        Returns strategy as dict {(c1,c2) sorted: np.array([p_check, p_raise_half, p_raise_pot])}.
+        Probabilities are floats summing to ~1.0.
+
+        Used when hero acts first on river, replacing equity threshold heuristics.
+
+        Args:
+            board: list/tuple of 5 card ints
+            pot_state: (my_bet, opp_bet)
+
+        Returns:
+            dict {(c1, c2) sorted: np.array of strategy} or None
+        """
+        if not self._loaded or len(board) != 5:
+            return None
+
+        board_idx = self._find_board_idx(board)
+        if board_idx is None:
+            return None
+
+        pot_idx = self._find_pot_idx(pot_state)
+        hmap = self._get_hand_map(board_idx)
+
+        # hero_s[board_idx, pot_idx, :, :] -> (231, n_actions) uint8
+        strat_arr = self._hero_s[board_idx, pot_idx]
+
+        result = {}
+        for hand_pair, hi in hmap.items():
+            raw = strat_arr[hi].astype(np.float64) / 255.0
+            total = raw.sum()
+            if total > 0:
+                raw /= total
+            else:
+                # Default: check
+                raw = np.zeros_like(raw)
+                raw[0] = 1.0
+            result[hand_pair] = raw
+
+        return result
