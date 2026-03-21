@@ -1541,7 +1541,7 @@ class PlayerAgent(Agent):
                                 precomp.get(a, 0.0) for a in (3, 4, 5, 6))
                             # Only override if precomputed says bet often enough
                             # to indicate this hand has real value
-                            if p_bet_precomp >= 0.15 and _rng.random() < p_bet_precomp:
+                            if p_bet_precomp >= 0.25 and _rng.random() < p_bet_precomp:
                                 # Sample bet size from precomputed distribution
                                 # (conditional on betting)
                                 pot = my_bet + opp_bet
