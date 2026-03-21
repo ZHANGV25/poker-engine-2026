@@ -59,13 +59,18 @@ def _deferred_load():
             _PRELOAD['multi_street']._build_all_node_maps()
     except Exception:
         pass
-    # Load river precomputed P(bet|hand) data
+    # Extract river.tar.lzma to /tmp if needed
     try:
-        import lzma as _lzma2, pickle as _pkl2
-        river_path = os.path.join(_data_dir, 'river.pkl.lzma')
-        if os.path.isfile(river_path):
-            with _lzma2.open(river_path, 'rb') as _f:
-                _PRELOAD['river_data'] = _pkl2.load(_f)
+        _river_archive = os.path.join(_dir, "data", "river.tar.lzma")
+        _river_extract = "/tmp/river_extract"
+        _river_dir_check = os.path.join(_dir, "data", "river")
+        if os.path.isfile(_river_archive) and not os.path.isdir(_river_dir_check):
+            import tarfile
+            os.makedirs(_river_extract, exist_ok=True)
+            with lzma.open(_river_archive) as lz:
+                with tarfile.open(fileobj=lz) as tar:
+                    tar.extractall(_river_extract)
+            _PRELOAD['river_extracted'] = os.path.join(_river_extract, "river")
     except Exception:
         pass
     _PRELOAD['deferred_done'] = True
@@ -117,12 +122,13 @@ class PlayerAgent(Agent):
         self.depth_limited_solver = DepthLimitedSolver(self.engine, self.range_solver)
 
         # Precomputed river strategies (from EC2, loaded if available)
+        # Check: 1) direct files in data/river/, 2) extracted from tar.lzma
         _river_dir = os.path.join(_dir, "data", "river")
-        _river_merged = os.path.join(_dir, "data", "river_data.pkl.lzma")
-        if os.path.isfile(_river_merged):
-            self.river_lookup = RiverLookup(_river_merged)
-        elif os.path.isdir(_river_dir):
+        _river_extracted = _PRELOAD.get('river_extracted')
+        if os.path.isdir(_river_dir):
             self.river_lookup = RiverLookup(_river_dir)
+        elif _river_extracted and os.path.isdir(_river_extracted):
+            self.river_lookup = RiverLookup(_river_extracted)
         else:
             self.river_lookup = RiverLookup()  # empty, will use runtime solver
 
@@ -1225,7 +1231,6 @@ class PlayerAgent(Agent):
                         prev_board, self._last_hero_bet,
                         self._last_pot_before, self._current_street, dead)
                 # else: check-check — both showed weakness, range stays wide.
-                # Don't narrow: opponent chose not to bet strong hands.
             self._current_street = street
             self._raised_this_street = False
             self._narrowed_this_street = False
@@ -1391,41 +1396,17 @@ class PlayerAgent(Agent):
         #    Facing bet: Bayesian P(bet|hand) narrowing (precomputed if available,
         #                else adaptive polarized heuristic) + range solver + equity gate
         if street == 3:
+            # Late-bind river lookup if extracted after init
+            if not self.river_lookup.loaded:
+                _rx = _PRELOAD.get('river_extracted')
+                if _rx and os.path.isdir(_rx):
+                    self.river_lookup = RiverLookup(_rx)
+
             facing_bet = opp_bet > my_bet
 
-            # Acting first: try precomputed strategy (0ms, better convergence)
-            if not facing_bet and self.river_lookup.loaded:
-                precomp = self.river_lookup.get_strategy(
-                    my_cards, board, my_bet, opp_bet)
-                if precomp is not None:
-                    self._path_counts['range_solver'] += 1
-                    # Sample action from precomputed strategy
-                    import random as _rng
-                    actions = list(precomp.keys())
-                    probs = [precomp[a] for a in actions]
-                    total_p = sum(probs)
-                    if total_p > 0:
-                        probs = [p / total_p for p in probs]
-                        chosen = _rng.choices(actions, weights=probs, k=1)[0]
-                        if chosen == ACT_CHECK:
-                            return (CHECK, 0, 0, 0)
-                        elif chosen in (ACT_RAISE_HALF, ACT_RAISE_POT,
-                                        ACT_RAISE_ALLIN, ACT_RAISE_OVERBET):
-                            # Map action to raise amount
-                            pot = my_bet + opp_bet
-                            frac = {ACT_RAISE_HALF: 0.4, ACT_RAISE_POT: 0.7,
-                                    ACT_RAISE_ALLIN: 1.0, ACT_RAISE_OVERBET: 1.5}
-                            amt = max(int(pot * frac.get(chosen, 0.5)),
-                                      observation["min_raise"])
-                            amt = min(amt, observation["max_raise"])
-                            if valid[RAISE]:
-                                self._raised_this_street = True
-                                self._streets_raised += 1
-                                self._last_hero_bet = amt
-                                self._last_pot_before = pot
-                                self._opp_bet_at_raise = opp_bet
-                                return (RAISE, amt, 0, 0)
-                            return (CHECK, 0, 0, 0)
+            # Acting first: use runtime solver with narrowed range (not precomputed).
+            # Precomputed strategies were solved against uniform range and miss
+            # value bets against narrowed opponents. Runtime solver sees actual range.
 
             if time_left > 50 and self._opp_weights is not None:
                 self._path_counts['range_solver'] += 1
@@ -1521,7 +1502,22 @@ class PlayerAgent(Agent):
                         pot_odds = continue_cost / (continue_cost + pot)
                         eq = self.engine.compute_equity(
                             my_cards, board, dead, solve_range)
-                        if eq < pot_odds:
+                        # Adaptive margin from opponent river bet frequency
+                        # Low bet% = value-heavy = fold wider
+                        # High bet% = bluff-heavy = call wider
+                        opp_river_acts = self._opp_actions_by_street.get(3, 0)
+                        opp_river_bets = self._opp_bets_by_street.get(3, 0)
+                        if opp_river_acts >= 5:
+                            bet_freq = opp_river_bets / opp_river_acts
+                            if bet_freq < 0.25:
+                                margin = 0.04
+                            elif bet_freq > 0.35:
+                                margin = -0.02
+                            else:
+                                margin = 0.0
+                        else:
+                            margin = 0.0
+                        if eq < pot_odds + margin:
                             self._we_folded_this_hand = True
                             return (FOLD, 0, 0, 0)
 
@@ -1647,6 +1643,8 @@ class PlayerAgent(Agent):
                     self._raised_this_street = True
                     self._streets_raised += 1
                     self._opp_bet_at_raise = opp_bet
+                    self._last_hero_bet = min(bet_size, max_raise)
+                    self._last_pot_before = pot
                     return (RAISE, min(bet_size, max_raise), 0, 0)
 
         # Call if equity justifies (against polarized-narrowed range)

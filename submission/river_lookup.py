@@ -32,10 +32,13 @@ class RiverLookup:
         self._file_count = 0
 
         if self._loaded:
-            # Count files but don't load them
+            # Quick check — don't enumerate all 80K files at startup
             try:
-                self._file_count = sum(1 for f in os.listdir(data_dir)
-                                       if f.startswith('river_') and f.endswith('.npz'))
+                if os.path.isfile(os.path.join(data_dir, 'river_0.npz')):
+                    self._file_count = 1  # sentinel: at least one file exists
+                else:
+                    self._file_count = 0
+                    self._loaded = False
             except Exception:
                 self._file_count = 0
                 self._loaded = False

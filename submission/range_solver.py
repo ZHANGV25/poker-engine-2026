@@ -346,14 +346,9 @@ class RangeSolver:
                     runout_mask |= 1 << c
                 full_board_mask = board_mask | runout_mask
 
-                # Mask out hands that contain a runout card
-                runout_set_mask = runout_mask
-                hero_valid = np.array(
-                    [(hero_masks[hi] & runout_set_mask) == 0
-                     for hi in range(n_hero)], dtype=bool)
-                opp_valid = np.array(
-                    [(opp_masks[oi] & runout_set_mask) == 0
-                     for oi in range(n_opp)], dtype=bool)
+                # Mask out hands that contain a runout card (vectorized)
+                hero_valid = (hero_masks & runout_mask) == 0
+                opp_valid = (opp_masks & runout_mask) == 0
 
                 # Valid pair matrix
                 valid_pairs = (hero_valid[:, None] & opp_valid[None, :]).astype(
