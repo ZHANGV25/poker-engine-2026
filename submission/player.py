@@ -330,6 +330,8 @@ class PlayerAgent(Agent):
             self._we_folded_this_hand = False
             self._hero_bet_this_hand = False
             self._river_reweighted = False
+            self._retro_narrowed_1 = False
+            self._retro_narrowed_2 = False
             self._narrowed_this_street = False
             self._opp_bet_at_raise = 0
             self._street_start_bet = 0
@@ -1262,6 +1264,18 @@ class PlayerAgent(Agent):
         if len(opp_discards) == 3 and self._opp_weights is None:
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards)
+
+        # Retroactive check narrowing: if previous street was CC
+        # (we acted first, checked, opponent checked behind), we missed
+        # the check narrowing because we didn't know opponent's action
+        # at our decision time. Apply it now at the start of the new street.
+        prev_street = street - 1
+        if (self._opp_weights is not None and prev_street in (1, 2)
+                and hero_is_first and opp_bet == my_bet
+                and not self._opp_bet_this_hand
+                and not getattr(self, '_retro_narrowed_' + str(prev_street), False)):
+            setattr(self, '_retro_narrowed_' + str(prev_street), True)
+            self._turn_check_bayesian_narrow(board, prev_street)
 
         # Range update from opponent actions
         if opp_bet > my_bet:
