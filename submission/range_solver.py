@@ -79,20 +79,35 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # Full tree + DCFR: ~1.2s per 500 iters Mac, ~3s ARM.
-        if time_remaining > 600:
-            iterations = 500
-        elif time_remaining > 300:
-            iterations = 300
-        elif time_remaining > 100:
-            iterations = 200
-        else:
-            iterations = 50
-
-        # Full tree: 4 bet sizes, 2 raises max
+        # River acting first: lean tree (25% block + 100% pot, 39 nodes).
+        # 3x faster → more iterations in same time. Solver uses blocking
+        # bet for medium hands that would otherwise check.
+        # All other: full tree (40/70/100/150% pot, 123 nodes).
         max_bet = 100
+        use_lean = (street == 3 and my_bet == opp_bet)
+
+        if use_lean:
+            # Lean tree is 3x faster — use more iterations
+            if time_remaining > 600:
+                iterations = 800
+            elif time_remaining > 300:
+                iterations = 500
+            elif time_remaining > 100:
+                iterations = 300
+            else:
+                iterations = 100
+        else:
+            if time_remaining > 600:
+                iterations = 500
+            elif time_remaining > 300:
+                iterations = 300
+            elif time_remaining > 100:
+                iterations = 200
+            else:
+                iterations = 50
+
         tree = self._get_tree(my_bet, opp_bet, min_raise, max_bet,
-                              compact=False)
+                              compact=False, lean=use_lean)
 
         if tree.size < 2:
             return None
@@ -267,11 +282,13 @@ class RangeSolver:
 
         return result
 
-    def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet, compact):
-        key = (hero_bet, opp_bet, min_raise, max_bet, True, compact)
+    def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet, compact,
+                  lean=False):
+        key = (hero_bet, opp_bet, min_raise, max_bet, True, compact, lean)
         if key not in self._tree_cache:
             self._tree_cache[key] = GameTree(
-                hero_bet, opp_bet, min_raise, max_bet, True, compact=compact)
+                hero_bet, opp_bet, min_raise, max_bet, True,
+                compact=compact, lean=lean)
         return self._tree_cache[key]
 
     def _compute_equity_and_mask(self, hero_hands, opp_hands, board,

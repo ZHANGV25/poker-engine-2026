@@ -36,7 +36,7 @@ class GameTree:
     """
 
     def __init__(self, hero_bet, opp_bet, min_raise, max_bet, hero_first,
-                 compact=False):
+                 compact=False, lean=False):
         """Build the game tree.
 
         Args:
@@ -46,8 +46,10 @@ class GameTree:
             max_bet: maximum total bet per player (100)
             hero_first: True if hero acts first on this street
             compact: if True, use 2 bet sizes + 1 raise max (for range solver)
+            lean: if True, use blocking bet (25% pot) + pot bet (100%) only
         """
         self._compact = compact
+        self._lean = lean
         # Node data (parallel lists, indexed by node_id)
         self.player = []        # 0=hero, 1=opp
         self.terminal = []      # TERM_* constant
@@ -115,6 +117,22 @@ class GameTree:
             allin = self._max_bet
             if allin > other_bet and allin != new_bet_med:
                 sizes.append((ACT_RAISE_ALLIN, allin))
+        elif self._lean:
+            # Lean mode: blocking bet (25% pot) + pot bet (100%).
+            # 39 nodes vs 123 (3x faster). Solver uses blocking bet
+            # for medium hands that would otherwise check.
+            block = max(self._min_raise, int(0.25 * pot))
+            block = min(block, remaining)
+            new_bet_block = other_bet + block
+            if new_bet_block <= self._max_bet:
+                sizes.append((ACT_RAISE_HALF, new_bet_block))
+
+            large = max(self._min_raise, pot)
+            large = min(large, remaining)
+            new_bet_large = other_bet + large
+            new_bet_large = min(new_bet_large, self._max_bet)
+            if new_bet_large > other_bet and new_bet_large != new_bet_block:
+                sizes.append((ACT_RAISE_ALLIN, new_bet_large))
         else:
             # Full mode: 4 bet sizes for maximum expressiveness.
 
