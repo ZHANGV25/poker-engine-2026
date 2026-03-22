@@ -1499,37 +1499,36 @@ class PlayerAgent(Agent):
                 self._path_counts['range_solver'] += 1
 
                 # Bet-narrowing for facing bets.
-                # Priority 1: precomputed P(bet|hand) — board-specific equilibrium
-                # Priority 2: adaptive polarized heuristic (tracked showdown WR)
+                # Runtime P(bet|hand): solve from opponent's perspective to get
+                # TRUE betting probabilities against our actual range.
+                # Falls back to precomputed/heuristic if runtime fails.
                 solve_range = self._opp_weights
-                used_precomputed_narrow = False
+                used_runtime_narrow = False
 
-                if opp_bet > my_bet and self.river_lookup.loaded:
-                    p_bet = self.river_lookup.get_p_bet(
-                        board, my_bet=my_bet, opp_bet=opp_bet)
-                    if p_bet:
-                        # Detect value-heavy opponent from bet frequency
-                        opp_r_acts = self._opp_actions_by_street.get(3, 0)
-                        opp_r_bets = self._opp_bets_by_street.get(3, 0)
-                        opp_value_heavy = (opp_r_acts >= 5 and
-                                           opp_r_bets / opp_r_acts < 0.25)
+                if opp_bet > my_bet and _USE_C_SOLVER and time_left > 150:
+                    # Runtime solve: compute P(bet|hand) from opponent's perspective
+                    hero_range = {}
+                    remaining = [c for c in range(27) if c not in set(board) | set(dead)]
+                    for h in itertools.combinations(remaining, 2):
+                        hero_range[h] = 1.0 / max(len(remaining) * (len(remaining)-1) // 2, 1)
+                    p_bet_runtime = self.range_solver.compute_opp_bet_probs(
+                        board, self._opp_weights, hero_range, dead,
+                        my_bet, opp_bet, street, min_raise=2, iterations=200)
+                    if p_bet_runtime:
                         narrowed = {}
                         for pair, weight in self._opp_weights.items():
                             if weight <= 0:
                                 continue
                             key = (min(pair[0], pair[1]), max(pair[0], pair[1]))
-                            pb = p_bet.get(key, 0.5)
-                            # Strip bluff frequencies against value-heavy opponents
-                            if opp_value_heavy and pb < 0.30:
-                                pb = 0.0
+                            pb = p_bet_runtime.get(key, 0.5)
                             narrowed[pair] = weight * max(pb, 0.001)
                         total_w = sum(narrowed.values())
                         if total_w > 0:
                             solve_range = {k: v / total_w
                                            for k, v in narrowed.items()}
-                            used_precomputed_narrow = True
+                            used_runtime_narrow = True
 
-                if opp_bet > my_bet and not used_precomputed_narrow:
+                if opp_bet > my_bet and not used_runtime_narrow:
                     board_set = set(board)
                     hand_strengths = []
                     for oh, w in self._opp_weights.items():
