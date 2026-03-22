@@ -1283,19 +1283,73 @@ class PlayerAgent(Agent):
                 # Opponent BET: narrow range toward betting hands
                 self._narrowed_this_street = True
                 if street == 1:
-                    # Flop: Bayesian from blueprint
-                    if not self._bayesian_range_update(board, my_bet, opp_bet, street):
-                        self._soft_narrow_range(my_bet, opp_bet, board, dead)
-                elif street == 2 and self._multi_street is not None:
-                    # Turn: try Bayesian from turn opp data, fall back to polarized
-                    if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
-                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                    # Flop: runtime P(bet|hand) when C solver available,
+                    # else blueprint Bayesian, else soft heuristic
+                    flop_narrowed = False
+                    if _USE_C_SOLVER and time_left > 300:
+                        try:
+                            remaining = [c for c in range(27)
+                                         if c not in set(board) | set(dead)]
+                            hero_range = {}
+                            n_pairs = len(remaining) * (len(remaining)-1) // 2
+                            for h in itertools.combinations(remaining, 2):
+                                hero_range[h] = 1.0 / max(n_pairs, 1)
+                            p_bet_rt = self.range_solver.compute_opp_bet_probs(
+                                board, self._opp_weights, hero_range, dead,
+                                my_bet, opp_bet, street, min_raise=2,
+                                iterations=150)
+                            if p_bet_rt:
+                                for pair, w in list(self._opp_weights.items()):
+                                    if w <= 0: continue
+                                    key = (min(pair[0],pair[1]),max(pair[0],pair[1]))
+                                    pb = p_bet_rt.get(key, 0.5)
+                                    self._opp_weights[pair] = w * max(pb, 0.005)
+                                total_w = sum(self._opp_weights.values())
+                                if total_w > 0:
+                                    for k in self._opp_weights:
+                                        self._opp_weights[k] /= total_w
+                                flop_narrowed = True
+                        except Exception:
+                            pass
+                    if not flop_narrowed:
+                        if not self._bayesian_range_update(board, my_bet, opp_bet, street):
+                            self._soft_narrow_range(my_bet, opp_bet, board, dead)
+                elif street == 2:
+                    # Turn: runtime P(bet|hand) when C solver available,
+                    # else blueprint Bayesian, else polarized heuristic
+                    turn_narrowed = False
+                    if _USE_C_SOLVER and time_left > 200:
+                        try:
+                            remaining = [c for c in range(27)
+                                         if c not in set(board) | set(dead)]
+                            hero_range = {}
+                            n_pairs = len(remaining) * (len(remaining)-1) // 2
+                            for h in itertools.combinations(remaining, 2):
+                                hero_range[h] = 1.0 / max(n_pairs, 1)
+                            p_bet_rt = self.range_solver.compute_opp_bet_probs(
+                                board, self._opp_weights, hero_range, dead,
+                                my_bet, opp_bet, street, min_raise=2,
+                                iterations=150)
+                            if p_bet_rt:
+                                for pair, w in list(self._opp_weights.items()):
+                                    if w <= 0: continue
+                                    key = (min(pair[0],pair[1]),max(pair[0],pair[1]))
+                                    pb = p_bet_rt.get(key, 0.5)
+                                    self._opp_weights[pair] = w * max(pb, 0.005)
+                                total_w = sum(self._opp_weights.values())
+                                if total_w > 0:
+                                    for k in self._opp_weights:
+                                        self._opp_weights[k] /= total_w
+                                turn_narrowed = True
+                        except Exception:
+                            pass
+                    if not turn_narrowed:
+                        if (self._multi_street is not None and
+                                not self._turn_bayesian_narrow(board, my_bet, opp_bet)):
+                            self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
-                    # River: no pre-narrowing needed. The range solver in
-                    # solve_and_act already models opponent's betting behavior
-                    # within its equilibrium computation. Pre-narrowing here
-                    # would double-count the "opponent bet" information,
-                    # over-narrowing toward value and making us fold too much.
+                    # River: narrowing happens later in the river-specific
+                    # code block via runtime compute_opp_bet_probs().
                     pass
             elif opp_bet == my_bet and not hero_is_first and street in (1, 2):
                 # Opponent CHECKED: Bayesian update with P(check|hand) from
