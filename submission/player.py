@@ -341,7 +341,6 @@ class PlayerAgent(Agent):
             self._opp_bet_this_hand = False
             self._we_folded_this_hand = False
             self._hero_bet_this_hand = False
-            self._river_reweighted = False
             self._narrowed_this_street = False
             self._opp_bet_at_raise = 0
             self._street_start_bet = 0
@@ -1444,22 +1443,25 @@ class PlayerAgent(Agent):
             # opponent range that the blueprint ignores.
             if facing_bet and time_left > 100 and self._opp_weights is not None:
                 self._path_counts['range_solver'] += 1
-                result = self.depth_limited_solver.solve_turn_facing_bet(
-                    hero_cards=my_cards, board=board,
-                    opp_range=self._opp_weights, dead_cards=dead,
-                    my_bet=my_bet, opp_bet=opp_bet,
-                    min_raise=observation["min_raise"],
-                    max_raise=observation["max_raise"],
-                    valid_actions=valid, time_remaining=time_left,
-                    hero_position=hero_position)
-                if result is not None:
-                    if result[0] == RAISE:
-                        self._raised_this_street = True
-                        self._streets_raised += 1
-                        self._last_hero_bet = result[1]
-                        self._last_pot_before = pot_state[0] + pot_state[1]
-                        self._opp_bet_at_raise = opp_bet
-                    return result
+                try:
+                    result = self.depth_limited_solver.solve_turn_facing_bet(
+                        hero_cards=my_cards, board=board,
+                        opp_range=self._opp_weights, dead_cards=dead,
+                        my_bet=my_bet, opp_bet=opp_bet,
+                        min_raise=observation["min_raise"],
+                        max_raise=observation["max_raise"],
+                        valid_actions=valid, time_remaining=time_left,
+                        hero_position=hero_position)
+                    if result is not None:
+                        if result[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
+                            self._last_hero_bet = result[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        return result
+                except Exception:
+                    pass
 
             # Acting first: depth-limited solver when C solver available.
             # Previous AF solver regression (v33/v34) was SINGLE-STREET.
@@ -1631,23 +1633,18 @@ class PlayerAgent(Agent):
 
                         solve_range = narrowed
 
-                result = self.range_solver.solve_and_act(
-                    hero_cards=my_cards, board=board,
-                    opp_range=solve_range, dead_cards=dead,
-                    my_bet=my_bet, opp_bet=opp_bet, street=street,
-                    min_raise=observation["min_raise"],
-                    max_raise=observation["max_raise"],
-                    valid_actions=valid, time_remaining=time_left)
+                try:
+                    result = self.range_solver.solve_and_act(
+                        hero_cards=my_cards, board=board,
+                        opp_range=solve_range, dead_cards=dead,
+                        my_bet=my_bet, opp_bet=opp_bet, street=street,
+                        min_raise=observation["min_raise"],
+                        max_raise=observation["max_raise"],
+                        valid_actions=valid, time_remaining=time_left)
+                except Exception:
+                    result = None
                 if result is not None:
-                    # Floor override and bluff injection REMOVED —
-                    # with full tree C solver + fixed inference, the solver
-                    # makes informed bet/check decisions. Overriding with
-                    # less-informed precomputed data was a conflict.
-
                     # River equity gate: fold when equity < pot odds + margin.
-                    # Margin of 0.12 trims marginal calls that are technically
-                    # above pot odds but lose in practice (97.8% accuracy
-                    # across 2625 calls — folds 179 losers, only 4 winners).
                     if (result[0] == CALL and opp_bet > my_bet
                             and self._opp_weights is not None):
                         continue_cost = opp_bet - my_bet
@@ -1659,13 +1656,6 @@ class PlayerAgent(Agent):
                             self._we_folded_this_hand = True
                             return (FOLD, 0, 0, 0)
 
-                    # Note: selective caller, overbet, floor override, bluff injection
-                    # all removed — with full tree C solver + DL solving on all streets,
-                    # active) already includes 150% pot as an action. The solver
-                    # picks the optimal size from 40/70/100/150%. Overriding its
-                    # choice was conflicting with the equilibrium strategy.
-
-                    # Track raise for re-raise narrowing and pot control
                     if result[0] == RAISE:
                         self._raised_this_street = True
                         self._streets_raised += 1
