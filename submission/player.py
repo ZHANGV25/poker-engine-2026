@@ -1421,6 +1421,8 @@ class PlayerAgent(Agent):
                                 return (FOLD, 0, 0, 0)
                         self._path_counts['ms_flop'] += 1
                         if action[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
                             self._last_hero_bet = action[1]
                             self._last_pot_before = pot_state[0] + pot_state[1]
                             self._opp_bet_at_raise = opp_bet
