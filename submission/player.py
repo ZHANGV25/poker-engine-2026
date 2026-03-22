@@ -1274,6 +1274,7 @@ class PlayerAgent(Agent):
             self._opp_weights = self.inference.infer_opponent_weights(
                 opp_discards, board, my_cards)
 
+
         # Range update from opponent actions
         if opp_bet > my_bet:
             self._opp_bet_this_hand = True
@@ -1283,70 +1284,13 @@ class PlayerAgent(Agent):
                 # Opponent BET: narrow range toward betting hands
                 self._narrowed_this_street = True
                 if street == 1:
-                    # Flop: runtime P(bet|hand) when C solver available,
-                    # else blueprint Bayesian, else soft heuristic
-                    flop_narrowed = False
-                    if _USE_C_SOLVER and time_left > 300:
-                        try:
-                            remaining = [c for c in range(27)
-                                         if c not in set(board) | set(dead)]
-                            hero_range = {}
-                            n_pairs = len(remaining) * (len(remaining)-1) // 2
-                            for h in itertools.combinations(remaining, 2):
-                                hero_range[h] = 1.0 / max(n_pairs, 1)
-                            p_bet_rt = self.range_solver.compute_opp_bet_probs(
-                                board, self._opp_weights, hero_range, dead,
-                                my_bet, opp_bet, street, min_raise=2,
-                                iterations=150)
-                            if p_bet_rt:
-                                for pair, w in list(self._opp_weights.items()):
-                                    if w <= 0: continue
-                                    key = (min(pair[0],pair[1]),max(pair[0],pair[1]))
-                                    pb = p_bet_rt.get(key, 0.5)
-                                    self._opp_weights[pair] = w * max(pb, 0.005)
-                                total_w = sum(self._opp_weights.values())
-                                if total_w > 0:
-                                    for k in self._opp_weights:
-                                        self._opp_weights[k] /= total_w
-                                flop_narrowed = True
-                        except Exception:
-                            pass
-                    if not flop_narrowed:
-                        if not self._bayesian_range_update(board, my_bet, opp_bet, street):
-                            self._soft_narrow_range(my_bet, opp_bet, board, dead)
-                elif street == 2:
-                    # Turn: runtime P(bet|hand) when C solver available,
-                    # else blueprint Bayesian, else polarized heuristic
-                    turn_narrowed = False
-                    if _USE_C_SOLVER and time_left > 200:
-                        try:
-                            remaining = [c for c in range(27)
-                                         if c not in set(board) | set(dead)]
-                            hero_range = {}
-                            n_pairs = len(remaining) * (len(remaining)-1) // 2
-                            for h in itertools.combinations(remaining, 2):
-                                hero_range[h] = 1.0 / max(n_pairs, 1)
-                            p_bet_rt = self.range_solver.compute_opp_bet_probs(
-                                board, self._opp_weights, hero_range, dead,
-                                my_bet, opp_bet, street, min_raise=2,
-                                iterations=150)
-                            if p_bet_rt:
-                                for pair, w in list(self._opp_weights.items()):
-                                    if w <= 0: continue
-                                    key = (min(pair[0],pair[1]),max(pair[0],pair[1]))
-                                    pb = p_bet_rt.get(key, 0.5)
-                                    self._opp_weights[pair] = w * max(pb, 0.005)
-                                total_w = sum(self._opp_weights.values())
-                                if total_w > 0:
-                                    for k in self._opp_weights:
-                                        self._opp_weights[k] /= total_w
-                                turn_narrowed = True
-                        except Exception:
-                            pass
-                    if not turn_narrowed:
-                        if (self._multi_street is not None and
-                                not self._turn_bayesian_narrow(board, my_bet, opp_bet)):
-                            self._polarized_narrow_range(board, dead, my_bet, opp_bet)
+                    # Flop: Bayesian from blueprint
+                    if not self._bayesian_range_update(board, my_bet, opp_bet, street):
+                        self._soft_narrow_range(my_bet, opp_bet, board, dead)
+                elif street == 2 and self._multi_street is not None:
+                    # Turn: Bayesian from turn data, fall back to polarized
+                    if not self._turn_bayesian_narrow(board, my_bet, opp_bet):
+                        self._polarized_narrow_range(board, dead, my_bet, opp_bet)
                 else:
                     # River: narrowing happens later in the river-specific
                     # code block via runtime compute_opp_bet_probs().
@@ -1376,11 +1320,9 @@ class PlayerAgent(Agent):
         #    continuation values — accounts for future street betting.
         #    Runtime solver only sees current-street equity (no future streets)
         #    which caused turn to regress from +6.4 to 0.0/hand.
-        if street == 1 and self._multi_street is not None:
-            # Flop depth-limited solver: solve against narrowed range with
-            # turn+river continuation values. Works for BOTH AF and FB.
-            # Replaces blueprint entirely when C solver is available.
-            facing_flop_bet = opp_bet > my_bet
+        if street == 1:
+            # Flop depth-limited solver: solve against narrowed range.
+            # Doesn't need blueprint — uses own continuation values.
             if (_USE_C_SOLVER
                     and self._opp_weights is not None
                     and time_left > 200):
@@ -1404,32 +1346,31 @@ class PlayerAgent(Agent):
                 except Exception:
                     pass  # fall through to blueprint
 
-            try:
-                strat = self._multi_street.get_strategy(
-                    my_cards, board, pot_state=pot_state,
-                    hero_position=hero_position)
-                action = self._try_strategy(strat, observation)
-                if action is not None:
-                    # Equity gate: blueprint was solved against uniform range.
-                    if (action[0] == CALL and self._opp_weights is not None
-                            and opp_bet > my_bet):
-                        continue_cost = opp_bet - my_bet
-                        pot = my_bet + opp_bet
-                        pot_odds = continue_cost / (continue_cost + pot)
-                        eq = self.engine.compute_equity(
-                            my_cards, board, dead, self._opp_weights)
-                        if eq < pot_odds:
-                            self._we_folded_this_hand = True
-                            return (FOLD, 0, 0, 0)
-
-                    self._path_counts['ms_flop'] += 1
-                    if action[0] == RAISE:
-                        self._last_hero_bet = action[1]
-                        self._last_pot_before = pot_state[0] + pot_state[1]
-                        self._opp_bet_at_raise = opp_bet
-                    return action
-            except Exception:
-                pass
+            if self._multi_street is not None:
+                try:
+                    strat = self._multi_street.get_strategy(
+                        my_cards, board, pot_state=pot_state,
+                        hero_position=hero_position)
+                    action = self._try_strategy(strat, observation)
+                    if action is not None:
+                        if (action[0] == CALL and self._opp_weights is not None
+                                and opp_bet > my_bet):
+                            continue_cost = opp_bet - my_bet
+                            pot = my_bet + opp_bet
+                            pot_odds = continue_cost / (continue_cost + pot)
+                            eq = self.engine.compute_equity(
+                                my_cards, board, dead, self._opp_weights)
+                            if eq < pot_odds:
+                                self._we_folded_this_hand = True
+                                return (FOLD, 0, 0, 0)
+                        self._path_counts['ms_flop'] += 1
+                        if action[0] == RAISE:
+                            self._last_hero_bet = action[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        return action
+                except Exception:
+                    pass
 
         # 2. Turn: blueprint for ALL decisions.
         #    Same reason as flop: backward induction accounts for river

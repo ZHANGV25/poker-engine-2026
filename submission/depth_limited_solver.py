@@ -470,10 +470,11 @@ class DepthLimitedSolver:
             river_cv = np.where(river_count > 0,
                                 river_gv_sum / np.maximum(river_count, 1), 0)
 
-            # Step 1b: Turn continuation value = river CV (simplified)
-            # Full approach would solve a turn subgame, but that's too expensive.
-            # Instead, use river CV directly as turn CV (assumes check-check on turn).
-            # This is a simplification but captures the hand strength after turn card.
+            # Turn continuation value = river CV directly.
+            # Full turn subgame solving (17 extra solves) was too expensive
+            # (4.86s/hand, caused timeouts). The river CV already captures
+            # hand strength — turn betting dynamics are handled by the
+            # flop solver's own tree structure.
             turn_cv_sum += river_cv * tc_vp * nb_flop
             turn_cv_count += tc_vp * nb_flop
 
