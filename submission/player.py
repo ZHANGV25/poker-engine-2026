@@ -1586,85 +1586,10 @@ class PlayerAgent(Agent):
                     max_raise=observation["max_raise"],
                     valid_actions=valid, time_remaining=time_left)
                 if result is not None:
-                    # Precomputed bet-frequency floor for acting-first decisions.
-                    # Problem: when opp range is narrowed to strong hands, the
-                    # solver checks everything (correct GTO vs strong range).
-                    # But this causes us to lose big at check-check showdowns
-                    # because we check strong hands that should value-bet.
-                    # Fix: use the precomputed strategy (solved vs uniform) as
-                    # a floor for betting frequency. If precomputed says bet
-                    # and solver says check, bet with the precomputed probability.
-                    if (result[0] == CHECK and my_bet == opp_bet
-                            and self.river_lookup.loaded and valid[RAISE]):
-                        import random as _rng
-                        precomp = self.river_lookup.get_strategy(
-                            my_cards, board, my_bet, opp_bet)
-                        if precomp:
-                            # Sum all bet actions from precomputed strategy
-                            # ACT_RAISE_HALF=3, ACT_RAISE_POT=4,
-                            # ACT_RAISE_ALLIN=5, ACT_RAISE_OVERBET=6
-                            p_bet_precomp = sum(
-                                precomp.get(a, 0.0) for a in (3, 4, 5, 6))
-                            # Only override if precomputed says bet often enough
-                            # to indicate this hand has real value
-                            if p_bet_precomp >= 0.25 and _rng.random() < p_bet_precomp:
-                                # Sample bet size from precomputed distribution
-                                # (conditional on betting)
-                                pot = my_bet + opp_bet
-                                _min_r = observation["min_raise"]
-                                _max_r = observation["max_raise"]
-                                # Map precomputed action types to pot fractions
-                                _size_map = {
-                                    3: 0.40,  # RAISE_HALF -> 40% pot
-                                    4: 0.70,  # RAISE_POT -> 70% pot
-                                    5: 1.00,  # RAISE_ALLIN -> 100% pot
-                                    6: 1.50,  # RAISE_OVERBET -> 150% pot
-                                }
-                                # Build conditional bet-sizing distribution
-                                _bet_acts = []
-                                _bet_probs = []
-                                for _ba in (3, 4, 5, 6):
-                                    _bp = precomp.get(_ba, 0.0)
-                                    if _bp > 0:
-                                        _bet_acts.append(_ba)
-                                        _bet_probs.append(_bp)
-                                if _bet_probs:
-                                    _bpt = sum(_bet_probs)
-                                    _bet_probs = [p / _bpt for p in _bet_probs]
-                                    _roll = _rng.random()
-                                    _cum = 0.0
-                                    _chosen = _bet_acts[0]
-                                    for _ba, _bp in zip(_bet_acts, _bet_probs):
-                                        _cum += _bp
-                                        if _roll < _cum:
-                                            _chosen = _ba
-                                            break
-                                    _frac = _size_map.get(_chosen, 0.5)
-                                    bet_amt = max(int(pot * _frac), _min_r)
-                                    bet_amt = min(bet_amt, _max_r)
-                                    result = (RAISE, bet_amt, 0, 0)
-
-                    # River bluff injection: if solver checked, we have a weak hand,
-                    # and opponent folds >50% to our bets, bluff at half-GTO frequency.
-                    # Our bluff rate is 5% vs GTO 33%. Opponents fold 4663 times —
-                    # massive fold equity left on table. Half-GTO is near-breakeven
-                    # even if called, so risk is minimal.
-                    if (result[0] == CHECK and my_bet == opp_bet
-                            and valid[RAISE]
-                            and self._opp_faces_bet.get(3, 0) >= 20):
-                        _r_fold_rate = (self._opp_folds_to_bet[3] /
-                                        self._opp_faces_bet[3])
-                        if _r_fold_rate > 0.50:
-                            _eq_bluff = self.engine.compute_equity(
-                                my_cards, board, dead, solve_range)
-                            if _eq_bluff < 0.25:
-                                import random as _rng2
-                                _pot = my_bet + opp_bet
-                                _bet = max(int(_pot * 0.6), observation["min_raise"])
-                                _bet = min(_bet, observation["max_raise"])
-                                _bluff_freq = _bet / (_bet + _pot) * 0.5
-                                if _rng2.random() < _bluff_freq:
-                                    result = (RAISE, _bet, 0, 0)
+                    # Floor override and bluff injection REMOVED —
+                    # with full tree C solver + fixed inference, the solver
+                    # makes informed bet/check decisions. Overriding with
+                    # less-informed precomputed data was a conflict.
 
                     # River equity gate: fold when equity < pot odds + margin.
                     # Margin of 0.12 trims marginal calls that are technically
@@ -1681,20 +1606,8 @@ class PlayerAgent(Agent):
                             self._we_folded_this_hand = True
                             return (FOLD, 0, 0, 0)
 
-                    # Selective caller suppression: if our bet-called WR
-                    # is very low, opponent only calls with better hands.
-                    # Suppress thin value bets (eq < 0.80) to avoid bleeding.
-                    if (result[0] == RAISE and my_bet == opp_bet
-                            and self._hero_bet_called_total >= 30):
-                        bet_called_wr = (self._hero_bet_called_wins /
-                                         self._hero_bet_called_total)
-                        if bet_called_wr < 0.40:
-                            eq_for_bet = self.engine.compute_equity(
-                                my_cards, board, dead, solve_range)
-                            if eq_for_bet < 0.80:
-                                result = (CHECK, 0, 0, 0)
-
-                    # Note: overbet sizing hack removed — full tree (when C solver
+                    # Note: selective caller, overbet, floor override, bluff injection
+                    # all removed — with full tree C solver + DL solving on all streets,
                     # active) already includes 150% pot as an action. The solver
                     # picks the optimal size from 40/70/100/150%. Overriding its
                     # choice was conflicting with the equilibrium strategy.
