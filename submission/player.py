@@ -1275,6 +1275,7 @@ class PlayerAgent(Agent):
                 opp_discards, board, my_cards)
 
 
+
         # Range update from opponent actions
         if opp_bet > my_bet:
             self._opp_bet_this_hand = True
