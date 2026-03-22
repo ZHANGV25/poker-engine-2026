@@ -16,6 +16,13 @@ Key features:
 import numpy as np
 import itertools
 from math import pow as fpow
+
+# Try to use C DCFR solver for ~4-5x speedup
+try:
+    from dcfr_bridge import c_available as _c_avail, run_dcfr_c as _run_dcfr_c
+    _USE_C_SOLVER = _c_avail()
+except ImportError:
+    _USE_C_SOLVER = False
 from game_tree import (
     GameTree, ACT_FOLD, ACT_CHECK, ACT_CALL,
     ACT_RAISE_HALF, ACT_RAISE_POT, ACT_RAISE_ALLIN, ACT_RAISE_OVERBET,
@@ -665,14 +672,16 @@ class RangeSolver:
         DCFR discounts early iterations so the average strategy
         converges faster. Parameters: alpha=1.5, beta=0, gamma=2.
 
-        If opp_locked_strategy is provided, the opponent's strategy at
-        every opponent node is fixed (node-locked) to the given strategy
-        and opponent regrets are not updated. Hero's strategy converges
-        to the best response against the locked opponent.
+        Uses C solver for ~4-5x speedup when available (auto-compiled).
+        Falls back to Python if C unavailable or node locking is used.
 
         opp_locked_strategy: dict {opp_node_id: np.array (n_opp, n_act)}
             or None for standard two-player CFR.
         """
+        # Use C solver when available and no node locking
+        if _USE_C_SOLVER and opp_locked_strategy is None:
+            return _run_dcfr_c(tree, opp_weights, terminal_values,
+                               n_hero, n_opp, iterations)
         n_hero_nodes = len(tree.hero_node_ids)
         n_opp_nodes = len(tree.opp_node_ids)
 
