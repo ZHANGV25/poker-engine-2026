@@ -1311,6 +1311,12 @@ class PlayerAgent(Agent):
 
         pot_state = (my_bet, opp_bet)
 
+        # Check C solver availability (used by flop DL and turn DL)
+        try:
+            from range_solver import _USE_C_SOLVER
+        except ImportError:
+            _USE_C_SOLVER = False
+
         # 1. Flop: multi-street blueprint for ALL decisions.
         #    Blueprint uses backward induction (river→turn→flop) with
         #    continuation values — accounts for future street betting.
@@ -1322,10 +1328,6 @@ class PlayerAgent(Agent):
             # range with turn+river continuation values. This directly fixes the
             # "invest-then-fold" leak where the blueprint calls too wide.
             facing_flop_bet = opp_bet > my_bet
-            try:
-                from range_solver import _USE_C_SOLVER
-            except ImportError:
-                _USE_C_SOLVER = False
             if (facing_flop_bet and _USE_C_SOLVER
                     and self._opp_weights is not None
                     and time_left > 200):
@@ -1406,8 +1408,34 @@ class PlayerAgent(Agent):
                         self._opp_bet_at_raise = opp_bet
                     return result
 
-            # Acting first or fallback: blueprint (backward induction, multi-street)
-            # Adding acting-first solver regressed from 70% to 33% (v33/v34).
+            # Acting first: depth-limited solver when C solver available.
+            # Previous AF solver regression (v33/v34) was SINGLE-STREET.
+            # Depth-limited uses river continuation values (multi-street).
+            if (not facing_bet and _USE_C_SOLVER
+                    and self._opp_weights is not None
+                    and time_left > 200):
+                try:
+                    result = self.depth_limited_solver.solve_turn_facing_bet(
+                        hero_cards=my_cards, board=board,
+                        opp_range=self._opp_weights, dead_cards=dead,
+                        my_bet=my_bet, opp_bet=opp_bet,
+                        min_raise=observation["min_raise"],
+                        max_raise=observation["max_raise"],
+                        valid_actions=valid, time_remaining=time_left,
+                        hero_position=hero_position)
+                    if result is not None:
+                        self._path_counts['turn_dl_af'] = self._path_counts.get('turn_dl_af', 0) + 1
+                        if result[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
+                            self._last_hero_bet = result[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        return result
+                except Exception:
+                    pass
+
+            # Fallback: blueprint (backward induction, multi-street)
             if self._multi_street is not None:
                 try:
                     strat = self._multi_street.get_turn_strategy(
