@@ -1667,20 +1667,10 @@ class PlayerAgent(Agent):
                             if eq_for_bet < 0.80:
                                 result = (CHECK, 0, 0, 0)
 
-                    # Overbet sizing with strong hands: overbets are +23.4/bet
-                    # (best of all sizes) with 61% fold rate and 71% call WR.
-                    # When solver bets and we have very strong equity, inflate
-                    # to 150% pot to maximize value extraction.
-                    if (result[0] == RAISE and my_bet == opp_bet
-                            and self._opp_weights is not None):
-                        _eq_size = self.engine.compute_equity(
-                            my_cards, board, dead, solve_range)
-                        if _eq_size >= 0.80:
-                            _pot = my_bet + opp_bet
-                            _overbet = max(int(_pot * 1.5),
-                                           observation["min_raise"])
-                            _overbet = min(_overbet, observation["max_raise"])
-                            result = (RAISE, _overbet, 0, 0)
+                    # Note: overbet sizing hack removed — full tree (when C solver
+                    # active) already includes 150% pot as an action. The solver
+                    # picks the optimal size from 40/70/100/150%. Overriding its
+                    # choice was conflicting with the equilibrium strategy.
 
                     # Track raise for re-raise narrowing and pot control
                     if result[0] == RAISE:
