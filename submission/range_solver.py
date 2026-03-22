@@ -600,9 +600,12 @@ class RangeSolver:
         max_entropy = np.log(n_opp_live)
         norm_entropy = entropy / max_entropy if max_entropy > 0 else 1.0
 
-        # Only use node locking if range is meaningfully narrowed
-        if norm_entropy > 0.92:
-            return None  # range too close to uniform, use standard solver
+        # Use node locking even with wide ranges — the equity-proportional
+        # opponent model is always more realistic than GTO for value betting.
+        # The locked solver naturally bets strong hands for value against
+        # opponents who call with worse, which GTO solver misses.
+        if norm_entropy > 0.99:
+            return None  # truly uniform, node locking won't help
 
         remaining = [c for c in range(27) if c not in known]
         for h in itertools.combinations(remaining, 2):
