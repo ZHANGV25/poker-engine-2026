@@ -181,11 +181,23 @@ class DepthLimitedSolver:
             eq, nb = self.range_solver._compute_equity_and_mask(
                 hero_hands, opp_hands, river_board, dead, 3)
 
-            # CTS equity as continuation value: (2*eq-1)*pot.
-            # This represents showdown value assuming both check.
-            # The PARENT solver's tree structure handles betting dynamics
-            # (bet/call/fold) — these CV are only used at SHOWDOWN terminals.
-            gv = (2 * eq - 1) * nb * pot
+            # Solve river subgame to get game values that account for
+            # river betting dynamics. CTS equity alone overvalues medium
+            # hands that would face bets and fold.
+            gv = (2 * eq - 1) * nb * pot  # fallback: CTS equity
+            try:
+                rv_tree = self.range_solver._get_tree(
+                    pot, pot, 2, 100, compact=True)
+                if rv_tree.size >= 2:
+                    rv_tv = self.range_solver._compute_terminal_values(
+                        rv_tree, eq, nb)
+                    self.range_solver._run_dcfr(
+                        rv_tree, opp_w, rv_tv, n_hero, n_opp, iters)
+                    rv = getattr(self.range_solver, '_last_root_value', None)
+                    if rv is not None and rv.shape == gv.shape:
+                        gv = rv
+            except Exception:
+                pass
 
             gv_sum += gv * vp
             count += vp * nb
