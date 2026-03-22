@@ -237,7 +237,8 @@ void run_dcfr_c(
     int n_hero_nodes, int n_opp_nodes,
     const double *opp_weights,
     int iterations,
-    double *hero_strat_sum
+    double *hero_strat_sum,
+    double *root_game_value  /* [n_hero * n_opp] output: game value at root */
 ) {
     int hr_size = n_hero_nodes * n_hero * MAX_ACT;
     int or_size = n_opp_nodes * n_opp * MAX_ACT;
@@ -284,6 +285,11 @@ void run_dcfr_c(
                      hero_idx, opp_idx, term_idx,
                      tv, hero_regrets, hero_strat_sum, opp_regrets,
                      n_hero, n_opp, bufs, node_value);
+    }
+
+    /* Copy root game value to output */
+    if (root_game_value != NULL) {
+        memcpy(root_game_value, node_value, ho * sizeof(double));
     }
 
     for (int d = 0; d < MAX_DEPTH; d++) {

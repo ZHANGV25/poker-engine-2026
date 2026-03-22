@@ -682,8 +682,15 @@ class RangeSolver:
         """
         # Use C solver when available and no node locking
         if _USE_C_SOLVER and opp_locked_strategy is None:
-            return _run_dcfr_c(tree, opp_weights, terminal_values,
-                               n_hero, n_opp, iterations)
+            result = _run_dcfr_c(tree, opp_weights, terminal_values,
+                                 n_hero, n_opp, iterations)
+            # Root game value stored in bridge._last_root_value
+            try:
+                from dcfr_bridge import get_last_root_value
+                self._last_root_value = get_last_root_value()
+            except Exception:
+                pass
+            return result
         n_hero_nodes = len(tree.hero_node_ids)
         n_opp_nodes = len(tree.opp_node_ids)
 
@@ -715,7 +722,7 @@ class RangeSolver:
                     opp_regrets *= np.where(opp_regrets > 0, pos_w, neg_w)
                 hero_strat_sum *= strat_w
 
-            self._range_cfr_traverse(
+            root_value = self._range_cfr_traverse(
                 tree, 0, hero_reach_init.copy(), opp_weights.copy(),
                 hero_regrets, hero_strat_sum, opp_regrets,
                 hero_node_idx, opp_node_idx, terminal_values,
@@ -733,6 +740,8 @@ class RangeSolver:
         totals = strat_slice.sum(axis=1, keepdims=True)
         result = np.where(totals > 0, strat_slice / np.maximum(totals, 1e-10),
                          np.full_like(strat_slice, 1.0 / n_act))
+        # Store last root game value for callers that need it
+        self._last_root_value = root_value
         return result
 
     @staticmethod

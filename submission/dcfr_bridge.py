@@ -60,6 +60,7 @@ def _try_load():
             ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
             ctypes.c_int,
             ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),
+            ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"),  # root_game_value
         ]
         return True
     except (OSError, Exception):
@@ -75,6 +76,12 @@ if not _try_load():
 
 def c_available():
     return _lib is not None
+
+# Storage for root game value from last C solver call
+_last_root_value = [None]
+
+def get_last_root_value():
+    return _last_root_value[0]
 
 
 def run_dcfr_c(tree, opp_weights, terminal_values, n_hero, n_opp, iterations):
@@ -117,8 +124,9 @@ def run_dcfr_c(tree, opp_weights, terminal_values, n_hero, n_opp, iterations):
     # Ensure opp_weights is contiguous float64
     opp_w = np.ascontiguousarray(opp_weights, dtype=np.float64)
 
-    # Output buffer
+    # Output buffers
     hero_strat_sum = np.zeros(n_hero_nodes * n_hero * MAX_ACT, dtype=np.float64)
+    root_game_value = np.zeros(n_hero * n_opp, dtype=np.float64)
 
     # Call C solver
     _lib.run_dcfr_c(
@@ -126,8 +134,11 @@ def run_dcfr_c(tree, opp_weights, terminal_values, n_hero, n_opp, iterations):
         hero_idx_arr, opp_idx_arr, term_idx_arr,
         n_nodes, tv_arr,
         n_hero, n_opp, n_hero_nodes, n_opp_nodes,
-        opp_w, iterations, hero_strat_sum
+        opp_w, iterations, hero_strat_sum, root_game_value
     )
+
+    # Store root game value for callers that need it
+    _last_root_value[0] = root_game_value.reshape(n_hero, n_opp)
 
     # Extract root strategy
     root = 0

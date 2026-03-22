@@ -468,12 +468,35 @@ class DepthLimitedSolver:
             river_cv = np.where(river_count > 0,
                                 river_gv_sum / np.maximum(river_count, 1), 0)
 
-            # Turn continuation value = river CV directly.
-            # Full turn subgame solving (17 extra solves) was too expensive
-            # (4.86s/hand, caused timeouts). The river CV already captures
-            # hand strength — turn betting dynamics are handled by the
-            # flop solver's own tree structure.
-            turn_cv_sum += river_cv * tc_vp * nb_flop
+            # Solve turn subgame to get game values that include turn
+            # betting dynamics. Without this, flop solver overvalues
+            # medium hands (assumes check-check on turn).
+            turn_nb = tc_vp * nb_flop
+            turn_gv = river_cv  # fallback
+            turn_tree = self.range_solver._get_tree(
+                ref_pot, ref_pot, 2, 100, compact=True)
+            if turn_tree.size >= 2 and turn_nb.sum() > 0:
+                turn_tv = {}
+                for nid in turn_tree.terminal_node_ids:
+                    tt = turn_tree.terminal[nid]
+                    hp = turn_tree.hero_pot[nid]
+                    op = turn_tree.opp_pot[nid]
+                    if tt == 1:
+                        turn_tv[nid] = -hp * turn_nb
+                    elif tt == 2:
+                        turn_tv[nid] = op * turn_nb
+                    elif tt == 3:
+                        scale = min(hp, op) / max(ref_pot, 1)
+                        turn_tv[nid] = river_cv * scale * turn_nb
+                try:
+                    self.range_solver._run_dcfr(
+                        turn_tree, opp_w, turn_tv, n_hero, n_opp, 50)
+                    rv = getattr(self.range_solver, '_last_root_value', None)
+                    if rv is not None and rv.shape == river_cv.shape:
+                        turn_gv = rv
+                except Exception:
+                    pass
+            turn_cv_sum += turn_gv * tc_vp * nb_flop
             turn_cv_count += tc_vp * nb_flop
 
         # Aggregate turn continuation values
