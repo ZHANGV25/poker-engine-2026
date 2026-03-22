@@ -267,10 +267,12 @@ void run_dcfr_c(
             double pos_w = pow(tm1, 1.5) / (pow(tm1, 1.5) + 1.0);
             double strat_w = pow(tm1 / (double)t, 2.0);
 
+            /* beta=0: neg_w = t^0 / (t^0 + 1) = 0.5 (match Python) */
+            double neg_w = 1.0 / (1.0 + 1.0);  /* = 0.5 */
             for (int i = 0; i < hr_size; i++)
-                hero_regrets[i] *= (hero_regrets[i] > 0) ? pos_w : 0.0;
+                hero_regrets[i] *= (hero_regrets[i] > 0) ? pos_w : neg_w;
             for (int i = 0; i < or_size; i++)
-                opp_regrets[i] *= (opp_regrets[i] > 0) ? pos_w : 0.0;
+                opp_regrets[i] *= (opp_regrets[i] > 0) ? pos_w : neg_w;
             for (int i = 0; i < hr_size; i++)
                 hero_strat_sum[i] *= strat_w;
         }

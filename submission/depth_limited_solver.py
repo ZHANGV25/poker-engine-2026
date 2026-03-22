@@ -169,9 +169,6 @@ class DepthLimitedSolver:
         gv_sum = np.zeros((n_hero, n_opp))
         count = np.zeros((n_hero, n_opp))
 
-        # Compact tree for quick river solves (cached)
-        tree = self.range_solver._get_tree(pot, pot, 2, 100, compact=True)
-
         for rc in river_cards:
             rc_mask = 1 << rc
             hv = np.array([(hero_masks[h] & rc_mask) == 0
@@ -183,7 +180,6 @@ class DepthLimitedSolver:
             river_board = turn_board + [rc]
             eq, nb = self.range_solver._compute_equity_and_mask(
                 hero_hands, opp_hands, river_board, dead, 3)
-            rv_tv = self.range_solver._compute_terminal_values(tree, eq, nb)
 
             # CTS equity as continuation value: (2*eq-1)*pot.
             # This represents showdown value assuming both check.
