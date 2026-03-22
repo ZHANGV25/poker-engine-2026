@@ -1634,13 +1634,28 @@ class PlayerAgent(Agent):
                         solve_range = narrowed
 
                 try:
-                    result = self.range_solver.solve_and_act(
-                        hero_cards=my_cards, board=board,
-                        opp_range=solve_range, dead_cards=dead,
-                        my_bet=my_bet, opp_bet=opp_bet, street=street,
-                        min_raise=observation["min_raise"],
-                        max_raise=observation["max_raise"],
-                        valid_actions=valid, time_remaining=time_left)
+                    # Acting first: use node-locked solver (best response
+                    # against equity-proportional opponent). GTO solver
+                    # checks too much because it assumes opponent plays
+                    # optimally. Locked solver models realistic opponents
+                    # who fold weak hands → finds profitable thin value bets.
+                    # Facing bet: use standard GTO solver (equilibrium).
+                    if my_bet == opp_bet and _USE_C_SOLVER:
+                        result = self.range_solver.solve_and_act_locked(
+                            hero_cards=my_cards, board=board,
+                            opp_range=solve_range, dead_cards=dead,
+                            my_bet=my_bet, opp_bet=opp_bet, street=street,
+                            min_raise=observation["min_raise"],
+                            max_raise=observation["max_raise"],
+                            valid_actions=valid, time_remaining=time_left)
+                    else:
+                        result = self.range_solver.solve_and_act(
+                            hero_cards=my_cards, board=board,
+                            opp_range=solve_range, dead_cards=dead,
+                            my_bet=my_bet, opp_bet=opp_bet, street=street,
+                            min_raise=observation["min_raise"],
+                            max_raise=observation["max_raise"],
+                            valid_actions=valid, time_remaining=time_left)
                 except Exception:
                     result = None
                 if result is not None:

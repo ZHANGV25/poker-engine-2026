@@ -185,12 +185,10 @@ class DepthLimitedSolver:
                 hero_hands, opp_hands, river_board, dead, 3)
             rv_tv = self.range_solver._compute_terminal_values(tree, eq, nb)
 
-            # Compute game value directly from equity and tree structure.
-            # No heuristic bonus — just use CTS equity scaled by pot.
-            # The card blocking fix makes CTS accurate for terminal values.
-            # The betting dynamics are captured implicitly: the TURN solver
-            # (which uses these as continuation values) will learn to
-            # value draws through the turn betting tree structure.
+            # CTS equity as continuation value: (2*eq-1)*pot.
+            # This represents showdown value assuming both check.
+            # The PARENT solver's tree structure handles betting dynamics
+            # (bet/call/fold) — these CV are only used at SHOWDOWN terminals.
             gv = (2 * eq - 1) * nb * pot
 
             gv_sum += gv * vp
