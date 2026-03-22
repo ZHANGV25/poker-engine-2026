@@ -1323,12 +1323,11 @@ class PlayerAgent(Agent):
         #    Runtime solver only sees current-street equity (no future streets)
         #    which caused turn to regress from +6.4 to 0.0/hand.
         if street == 1 and self._multi_street is not None:
-            # Flop depth-limited solver: when facing a bet with narrowed range
-            # and C solver available, solve the flop against the actual opponent
-            # range with turn+river continuation values. This directly fixes the
-            # "invest-then-fold" leak where the blueprint calls too wide.
+            # Flop depth-limited solver: solve against narrowed range with
+            # turn+river continuation values. Works for BOTH AF and FB.
+            # Replaces blueprint entirely when C solver is available.
             facing_flop_bet = opp_bet > my_bet
-            if (facing_flop_bet and _USE_C_SOLVER
+            if (_USE_C_SOLVER
                     and self._opp_weights is not None
                     and time_left > 200):
                 try:
