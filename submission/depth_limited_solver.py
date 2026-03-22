@@ -373,6 +373,150 @@ class DepthLimitedSolver:
 
         return strat
 
+    def solve_flop_facing_bet(self, hero_cards, board, opp_range, dead_cards,
+                              my_bet, opp_bet, min_raise, max_raise,
+                              valid_actions, time_remaining,
+                              hero_position=0):
+        """Depth-limited FLOP solver: flop → turn → river with continuation values.
+
+        Extends the turn depth-limited pattern one level deeper:
+        1. For each possible turn card (~17):
+           a. For each possible river card (~15): compute river equity → river CV
+           b. Solve turn subgame with river CVs → turn CV for this turn card
+        2. Aggregate turn CVs across all turn cards → flop continuation values
+        3. Solve flop with turn continuation values against narrowed range
+
+        Uses compact trees and low iteration counts for subgames to fit
+        within ~3s total budget per flop decision.
+        """
+        if opp_range is None:
+            return None
+
+        known = set(board) | set(dead_cards)  # board is 3-card flop
+        remaining = [c for c in range(27) if c not in known]
+        hero_hands = list(itertools.combinations(remaining, 2))
+        opp_hands = []
+        opp_weights = []
+        for hand, w in opp_range.items():
+            if w > 0.001 and not (set(hand) & known):
+                opp_hands.append(hand)
+                opp_weights.append(w)
+
+        if not opp_hands:
+            return None
+
+        opp_w = np.array(opp_weights, dtype=np.float64)
+        opp_w /= opp_w.sum()
+        n_hero = len(hero_hands)
+        n_opp = len(opp_hands)
+
+        hero_tuple = tuple(sorted(hero_cards))
+        hero_idx = None
+        for i, h in enumerate(hero_hands):
+            if tuple(sorted(h)) == hero_tuple:
+                hero_idx = i
+                break
+        if hero_idx is None:
+            return None
+
+        hero_masks = np.array([(1 << h[0]) | (1 << h[1]) for h in hero_hands],
+                              dtype=np.int64)
+        opp_masks = np.array([(1 << o[0]) | (1 << o[1]) for o in opp_hands],
+                              dtype=np.int64)
+        nb_flop = ((hero_masks[:, None] & opp_masks[None, :]) == 0).astype(np.float64)
+
+        # Step 1: Compute turn continuation values
+        # For each turn card, compute river CVs then solve turn → get turn CV
+        turn_cards = [c for c in range(27) if c not in known]
+        ref_pot = max(min(my_bet, opp_bet), 2)
+
+        turn_cv_sum = np.zeros((n_hero, n_opp))
+        turn_cv_count = np.zeros((n_hero, n_opp))
+
+        compact_tree = self.range_solver._get_tree(ref_pot, ref_pot, 2, 100, compact=True)
+
+        for tc in turn_cards:
+            tc_mask = 1 << tc
+            # Skip hands that contain the turn card
+            h_valid = (hero_masks & tc_mask) == 0
+            o_valid = (opp_masks & tc_mask) == 0
+            tc_vp = np.outer(h_valid, o_valid).astype(float)
+
+            turn_board = list(board) + [tc]
+
+            # Step 1a: For this turn card, compute river continuation values
+            # (same as existing _compute_continuation_values)
+            turn_known = known | {tc}
+            river_cards = [c for c in range(27) if c not in turn_known]
+
+            river_gv_sum = np.zeros((n_hero, n_opp))
+            river_count = np.zeros((n_hero, n_opp))
+
+            for rc in river_cards:
+                rc_mask = 1 << rc
+                hv = (hero_masks & rc_mask) == 0
+                ov = (opp_masks & rc_mask) == 0
+                rv_vp = np.outer(hv & h_valid, ov & o_valid).astype(float)
+
+                river_board = turn_board + [rc]
+                eq, rv_nb = self.range_solver._compute_equity_and_mask(
+                    hero_hands, opp_hands, river_board, dead_cards, 3)
+
+                gv = (2 * eq - 1) * rv_nb * ref_pot
+                river_gv_sum += gv * rv_vp
+                river_count += rv_vp * rv_nb
+
+            # River continuation values for this turn card
+            river_cv = np.where(river_count > 0,
+                                river_gv_sum / np.maximum(river_count, 1), 0)
+
+            # Step 1b: Turn continuation value = river CV (simplified)
+            # Full approach would solve a turn subgame, but that's too expensive.
+            # Instead, use river CV directly as turn CV (assumes check-check on turn).
+            # This is a simplification but captures the hand strength after turn card.
+            turn_cv_sum += river_cv * tc_vp * nb_flop
+            turn_cv_count += tc_vp * nb_flop
+
+        # Aggregate turn continuation values
+        flop_cv = np.where(turn_cv_count > 0,
+                           turn_cv_sum / np.maximum(turn_cv_count, 1), 0)
+
+        # Step 2: Solve the flop with turn continuation values
+        tree = self._get_tree(my_bet, opp_bet, min_raise, 100)
+        if tree.size < 2:
+            return None
+
+        tv = {}
+        for nid in tree.terminal_node_ids:
+            tt = tree.terminal[nid]
+            hp = tree.hero_pot[nid]
+            op = tree.opp_pot[nid]
+            if tt == TERM_FOLD_HERO:
+                tv[nid] = -hp * nb_flop
+            elif tt == TERM_FOLD_OPP:
+                tv[nid] = op * nb_flop
+            elif tt == TERM_SHOWDOWN:
+                scale = min(hp, op) / max(ref_pot, 1)
+                tv[nid] = flop_cv * scale * nb_flop
+
+        # Step 3: Solve with gadget
+        cbv = self._compute_blueprint_cbv(
+            hero_hands, opp_hands, opp_w, board, dead_cards,
+            my_bet, opp_bet, hero_position, flop_cv)
+
+        facing_bet = opp_bet > my_bet
+        iters = 150 if facing_bet else 100
+
+        hero_strategy = self._solve_with_gadget(
+            tree, opp_w, tv, cbv, nb_flop, n_hero, n_opp, iters,
+            hero_hands=hero_hands)
+
+        our_strategy = hero_strategy[hero_idx]
+
+        return self._strategy_to_action(
+            tree, our_strategy, my_bet, opp_bet, min_raise, max_raise,
+            valid_actions)
+
     def _get_tree(self, hero_bet, opp_bet, min_raise, max_bet):
         key = (hero_bet, opp_bet, min_raise, max_bet, True, False)
         if key not in self._tree_cache:

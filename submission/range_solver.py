@@ -86,12 +86,14 @@ class RangeSolver:
         if hero_idx_in_list is None:
             return None
 
-        # River acting first: lean tree (25% block + 100% pot, 39 nodes).
-        # 3x faster → more iterations in same time. Solver uses blocking
-        # bet for medium hands that would otherwise check.
-        # All other: full tree (40/70/100/150% pot, 123 nodes).
+        # River acting first: use full tree when C solver available (4 bet
+        # sizes for optimal sizing), lean tree otherwise (2 sizes, 3x faster).
+        # C solver is ~5x faster, so full tree in C ≈ lean tree in Python.
         max_bet = 100
-        use_lean = (street == 3 and my_bet == opp_bet)
+        if _USE_C_SOLVER:
+            use_lean = False  # C solver fast enough for full tree everywhere
+        else:
+            use_lean = (street == 3 and my_bet == opp_bet)
 
         if use_lean:
             # Lean tree is 3x faster — use more iterations

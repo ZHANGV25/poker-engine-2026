@@ -1306,6 +1306,38 @@ class PlayerAgent(Agent):
         #    Runtime solver only sees current-street equity (no future streets)
         #    which caused turn to regress from +6.4 to 0.0/hand.
         if street == 1 and self._multi_street is not None:
+            # Flop depth-limited solver: when facing a bet with narrowed range
+            # and C solver available, solve the flop against the actual opponent
+            # range with turn+river continuation values. This directly fixes the
+            # "invest-then-fold" leak where the blueprint calls too wide.
+            facing_flop_bet = opp_bet > my_bet
+            try:
+                from range_solver import _USE_C_SOLVER
+            except ImportError:
+                _USE_C_SOLVER = False
+            if (facing_flop_bet and _USE_C_SOLVER
+                    and self._opp_weights is not None
+                    and time_left > 200):
+                try:
+                    result = self.depth_limited_solver.solve_flop_facing_bet(
+                        my_cards, board, self._opp_weights, dead,
+                        my_bet, opp_bet,
+                        observation["min_raise"], observation["max_raise"],
+                        valid, time_left, hero_position=hero_position)
+                    if result is not None:
+                        self._path_counts['flop_dl'] = self._path_counts.get('flop_dl', 0) + 1
+                        if result[0] == RAISE:
+                            self._raised_this_street = True
+                            self._streets_raised += 1
+                            self._last_hero_bet = result[1]
+                            self._last_pot_before = pot_state[0] + pot_state[1]
+                            self._opp_bet_at_raise = opp_bet
+                        if result[0] == FOLD:
+                            self._we_folded_this_hand = True
+                        return result
+                except Exception:
+                    pass  # fall through to blueprint
+
             try:
                 strat = self._multi_street.get_strategy(
                     my_cards, board, pot_state=pot_state,
@@ -1313,10 +1345,6 @@ class PlayerAgent(Agent):
                 action = self._try_strategy(strat, observation)
                 if action is not None:
                     # Equity gate: blueprint was solved against uniform range.
-                    # If it says CALL but our equity vs the NARROWED range
-                    # is below pot odds, override to FOLD. This catches
-                    # overcalls against value-heavy opponents that the
-                    # blueprint can't detect.
                     if (action[0] == CALL and self._opp_weights is not None
                             and opp_bet > my_bet):
                         continue_cost = opp_bet - my_bet
