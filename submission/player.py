@@ -112,12 +112,19 @@ _POT_FRACTIONS = {
 
 
 class PlayerAgent(Agent):
-    VERSION = "v13-flop-dl"
+    VERSION = "5.0"
 
     def __init__(self, stream: bool = True):
         super().__init__(stream)
         import logging
-        logging.getLogger(__name__).info(f"PlayerAgent {self.VERSION} starting")
+        _log = logging.getLogger(__name__)
+        _log.info(f"PlayerAgent {self.VERSION} starting")
+        # Log C solver and flop DL status after init
+        try:
+            from range_solver import _USE_C_SOLVER
+            _log.info(f"C solver: {'ACTIVE' if _USE_C_SOLVER else 'UNAVAILABLE (Python fallback)'}")
+        except:
+            _log.info("C solver: UNAVAILABLE")
 
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)
