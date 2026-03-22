@@ -14,6 +14,7 @@ Strategy hierarchy:
 
 import os
 import sys
+import itertools
 import numpy as np
 
 _dir = os.path.dirname(os.path.abspath(__file__))
@@ -1276,6 +1277,12 @@ class PlayerAgent(Agent):
 
 
 
+        # Check C solver availability (used by narrowing and DL solvers)
+        try:
+            from range_solver import _USE_C_SOLVER
+        except ImportError:
+            _USE_C_SOLVER = False
+
         # Range update from opponent actions
         if opp_bet > my_bet:
             self._opp_bet_this_hand = True
@@ -1364,12 +1371,6 @@ class PlayerAgent(Agent):
             self._reraise_narrow_range(board, dead, my_bet, opp_bet)
 
         pot_state = (my_bet, opp_bet)
-
-        # Check C solver availability (used by flop DL and turn DL)
-        try:
-            from range_solver import _USE_C_SOLVER
-        except ImportError:
-            _USE_C_SOLVER = False
 
         # 1. Flop: multi-street blueprint for ALL decisions.
         #    Blueprint uses backward induction (river→turn→flop) with
