@@ -1644,6 +1644,45 @@ class PlayerAgent(Agent):
                 except Exception:
                     result = None
                 if result is not None:
+                    # Floor override: if solver checks but precomputed says
+                    # bet, override to bet. Catches missed value bets that
+                    # GTO solver misses due to narrow range assumption.
+                    if (result[0] == CHECK and my_bet == opp_bet
+                            and self.river_lookup.loaded and valid[RAISE]):
+                        import random as _rng
+                        precomp = self.river_lookup.get_strategy(
+                            my_cards, board, my_bet, opp_bet)
+                        if precomp:
+                            p_bet_precomp = sum(
+                                precomp.get(a, 0.0) for a in (3, 4, 5, 6))
+                            if p_bet_precomp >= 0.25 and _rng.random() < p_bet_precomp:
+                                pot = my_bet + opp_bet
+                                _min_r = observation["min_raise"]
+                                _max_r = observation["max_raise"]
+                                _size_map = {3: 0.40, 4: 0.70, 5: 1.00, 6: 1.50}
+                                _bet_acts = []
+                                _bet_probs = []
+                                for _ba in (3, 4, 5, 6):
+                                    _bp = precomp.get(_ba, 0.0)
+                                    if _bp > 0:
+                                        _bet_acts.append(_ba)
+                                        _bet_probs.append(_bp)
+                                if _bet_probs:
+                                    _bpt = sum(_bet_probs)
+                                    _bet_probs = [p / _bpt for p in _bet_probs]
+                                    _roll = _rng.random()
+                                    _cum = 0.0
+                                    _chosen = _bet_acts[0]
+                                    for _ba, _bp in zip(_bet_acts, _bet_probs):
+                                        _cum += _bp
+                                        if _roll < _cum:
+                                            _chosen = _ba
+                                            break
+                                    _frac = _size_map.get(_chosen, 0.5)
+                                    bet_amt = max(int(pot * _frac), _min_r)
+                                    bet_amt = min(bet_amt, _max_r)
+                                    result = (RAISE, bet_amt, 0, 0)
+
                     # River equity gate: fold when equity < pot odds + margin.
                     if (result[0] == CALL and opp_bet > my_bet
                             and self._opp_weights is not None):
