@@ -112,8 +112,12 @@ _POT_FRACTIONS = {
 
 
 class PlayerAgent(Agent):
+    VERSION = "v13-flop-dl"
+
     def __init__(self, stream: bool = True):
         super().__init__(stream)
+        import logging
+        logging.getLogger(__name__).info(f"PlayerAgent {self.VERSION} starting")
 
         self.engine = ExactEquityEngine()
         self.inference = DiscardInference(self.engine)

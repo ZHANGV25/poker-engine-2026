@@ -185,3 +185,4 @@ fleet_instances.txt
 # Large data files (uploaded separately to competition)
 submission/data/multi_street/blueprint.pkl.lzma
 submission/data/multi_street/turn_opp.pkl.lzma
+submission/data/river.tar.lzma
