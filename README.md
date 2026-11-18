@@ -1,83 +1,46 @@
-# Poker AI — CMU x Jump Trading Tournament 2026
+# Poker bot for a 27-card hold'em variant
 
-A poker bot for a custom 27-card variant, built for the CMU x Jump Trading Poker AI Tournament (March 2026).
+A heads-up poker bot built by a team of two for the CMU × Jump Trading Poker AI Tournament in March 2026. Bots played each other in 1,000-hand matches and were ranked by Elo.
 
-## The Game
+## The game
 
-27-card deck (9 ranks × 3 suits). Each player gets 5 hole cards, discards 3 (revealed), keeps 2. Community board: flop (3), turn (1), river (1) with betting on each street. 1000 hands per match, ELO ranking.
+The deck has 27 cards: nine ranks in three suits. Each player is dealt five hole cards, discards three face up and keeps two. A flop, turn and river follow, with betting on each street as in hold'em.
 
-Key properties:
-- No four-of-a-kind (only 3 suits)
-- Trips is mediocre — 52% of showdown hands beat trips
-- Best-2-of-5 selection means everyone has strong hands (0% high card at showdown)
-- Flush draws are extremely common (9 cards per suit) and complete ~51% of the time
-- The game tree is small enough (~80K river boards) to solve entirely at runtime with a fast solver
+Three suits change the hand values. There are no four of a kind, flush draws are common, and keeping the best two of five means most hands that reach showdown are strong. The full rules are in [docs/rules.md](docs/rules.md).
 
-## What the Optimal Approach Looks Like
+## How it plays
 
-1. **Fast solver (C/C++ with SIMD)** — the game is small enough to solve every decision at runtime. No precomputation needed. A 25x-optimized C solver could solve flop-to-river in ~2 seconds.
+- **Preflop.** A precomputed strategy table over 200 hand buckets.
+- **Discards.** The opponent's three face-up discards narrow what they kept. The bot weighs each holding by exact equity, with extra weight on hands that keep a flush or straight draw.
+- **Flop and turn.** Strategies for all 2,925 flops were precomputed offline by backward induction from the river. When facing a bet, a depth-limited solver re-solves the street, with the later streets' values at its leaves.
+- **River.** A range-against-range CFR solver written in C ([dcfr_core.c](submission/dcfr_core.c)). It compiles at startup and runs 4.8× faster than the Python version.
+- **Ranges.** Every opponent action narrows the estimate of their range before the next solve.
 
-2. **Exact range tracking for BOTH players** — track hero range through the hand (narrowed by our own actions) and opponent range (narrowed by their actions). Pass both to the solver. This is how Libratus works — ranges are derived from equilibrium, not inferred from observations.
+## What we learned
 
-3. **Opponent modeling** — detect opponent type (aggressive, passive, trapping) within 50 hands. Solve against the detected model, not generic GTO.
+The bot's biggest leak was calling too often on the river. It tracked the opponent's range through each hand but solved as if its own range were uniform, so it misjudged how the opponent would bet against it. Tracking both ranges fixes that. Our version crashed on an edge case, and we reverted it instead of debugging it.
 
-4. **No precomputation** — with a fast enough solver, blueprints and EC2 fleets are unnecessary for a 27-card game.
+The game is small enough that a faster runtime solver would likely have beaten the precomputed flop and turn data, which took a fleet of EC2 machines to compute and more than 600 MB to store.
 
-## What We Tried
+## Layout
 
-- **EC2 precomputation** — 20 × c5.9xlarge instances computing 80,730 river boards at 300 DCFR iterations. Produced 146MB of strategy data. In hindsight, overkill for a game this small.
-- **Multi-street blueprints** — backward induction across all 2,925 flop boards with turn/river continuation values. 632MB of precomputed data.
-- **Heuristic overrides** — equity gate margins, floor overrides, bluff injection, selective caller suppression, overbet sizing hacks. Each one patched a symptom rather than fixing the root cause.
-- **Node-locked solver** — attempted to model non-GTO opponents by locking their strategy to equity-proportional play. Produced reversed behavior (bluffed with weak hands, checked strong).
-- **Check-behind narrowing** — narrowing opponent range when they check behind. Proven to hurt because opponents trap (check strong hands).
+| Path | What it holds |
+|---|---|
+| `submission/` | The bot. [player.py](submission/player.py) is the entry point; the solvers, equity engine and C core sit beside it |
+| `submission/data/` | Precomputed strategies (about 640 MB) |
+| `blueprint/` | The offline computation of the flop and turn strategies |
+| `agents/` | Simple opponents for testing |
+| `docs/` | The tournament's rules and engine docs |
+| `docs/notes/` | Our working notes from the tournament |
+| `match.py`, `run.py` | The tournament's match runner |
 
-## What We Ended Up With
+## Running it
 
-### Architecture
-```
-Preflop:  Precomputed GTO table (200 buckets)
-Discard:  Exact equity + draw-aware Bayesian inference
-Flop:     Depth-limited solver (C DCFR) with turn+river game values
-Turn:     Depth-limited solver (C DCFR) with river game values
-River:    Full-tree DCFR solver (C, 4 bet sizes) + floor override + equity gate
-```
-
-### Key Components
-- **C DCFR solver** (`dcfr_core.c`) — auto-compiles at startup, 4.8x speedup over Python, returns root game values for continuation value computation
-- **Draw-aware discard inference** — Boltzmann-weighted with flush draw (+3000) and straight draw (+1500) bonuses. Fixed a 47 percentage point equity error.
-- **Runtime P(bet|hand) narrowing** — solves from opponent's perspective on every street to compute betting probabilities. Replaces static blueprint narrowing.
-- **Full subgame solving** — river game values feed into turn solver, turn game values feed into flop solver. Every decision accounts for future street betting dynamics.
-- **Equity gate (+0.12 margin)** on river calls — 94.9% accuracy across 2,625 tested calls.
-
-### The Gap We Identified Too Late
-
-The single biggest remaining issue: **hero range tracking**. We track the opponent's range but use a UNIFORM hero range when computing P(bet|hand). Since opponents bet differently against our actual (capped) range vs uniform, this causes systematic overcalling on the river.
-
-We implemented hero range tracking but it crashed on an edge case. We reverted instead of debugging — a 20-minute fix that could have changed the outcome.
-
-### Lessons Learned
-
-1. **For a 27-card game, invest in solver speed, not precompute infrastructure.** A fast C solver eliminates the need for EC2 fleets and blueprint databases.
-2. **Foundation before features.** Range tracking is the foundation. Everything else (DL solvers, runtime narrowing, subgame solving) operates on the ranges. Wrong ranges → wrong everything.
-3. **Debug, don't revert.** A feature that works in 19/20 tests is worth debugging, not reverting.
-4. **One change at a time.** We shipped versions with 6 changes and couldn't tell which helped.
-5. **Verify execution, not just compilation.** Our "runtime narrowing" was dead code for hours due to a missing import — it compiled fine but silently fell back to blueprint narrowing.
-6. **Agents describe the right architecture but implement shortcuts.** Always trace actual code execution on a specific hand, not the architecture description.
-
-## Project Structure
+Python 3.13 with [uv](https://docs.astral.sh/uv/):
 
 ```
-submission/
-  player.py              # Main decision engine
-  inference.py            # Bayesian discard inference with draw bonus
-  range_solver.py         # DCFR solver + C bridge integration
-  depth_limited_solver.py # Flop/turn DL solver with subgame solving
-  dcfr_core.c             # C DCFR solver (auto-compiles)
-  dcfr_bridge.py          # Python-C bridge with root game value extraction
-  equity.py               # Exact enumeration equity engine
-  game_tree.py            # Betting tree (full/lean/compact modes)
-  river_lookup.py         # Lazy-loaded precomputed river strategies
-  data/                   # Precomputed blueprints + river strategies
-docs/
-  OPTIMAL_SOLVER.md       # Detailed roadmap for the ideal architecture
+uv sync
+uv run python run.py
 ```
+
+`run.py` plays the two bots named in [agent_config.json](agent_config.json): this bot against a simple probability-based opponent. The engine tests run with `uv run --with pytest --with pytest-asyncio pytest engine_test.py api_test.py`.
